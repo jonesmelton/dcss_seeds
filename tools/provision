@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Build a crawl explorer for one version.
+#   tools/provision <name> <git-ref>
+#
+# Each version gets an isolated build tree (a git worktree of the crawl repo,
+# with its own submodules) and its own save sandbox. Both are required: crawl
+# stores its .des cache under the save dir, unversioned unless built for
+# dgamelaunch, so two versions sharing a save dir clobber each other's cache.
+set -euo pipefail
+
+name="${1:?usage: provision <name> <git-ref>}"
+ref="${2:?usage: provision <name> <git-ref>}"
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+crawl_repo="${CRAWL_REPO:-$HOME/code/crawl}"
+tree="$root/builds/$name"
+sandbox="$root/sandboxes/$name"
+src="$tree/crawl-ref/source"
+jobs="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
+
+if [ ! -d "$crawl_repo/.git" ]; then
+    echo "error: no crawl repo at $crawl_repo (set CRAWL_REPO)" >&2
+    exit 1
+fi
+
+# python with pyyaml, needed by crawl's codegen step
+py="${PYTHON:-}"
+if [ -z "$py" ]; then
+    if [ -x "$root/.venv/bin/python3" ]; then
+        py="$root/.venv/bin/python3"
+    else
+        echo "==> creating python venv with pyyaml"
+        python3 -m venv "$root/.venv"
+        "$root/.venv/bin/python3" -m pip install --quiet pyyaml
+        py="$root/.venv/bin/python3"
+    fi
+fi
+
+if [ ! -d "$src" ]; then
+    echo "==> worktree $name at $ref"
+    git -C "$crawl_repo" worktree add --detach "$tree" "$ref"
+fi
+
+# worktrees do not inherit the parent's submodules
+echo "==> submodules"
+git -C "$tree" submodule update --init --recursive --quiet
+
+# Local crawl patches, applied before the build. dgn.shop_type_at has no
+# upstream equivalent -- crawl exposes a shop's stock and name but not its type
+# -- and a shop's name does not determine it, so without this a fill silently
+# records null for every shop. Idempotent: a patch already applied is skipped,
+# so re-provisioning an existing tree is safe.
+if [ -d "$root/patches" ]; then
+    for p in "$root"/patches/*.patch; do
+        [ -e "$p" ] || continue
+        if git -C "$tree" apply --check "$p" 2>/dev/null; then
+            echo "==> applying $(basename "$p")"
+            git -C "$tree" apply "$p"
+        elif git -C "$tree" apply --reverse --check "$p" 2>/dev/null; then
+            echo "==> $(basename "$p") already applied"
+        else
+            echo "error: $(basename "$p") does not apply to this tree" >&2
+            exit 1
+        fi
+    done
+fi
+
+# BUILD_ZLIB= uses the system zlib: the bundled copy is pre-C23 K&R C and
+# no longer compiles against current macOS SDK headers.
+echo "==> building crawl ($jobs jobs, this takes a few minutes)"
+PATH="$(dirname "$py"):$PATH" make -C "$src" -j"$jobs" profile BUILD_ZLIB= >"$root/builds/$name.build.log" 2>&1 \
+    || { echo "build failed, see builds/$name.build.log" >&2; exit 1; }
+PATH="$(dirname "$py"):$PATH" make -C "$src" util/fake_pty >>"$root/builds/$name.build.log" 2>&1
+
+if [ ! -x "$src/crawl" ]; then
+    echo "error: no binary produced, see builds/$name.build.log" >&2
+    exit 1
+fi
+
+cp "$root/scripts/seed_dump.lua" "$root/scripts/seed_dump_sexp.lua" "$src/scripts/"
+
+mkdir -p "$sandbox"
+echo "==> building des cache"
+(cd "$src" && ./crawl -dir "$sandbox" -builddb --reset-cache >/dev/null 2>&1)
+
+echo "==> $name ready: $("$src/crawl" --version | head -1)"

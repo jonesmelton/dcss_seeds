@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# Fill the corpus with a contiguous range of seeds for one version.
+#   tools/corpus-fill <version> [-s <start>] [-n <count>] [-d <depth>]
+#                     [--db <path>] [--skip-done] [--mon-items]
+#
+# Chunks the range across cores, runs one crawl process per chunk, and pipes
+# each straight into ingest. Ingest is idempotent per (seed, version, level),
+# so a failed chunk can simply be re-run. See docs/extraction.md.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+version="${1:?usage: corpus-fill <version> [-s start] [-n count] [-d depth] [--db path]}"
+shift
+
+start=1
+count=1000
+depth="D:8"
+db="$root/corpus.db"
+skip_done=0
+extra=()
+chunk="${CHUNK:-250}"
+jobs="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -s|--start)  start="$2"; shift 2 ;;
+        -n|--count)  count="$2"; shift 2 ;;
+        -d|--depth)  depth="$2"; shift 2 ;;
+        --db)        db="$2"; shift 2 ;;
+        --skip-done) skip_done=1; shift ;;
+        --mon-items|--all-items|--artefacts) extra+=("${1/--/-}"); shift ;;
+        --) shift; break ;;
+        *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
+
+# crawl takes -depth as a branch:level place, and a bare integer is NOT a
+# synonym for it: `-depth 8` reaches D:7, one short. That corpus then rescores
+# at cap 7 while the summary reads Fill_depth.shallow (8), so every heat cell
+# renders "unknown" -- a corpus that passes corpus-check and serves fine with a
+# blank column. Normalise the integer rather than refusing it.
+case "$depth" in
+    [0-9]|[0-9][0-9]) depth="D:$depth" ;;
+    *:*) ;;
+    *) echo "bad -depth '$depth': want a place like D:8 or Swamp:4" >&2; exit 1 ;;
+esac
+
+src="$root/builds/$version/crawl-ref/source"
+sandbox="$root/sandboxes/$version"
+ingest="$root/_build/default/bin/ingest.exe"
+rescore="$root/_build/default/bin/rescore.exe"
+
+[ -x "$src/crawl" ] || { echo "no build for '$version'; run: make provision-$version" >&2; exit 1; }
+[ -x "$ingest" ] || { echo "no ingest binary; run: just build" >&2; exit 1; }
+[ -x "$rescore" ] || { echo "no rescore binary; run: just build" >&2; exit 1; }
+
+# provision copies the dumpers at build time, so a build older than the script
+# has a stale copy. Re-copying is cheap and removes a whole class of confusion.
+cp "$root/scripts/seed_dump_sexp.lua" "$src/scripts/"
+
+if [ ! -f "$db" ]; then
+    echo "==> creating $db from schema.sql"
+    sqlite3 -init /dev/null "$db" < "$root/schema.sql"
+fi
+
+# The corpus has one writer, and a fill is eight of them. The deepen generator
+# is a ninth, running continuously and on nobody's schedule: when the two
+# overlap, both sides sit on the write lock long enough to exhaust the other's
+# busy_timeout. Holding this lock for the whole fill makes the exclusion a
+# property of the code rather than of the operator remembering to stop a
+# service. Deepen takes the same lock per pass and skips that pass instead of
+# waiting, so it yields to a fill rather than queueing behind one.
+lock="${FILL_LOCK:-${db%.db}-write.lock}"
+if command -v flock >/dev/null 2>&1; then
+    exec {lock_fd}>"$lock" || { echo "cannot open lock $lock" >&2; exit 1; }
+    if ! flock -n "$lock_fd"; then
+        echo "==> waiting for the corpus write lock ($lock)" >&2
+        flock "$lock_fd"
+    fi
+else
+    # macOS has no flock(1). A dev fill on a laptop has no deepen service to
+    # contend with, so this degrades to no locking rather than refusing to run.
+    echo "==> no flock(1); continuing without the corpus write lock" >&2
+fi
+
+seeds_tmp="$(mktemp)"
+trap 'rm -f "$seeds_tmp" "$seeds_tmp".part.*' EXIT
+
+seq "$start" "$((start + count - 1))" > "$seeds_tmp"
+
+if [ "$skip_done" -eq 1 ]; then
+    done_tmp="$(mktemp)"
+    sqlite3 -init /dev/null -noheader "$db" \
+        "select distinct sl.seed from seed_levels sl join versions v on v.id = sl.version_id where v.version = '$version';" \
+        | LC_ALL=C sort > "$done_tmp"
+    LC_ALL=C sort "$seeds_tmp" > "$seeds_tmp.all"
+    LC_ALL=C comm -23 "$seeds_tmp.all" "$done_tmp" | LC_ALL=C sort -n > "$seeds_tmp.todo"
+    mv "$seeds_tmp.todo" "$seeds_tmp"
+    rm -f "$done_tmp" "$seeds_tmp.all"
+fi
+
+total=$(wc -l < "$seeds_tmp" | tr -d ' ')
+[ "$total" -gt 0 ] || { echo "nothing to do"; exit 0; }
+
+# Batching amortises crawl's ~0.6s startup, but a single chunk leaves cores
+# idle. Shrink the chunk so every worker gets one, while keeping chunks big
+# enough that startup stays amortised.
+if [ -z "${CHUNK:-}" ]; then
+    by_jobs=$(( (total + jobs - 1) / jobs ))
+    [ "$by_jobs" -lt 1 ] && by_jobs=1
+    [ "$by_jobs" -lt "$chunk" ] && chunk=$by_jobs
+fi
+
+split -l "$chunk" "$seeds_tmp" "$seeds_tmp".part.
+parts=("$seeds_tmp".part.*)
+echo "==> $version @ $depth: $total seeds, ${#parts[@]} chunk(s) of $chunk, $jobs way parallel -> $db"
+
+started=$(date +%s)
+
+run_chunk() {
+    local part="$1"
+    local first last
+    first=$(head -1 "$part")
+    last=$(tail -1 "$part")
+    # Seeds are passed explicitly rather than as -seed/-count: --skip-done
+    # punches holes in the range, so a chunk is not necessarily contiguous.
+    local seeds=()
+    while read -r s; do seeds+=("$s"); done < "$part"
+    local n=${#seeds[@]}
+    local t0
+    t0=$(date +%s)
+    if (cd "$src" && util/fake_pty ./crawl -dir "$sandbox" \
+        -script seed_dump_sexp.lua \
+        -seed "${seeds[@]}" -depth "$depth" ${extra[@]+"${extra[@]}"} 2>&1) \
+        | grep '^#SEED#' \
+        | "$ingest" -db "$db" -quiet -batch-size 2000 \
+        > "$part.log" 2>&1
+    then
+        chunk_done "$n" "$t0" ok "$first" "$last"
+    else
+        chunk_done "$n" "$t0" failed "$first" "$last"
+        echo "chunk $first..$last failed, see $part.log" >&2
+    fi
+}
+
+# One line per chunk as it lands, so a long fill leaves a rate CURVE rather
+# than a single average over its whole duration. The distinction is the point:
+# ingest writes into a growing table with growing indexes, so the rate decays,
+# and an average cannot tell an asymptote from a linear decline -- only one of
+# which reaches a large corpus. See docs/corpus-scaling.md.
+#
+# Chunks finish concurrently and every worker appends here. A lone printf of
+# one short line to O_APPEND is atomic under PIPE_BUF, which is what makes this
+# safe without a lock.
+chunk_done() {
+    local n="$1" t0="$2" status="$3" first="$4" last="$5"
+    local now secs rate
+    now=$(date +%s)
+    secs=$(( now - t0 ))
+    [ "$secs" -gt 0 ] || secs=1
+    rate=$(( n * 60 / secs ))
+    [ -z "$progress" ] || \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$now" "$(( now - started ))" "$n" "$secs" "$rate" "$status" "$first-$last" \
+            >> "$progress" 2>/dev/null || true
+    [ "$quiet_progress" -eq 1 ] || \
+        printf '    [%5ds] %s seeds in %ss = %s/min (%s %s)\n' \
+            "$(( now - started ))" "$n" "$secs" "$rate" "$status" "$first-$last" >&2
+}
+
+# Written next to the database rather than into the checkout: a fill on the
+# host runs against /corpus, and the log describing it belongs with the corpus
+# it describes, not in a working tree that gets updated out from under it.
+progress="${PROGRESS:-${db%.db}-fill-progress.tsv}"
+quiet_progress="${QUIET_PROGRESS:-0}"
+# The log is diagnostics, so it must never be why a fill refuses to start: an
+# unwritable path degrades to no log rather than taking the run down with it.
+# Without this the header write trips set -e before the first chunk.
+if [ ! -s "$progress" ]; then
+    printf 'at\telapsed\tseeds\tsecs\tper_min\tstatus\trange\n' > "$progress" 2>/dev/null || progress=""
+elif [ ! -w "$progress" ]; then
+    progress=""
+fi
+if [ -n "$progress" ]; then
+    echo "==> progress log: $progress"
+else
+    echo "==> progress log unwritable, continuing without it" >&2
+fi
+
+for part in "${parts[@]}"; do
+    run_chunk "$part" &
+    while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n; done
+done
+wait
+elapsed=$(( $(date +%s) - started ))
+
+# Released before the rescore, not at exit. The lock exists to keep eight
+# parallel writers off the single write lock for hours; the rescore is one
+# writer doing long scans, which is what busy_timeout is sized for. Holding it
+# through the rescore would make a user's deepen request wait out the scoring
+# pass too -- on a 100k corpus that is the larger half of the wait.
+[ -z "${lock_fd:-}" ] || exec {lock_fd}>&-
+
+got=$(sqlite3 -init /dev/null -noheader "$db" \
+    "select count(distinct sl.seed) from seed_levels sl join versions v on v.id = sl.version_id where v.version = '$version';")
+rows=$(sqlite3 -init /dev/null -noheader "$db" \
+    "select count(*) from entries e join versions v on v.id = e.version_id where v.version = '$version';")
+echo "==> ${elapsed}s; corpus now holds $got seeds / $rows entries for $version"
+
+# Heat is a population statistic over the whole version, not a per-batch
+# derivation -- see docs/heat.md, "Running it": the surprise pass runs after a
+# fill completes, not per batch. This is the fill's first post-fill
+# maintenance phase; it runs only after every worker above has exited, so it
+# reads a settled corpus rather than one still under a parallel-writer race.
+echo "==> $version: rescoring heat"
+rescore_started=$(date +%s)
+"$rescore" -db "$db" -build "$version"
+rescore_elapsed=$(( $(date +%s) - rescore_started ))
+echo "==> rescore ${rescore_elapsed}s; fill ${elapsed}s; total $(( elapsed + rescore_elapsed ))s"

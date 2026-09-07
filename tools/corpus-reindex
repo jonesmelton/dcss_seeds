@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# Add any tables and indexes schema.sql declares that a corpus is missing, and
+# rebuild any index whose definition changed under the same name.
+#   tools/corpus-reindex [--db <path>]
+#
+# schema.sql gains indexes over time, and a corpus created by an older copy
+# silently scans where it should seek. It also gains the occasional table --
+# book_spells, say -- and there a missing one is not slow but fatal, since a
+# read path prepares a statement against it. This replays both, made idempotent
+# with `if not exists`, so it is safe to run against a corpus at any time --
+# including one being filled, though it will contend with the writers and is
+# better run after.
+#
+# `if not exists` only covers an index schema.sql *adds*; a column reordered
+# or appended inside an existing index name -- entries_search_type gaining a
+# trailing `cost`, say -- leaves sqlite_master's row untouched, since the name
+# already exists and the create is skipped outright. That is silent: the old
+# definition keeps serving every query under the new name, and nothing short
+# of an `explain query plan` diff would show it. So before the replay, every
+# index schema.sql declares is compared against sqlite_master's stored
+# definition and dropped for the replay to recreate if they disagree.
+#
+# Replaying a `create table` only creates what is absent; it does not alter a
+# table whose columns changed, so a column a later wire format added is listed
+# by name below and added on its own.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+db="$root/corpus.db"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --db) db="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
+
+[ -f "$db" ] || { echo "no corpus at $db" >&2; exit 1; }
+
+# This adds what is missing; it cannot reshape what is there. Interning renamed
+# every text column on entries and seed_levels to an id and moved the values
+# into a `strings` dictionary, which is a rewrite of the data, not a DDL change
+# -- `create table if not exists` sees the old table, does nothing, and the
+# index replay below then fails or, worse, half-applies against columns whose
+# names no longer mean what they say.
+#
+# So an old-schema corpus is refused outright rather than partly migrated. The
+# migration path is the reingest the name-compression plan budgets for; there is
+# no in-place upgrade, and pretending otherwise would leave a corpus that reads
+# wrong rather than one that reads not at all.
+if [ "$(sqlite3 -init /dev/null -noheader "$db" \
+    "select count(*) from pragma_table_info('entries') where name = 'name_id';")" -eq 0 ]; then
+    echo "$db predates the interned schema (entries has no name_id)." >&2
+    echo "This tool adds missing tables and indexes; it cannot migrate that" >&2
+    echo "reshape. Refill into a new file." >&2
+    exit 1
+fi
+
+# Columns a later format added. `create table if not exists` sees the existing
+# table and does nothing, so each one needs its own add -- idempotent because
+# the add is skipped when pragma_table_info already lists it. They stay null
+# until a re-fill on the new format, which is the whole point of the bump: the
+# facts are un-backfillable, and the column existing is only what lets an old
+# corpus load under the new reader.
+add_column() {
+    if [ "$(sqlite3 -init /dev/null -noheader "$db" \
+        "select count(*) from pragma_table_info('$1') where name = '$2';")" -eq 0 ]; then
+        sqlite3 -init /dev/null "$db" "alter table $1 add column $2 $3;"
+        echo "added $1.$2"
+    fi
+}
+
+add_column seed_levels gold integer
+add_column entries toll_note_id integer
+
+before=$(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_master where type = 'index' and name not like 'sqlite_%';")
+before_t=$(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_master where type = 'table' and name not like 'sqlite_%';")
+
+# `create X` -> `create X if not exists`, so replaying is a no-op for whatever
+# already exists. Statements span lines, so they are joined first. Tables go
+# before indexes, since an index on a missing table is an error.
+replay() {
+    # Comments must go before the newlines do: flattening first would let a
+    # `--` comment inside a create-table body swallow the rest of the statement.
+    sed 's/--.*$//' "$root/schema.sql" \
+        | tr '\n' ' ' \
+        | grep -oE "create $1 [^;]+;" \
+        | sed "s/create $1 /create $1 if not exists /" \
+        | tr ';' '\n' \
+        | sed 's/$/;/' \
+        | grep -v '^;$'
+}
+
+# One declared statement per line, without the `if not exists` the replay
+# above injects -- this is what gets diffed against sqlite_master, which never
+# has it either. Squeezed to single spaces so the only differences left are
+# real ones, not schema.sql's line wrapping.
+declared_indexes() {
+    sed 's/--.*$//' "$root/schema.sql" \
+        | tr '\n' ' ' \
+        | grep -oE "create index [^;]+;" \
+        | tr ';' '\n' \
+        | sed 's/$/;/' \
+        | grep -v '^;$' \
+        | tr -s ' '
+}
+
+# sqlite_master stores a create-index statement close to verbatim -- same
+# casing, same whitespace it was given -- except it always renders the
+# `create index` keywords uppercase regardless of how they were typed. So the
+# declared side is upper-cased the same two words before comparing, or every
+# index would look changed.
+while IFS= read -r stmt; do
+    name=$(sed -E 's/^create index ([a-zA-Z_0-9]+).*/\1/' <<<"$stmt")
+    declared_norm=$(sed -E 's/^create index/CREATE INDEX/; s/;$//' <<<"$stmt")
+    live=$(sqlite3 -init /dev/null -noheader "$db" \
+        "select sql from sqlite_master where type = 'index' and name = '$name';")
+    if [ -n "$live" ] && [ "$live" != "$declared_norm" ]; then
+        sqlite3 -init /dev/null "$db" "drop index $name;"
+        echo "redefined $name"
+    fi
+done < <(declared_indexes)
+
+sqlite3 -init /dev/null "$db" < <(replay table)
+
+# `create virtual table` needs its own pass: the `create table` grep above
+# requires those two words adjacent and so never matches it. Without this the
+# fts5 substring index would be invisible to the one tool that exists to add
+# what a corpus is missing, and the only thing that created it would be the
+# rebuild tool -- a second schema-creation path for one table.
+#
+# `replay` cannot be reused as-is because the `if not exists` it injects has to
+# land after `virtual table`, not after `create`.
+sed 's/--.*$//' "$root/schema.sql" \
+    | tr '\n' ' ' \
+    | grep -oE "create virtual table [^;]+;" \
+    | sed 's/create virtual table /create virtual table if not exists /' \
+    | sqlite3 -init /dev/null "$db"
+
+sqlite3 -init /dev/null "$db" < <(replay index)
+
+after=$(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_master where type = 'index' and name not like 'sqlite_%';")
+after_t=$(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_master where type = 'table' and name not like 'sqlite_%';")
+echo "tables:  $before_t -> $after_t"
+echo "indexes: $before -> $after"
+
+# seed_fills is derived, not extracted: the levels a seed already holds are the
+# evidence of how deep it was filled, which is what lets an existing corpus gain
+# the column without re-extraction. Seeds already recorded are left alone, so
+# this is idempotent and cheap to re-run after a partial fill.
+#
+# The depth expression mirrors Fill_depth.of_levels: reach depth is the branch's
+# entrance depth plus the level number, portals are skipped (a portal ranks at
+# its parent's depth and never extends a seed's reach), and an unknown branch
+# contributes nothing rather than sorting last.
+backfill=$(cat <<'SQL'
+insert into seed_fills (seed, version_id, depth)
+select sl.seed
+     , sl.version_id
+     , max(case
+             when instr(s_level.val, ':') > 0
+             then coalesce(b.entrance, -1) + cast(substr(s_level.val, instr(s_level.val, ':') + 1) as integer)
+             else coalesce(b.entrance, -1)
+           end)
+  from seed_levels as sl
+  join strings as s_level
+    on s_level.id = sl.level_id
+  left join (select 'D' as br, 0 as entrance
+             union all select 'Temple', 4
+             union all select 'Lair', 8
+             union all select 'Vaults', 8
+             union all select 'Orc', 9
+             union all select 'Crypt', 10
+             union all select 'Snake', 10
+             union all select 'Spider', 10
+             union all select 'Shoals', 10
+             union all select 'Swamp', 10
+             union all select 'Elf', 11
+             union all select 'Slime', 12
+             union all select 'Depths', 15
+             union all select 'Zot', 19) as b
+    on b.br = case
+                when instr(s_level.val, ':') > 0
+                then substr(s_level.val, 1, instr(s_level.val, ':') - 1)
+                else s_level.val
+              end
+ where b.entrance is not null
+   and not exists (select 1
+                     from seed_fills as f
+                    where f.seed = sl.seed
+                      and f.version_id = sl.version_id)
+ group by sl.seed, sl.version_id
+SQL
+)
+sqlite3 -init /dev/null "$db" "$backfill;"
+echo "fill depths: $(sqlite3 -init /dev/null -noheader "$db" "select count(*) from seed_fills;") seeds"
+
+# A new index the planner does not know the size of is the same problem as a
+# missing one. Without sqlite_stat1 it sizes every index from built-in defaults
+# and underestimates the partial ones badly enough to pick a whole-table walk
+# over a seek: measured 161ms against 1.9ms on one summary query over a
+# 10k-seed corpus. Ingest refreshes this at close via `pragma optimize`; this is
+# what gets a corpus filled before that existed onto the same footing.
+sqlite3 -init /dev/null "$db" "analyze;"
+echo "statistics: $(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_stat1;") rows"

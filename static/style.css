@@ -1,0 +1,1697 @@
+/* Typography and color per docs/style.md. Alegreya throughout — every shipped
+   face carries `tnum`, so tabular data needs no monospaced font and there is no
+   mono role. Color marks significance, never category. */
+
+/* ── Fonts ─────────────────────────────────────────────────────────────── */
+@font-face {
+  font-family: "Alegreya";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/type/alegreya/alegreya.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Alegreya";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/type/alegreya/alegreya-italic.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Alegreya SC";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/static/type/alegreya/alegreya-sc-500.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Alegreya Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/type/alegreya/alegreya-sans-400.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Alegreya Sans";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/static/type/alegreya/alegreya-sans-500.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Alegreya Sans";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/type/alegreya/alegreya-sans-italic.woff2") format("woff2");
+}
+
+/* ── Color ─────────────────────────────────────────────────────────────── */
+/* Light is defined on bare :root so it is the fallback in every case. Dark is
+   redefined twice: once under the OS preference, once under an explicit
+   data-theme, so the toggle wins in both directions. */
+:root {
+  color-scheme: light dark;
+
+  --ink: oklch(0.22 0.012 250);
+  --paper: oklch(0.98 0.005 250);
+  --ink-2: oklch(0.44 0.02 250);
+  --ink-3: oklch(0.58 0.014 250);
+  --paper-2: oklch(0.95 0.008 250);
+  --rule: oklch(0.86 0.01 250);
+  --rule-2: oklch(0.91 0.008 250);
+
+  --accent: oklch(0.45 0.11 250);
+  --gold: oklch(0.52 0.11 75);
+  --ember: oklch(0.51 0.13 45);
+  --verdant: oklch(0.48 0.1 150);
+  --arcane: oklch(0.48 0.13 305);
+  --danger: oklch(0.52 0.18 28);
+
+  --serif: "Alegreya", Georgia, serif;
+  --sans: "Alegreya Sans", system-ui, sans-serif;
+  --sc: "Alegreya SC", var(--serif);
+}
+
+/* Accents gain lightness and shed chroma against a dark ground to hold the same
+   apparent contrast; they are defined per theme, not derived. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ink: oklch(0.91 0.01 250);
+    --paper: oklch(0.19 0.008 250);
+    --ink-2: oklch(0.68 0.022 250);
+    --ink-3: oklch(0.56 0.014 250);
+    --paper-2: oklch(0.23 0.01 250);
+    --rule: oklch(0.35 0.012 250);
+    --rule-2: oklch(0.27 0.01 250);
+
+    --accent: oklch(0.76 0.1 250);
+    --gold: oklch(0.82 0.11 80);
+    --ember: oklch(0.75 0.12 45);
+    --verdant: oklch(0.76 0.11 150);
+    --arcane: oklch(0.76 0.12 305);
+    --danger: oklch(0.7 0.15 28);
+  }
+}
+
+:root[data-theme="dark"] {
+  --ink: oklch(0.91 0.01 250);
+  --paper: oklch(0.19 0.008 250);
+  --ink-2: oklch(0.68 0.022 250);
+  --ink-3: oklch(0.56 0.014 250);
+  --paper-2: oklch(0.23 0.01 250);
+  --rule: oklch(0.35 0.012 250);
+  --rule-2: oklch(0.27 0.01 250);
+
+  --accent: oklch(0.76 0.1 250);
+  --gold: oklch(0.82 0.11 80);
+  --ember: oklch(0.75 0.12 45);
+  --verdant: oklch(0.76 0.11 150);
+  --arcane: oklch(0.76 0.12 305);
+  --danger: oklch(0.7 0.15 28);
+}
+
+/* ── Base ──────────────────────────────────────────────────────────────── */
+* {
+  box-sizing: border-box;
+}
+
+html {
+  font-family: var(--serif);
+  font-size: 1.125rem;
+  line-height: 1.6;
+  font-variant-numeric: oldstyle-nums proportional-nums;
+  font-feature-settings: "kern" 1, "liga" 1;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+main {
+  margin: 0 auto;
+  max-width: 38rem;
+  padding: 2rem 1.5rem 4rem;
+}
+
+/* Catalogs are not prose and must not be crammed into the reading measure. */
+.wide {
+  max-width: 62rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* ── Numerals ──────────────────────────────────────────────────────────── */
+.num {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+/* A seed is a ten-digit identifier read as a token, not a quantity, and it must
+   be tellable apart at a glance from the serif data around it. The sans does
+   that job without leaving the family — which is why there is no mono.
+   Listed with h1 so it wins there: a seed set in small-caps is just a number. */
+h1 .seed,
+.seed {
+  font-family: var(--sans);
+  font-variant-numeric: tabular-nums lining-nums;
+  font-size: 0.9em;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+/* ── Small-caps ────────────────────────────────────────────────────────── */
+.sc {
+  font-family: var(--sc);
+  letter-spacing: 0.06em;
+}
+
+.sc-label {
+  font-family: var(--sc);
+  letter-spacing: 0.12em;
+}
+
+/* A portal is catalogued under its own name, so the level its entrance sat on
+   is the reader's only clue to how early it is reachable. */
+.from {
+  font-size: 0.6em;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+/* ── Headings ──────────────────────────────────────────────────────────── */
+h1,
+h2 {
+  font-family: var(--sc);
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  margin: 0 0 0.5rem;
+}
+
+/* Small-caps read larger than their point size suggests, since every letter is
+   cap-height; the scale is pulled in a step from what a lowercase serif would
+   want so a heading has authority without shouting. */
+h1 {
+  font-size: 1.75rem;
+  line-height: 1.25;
+}
+
+h2 {
+  font-size: 1.35rem;
+  line-height: 1.3;
+  margin-top: 2.5rem;
+}
+
+h3 {
+  font-style: italic;
+  font-weight: 700;
+  font-size: 1.25rem;
+  line-height: 1.2;
+  margin: 2rem 0 0.5rem;
+}
+
+/* Below h3 the Tufte convention applies: a run-in side head, not another
+   size step. */
+h4,
+h5,
+h6 {
+  display: run-in;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 1rem;
+  font-style: normal;
+  margin: 0 0.5em 0 0;
+}
+
+.subtitle {
+  color: var(--ink-2);
+  font-style: italic;
+  margin-bottom: 1.5rem;
+}
+
+.newthought {
+  font-family: var(--sc);
+  letter-spacing: 0.04em;
+}
+
+/* ── Body text ─────────────────────────────────────────────────────────── */
+p {
+  margin: 0 0 1.2em;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 0.5px;
+  text-underline-offset: 0.15em;
+  text-decoration-color: color-mix(in oklch, var(--accent) 40%, transparent);
+}
+
+a:hover,
+a:focus-visible {
+  text-decoration-color: currentcolor;
+}
+
+/* A link that leaves the site says so, since an unmarked one here reads as
+   another page of the catalog. A glyph appended in content, so it never lands
+   on its own line. */
+.outbound::after {
+  content: "\2197";
+  display: inline-block;
+  margin-left: 0.15em;
+  font-size: 0.8em;
+  vertical-align: 0.1em;
+  text-decoration: none;
+}
+
+em {
+  font-style: italic;
+}
+
+strong {
+  font-weight: 700;
+}
+
+blockquote {
+  margin: 1.5em 0;
+  padding-left: 1.5rem;
+  border-left: 2px solid var(--rule);
+  color: var(--ink-2);
+}
+
+blockquote footer {
+  font-style: italic;
+  font-size: 0.9em;
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--sans);
+  font-size: 0.9em;
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+pre {
+  overflow-x: auto;
+  padding: 1rem 1.25rem;
+  background: var(--paper-2);
+  line-height: 1.5;
+}
+
+kbd {
+  border: 0.5px solid var(--rule);
+  border-radius: 3px;
+  padding: 0.05em 0.4em;
+  background: var(--paper-2);
+}
+
+/* ── Rules ─────────────────────────────────────────────────────────────── */
+hr {
+  border: none;
+  border-top: 0.5px solid var(--rule);
+  margin: 2rem 0;
+}
+
+.section-rule {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 2.5rem;
+}
+
+.section-rule::before,
+.section-rule::after {
+  content: "";
+  flex: 1;
+  height: 0;
+  border-top: 0.5px solid var(--rule);
+}
+
+.section-rule > * {
+  font-family: var(--sc);
+  letter-spacing: 0.1em;
+  color: var(--ink-2);
+  white-space: nowrap;
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+/* ── Page header ───────────────────────────────────────────────────────── */
+/* The masthead shares the reading measure plus the breakout the catalog uses,
+   so the site name lines up with the widest thing on the page rather than
+   floating on an axis of its own. */
+.masthead {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 1rem 1.5rem 0;
+}
+
+.masthead-bar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.masthead .site {
+  font-family: var(--sc);
+  letter-spacing: 0.08em;
+  color: var(--ink-2);
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+
+.masthead .site:hover {
+  color: var(--ink);
+}
+
+/* Between the site name and the theme toggle, set in the same small caps as
+   both so the bar reads as one row of chrome rather than three things that
+   happen to be adjacent. The nav is deliberately small: the build below it is
+   the masthead's dominant element and stays that way. */
+.masthead-nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  gap: 1.1rem;
+}
+
+.masthead-nav a {
+  font-family: var(--sc);
+  letter-spacing: 0.08em;
+  font-size: 0.8rem;
+  color: var(--ink-3);
+  text-decoration: none;
+  padding-bottom: 0.15rem;
+  border-bottom: 1px solid transparent;
+}
+
+.masthead-nav a:hover {
+  color: var(--ink);
+  border-bottom-color: var(--rule);
+}
+
+/* The current page is marked by weight and a rule, not by colour alone. */
+.masthead-nav a.current {
+  color: var(--ink);
+  font-weight: 500;
+  border-bottom-color: var(--accent);
+}
+
+/* The build outranks the product name, because the product name is not what
+   makes an answer here right or wrong. A seed quoted without its build is the
+   commonest way a shared seed becomes a different dungeon, so the version is
+   set at display size and the caveat sits under it rather than in a footer. */
+.build {
+  margin-top: 0.6rem;
+  padding-bottom: 0.9rem;
+  border-bottom: 0.5px solid var(--rule);
+}
+
+.build-version {
+  display: block;
+  font-family: var(--sans);
+  font-weight: 500;
+  font-size: clamp(1.9rem, 6vw, 3rem);
+  line-height: 1;
+  letter-spacing: -0.01em;
+  font-variant-numeric: lining-nums tabular-nums;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.build-version:hover {
+  color: var(--accent);
+}
+
+.build-label {
+  font-family: var(--sc);
+  font-size: 0.42em;
+  letter-spacing: 0.1em;
+  color: var(--ink-3);
+  vertical-align: 0.55em;
+}
+
+.build-caveat {
+  margin: 0.35rem 0 0;
+  max-width: 34rem;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  font-style: italic;
+  color: var(--ink-2);
+}
+
+/* The picker keeps the build at display size: it is still the dominant
+   element, now openable. The triangle is drawn rather than inherited, since
+   inline-block drops the UA marker. */
+.build-picker > summary {
+  display: inline-block;
+  list-style: none;
+  cursor: pointer;
+}
+
+.build-picker > summary::-webkit-details-marker {
+  display: none;
+}
+
+.build-picker > summary::after {
+  content: "\25b8";
+  display: inline-block;
+  margin-left: 0.3em;
+  font-size: 0.4em;
+  vertical-align: 0.35em;
+  color: var(--ink-3);
+  transition: transform 120ms ease;
+}
+
+.build-picker[open] > summary::after {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .build-picker > summary::after {
+    transition: none;
+  }
+}
+
+.build-picker > summary:hover,
+.build-picker > summary:hover::after {
+  color: var(--accent);
+}
+
+.build-list {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.6rem;
+}
+
+.build-choice {
+  display: block;
+  text-decoration: none;
+  color: var(--ink-2);
+  padding: 0.15rem 0.3rem;
+  border-radius: 2px;
+  border-left: 2px solid transparent;
+  padding-left: 0.5rem;
+}
+
+.build-choice:hover {
+  color: var(--ink);
+  border-left-color: var(--accent);
+}
+
+.build-choice-name {
+  display: block;
+  font-family: var(--sans);
+  font-variant-numeric: lining-nums tabular-nums;
+  font-size: 1rem;
+}
+
+.build-choice.current .build-choice-name {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.build-choice-count {
+  display: block;
+  font-size: 0.72rem;
+  font-variant-numeric: lining-nums tabular-nums;
+  color: var(--ink-3);
+}
+
+/* ── Theme toggle ──────────────────────────────────────────────────────── */
+/* Three states, not two: following the OS is a distinct choice from pinning a
+   theme, and a reader who has pinned one needs a way back. */
+.theme-toggle {
+  display: inline-flex;
+  border: 0.5px solid var(--rule);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.theme-toggle button {
+  font: inherit;
+  font-family: var(--sc);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  padding: 0.15rem 0.6rem;
+  border: 0;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+
+.theme-toggle button + button {
+  border-left: 0.5px solid var(--rule);
+}
+
+.theme-toggle button:hover {
+  color: var(--ink);
+  background: var(--paper-2);
+}
+
+/* The current theme is marked by weight and fill as well as color. */
+.theme-toggle button[aria-pressed="true"] {
+  color: var(--ink);
+  background: var(--paper-2);
+  font-weight: 500;
+}
+
+/* ── Tables ────────────────────────────────────────────────────────────── */
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+/* The first four columns are narrow and fixed; "others" takes the rest, since
+   its tag list is the one thing here that varies in width. */
+.seed-list {
+  width: 100%;
+  max-width: 100%;
+  min-width: 18rem;
+}
+
+.seed-list td,
+.seed-list th {
+  padding-right: 1.5rem;
+}
+
+/* A deep seed carries several times the portals and rare altars a D:8 seed
+   does -- seven tags against one -- so this cell is sized to take the rest of
+   the row and wrap inside it. It must not widen the table: an extra column of
+   width buys a horizontal scrollbar for the one column that reads fine stacked,
+   and the tags are an unordered set, not a sequence, so a second line loses
+   nothing. */
+.seed-list td.tags,
+.seed-list th.tags {
+  padding-right: 0;
+}
+
+/* Heat is the listing's one ordinal -- four bands in a fixed order -- so it is
+   set as a scale rather than as a pictogram: a constant track of four hairline
+   ticks filled to the band, then the band's name. The track prints the scale on
+   every row, so a reader sees that `warm` is second of four without knowing the
+   vocabulary. The word still carries the meaning; the fill and the hue only
+   find it. The cold end stays in ink -- blue is navigation and red is danger, so
+   a heat scale gets no hue of its own beyond `--ember` at the top. The gauge and
+   its word read as one token; a break between them would leave the track alone
+   on a line. */
+.seed-list td.heat {
+  white-space: nowrap;
+}
+
+.heat-mark {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5em;
+}
+
+/* Ticks sit on the baseline as a group and rise to cap height, so a column of
+   gauges reads as one axis alongside the tabular figures beside it. */
+.heat-gauge {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  flex: none;
+  vertical-align: -0.05em;
+}
+
+.heat-gauge i {
+  display: block;
+  width: 3px;
+  height: 0.72em;
+  background: var(--rule-2);
+}
+
+.heat-band {
+  font-family: var(--sc);
+  letter-spacing: 0.06em;
+  font-size: 0.95rem;
+  color: var(--ink-2);
+}
+
+/* Fill: the first N ticks take the band's ink. */
+.heat--cold .heat-gauge i:nth-child(-n + 1),
+.heat--warm .heat-gauge i:nth-child(-n + 2),
+.heat--hot .heat-gauge i:nth-child(-n + 3),
+.heat--blazing .heat-gauge i {
+  background: currentcolor;
+}
+
+/* The mark's `color` is the tick ink, so cold's ticks stay the quietest on the
+   page -- but `--ink-3` is 4.0:1 on paper and misses AA as body text, so the
+   word alone steps up to `--ink-2`. The band still reads as the cold end by
+   fill count and tick weight, which is where that signal belongs. */
+.heat--cold {
+  color: var(--ink-3);
+}
+
+.heat--cold .heat-band {
+  color: var(--ink-2);
+}
+
+.heat--warm {
+  color: var(--ink-2);
+}
+
+.heat--hot,
+.heat--blazing {
+  color: var(--ember);
+}
+
+.heat--hot .heat-band,
+.heat--blazing .heat-band {
+  color: var(--ember);
+}
+
+/* Blazing is the top of the scale and the rarest band, so it is set bold as
+   well: the palette is never the only thing saying so. */
+.heat--blazing .heat-band {
+  font-weight: 700;
+}
+
+/* Tags are distinguished from each other by their leading glyph and from body
+   text by size and letterspacing, so the hue is the last signal rather than the
+   only one.
+
+   A wrapping flex row rather than an inline run: the markup has no whitespace
+   between adjacent spans, so an inline run offers the line breaker no
+   opportunity between two tags and the cell overflows instead of wrapping. A
+   deep seed carries seven of these against a shallow seed's one, so wrapping is
+   the normal case, not the edge. The tags are an unordered set, so a second
+   line costs nothing. */
+.seed-list td.tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 0.7rem;
+  row-gap: 0.15rem;
+}
+
+/* Tile + label on one line; a tile split from its word says nothing. */
+.tag {
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums lining-nums;
+  white-space: nowrap;
+}
+
+.tag .tile {
+  width: 1.1rem;
+  height: 1.1rem;
+  vertical-align: -0.2em;
+  margin-right: 0.25rem;
+}
+
+.tag--boon {
+  color: var(--verdant);
+  font-weight: 600;
+}
+
+.tag--altar {
+  color: var(--arcane);
+}
+
+.tag--portal {
+  color: var(--verdant);
+}
+
+/* An em dash standing in for a value the corpus does not have, as against a
+   value of zero. Dimmed so a row of them reads as absence at a glance. */
+.unknown {
+  color: var(--ink-2);
+  opacity: 0.55;
+}
+
+/* A catalog is not prose and must not be crammed into the reading measure, but
+   the prose around it must stay at 65ch. So the table breaks *out* of the
+   measure symmetrically rather than the page widening around it: the negative
+   margin is capped by the viewport so it never forces a horizontal scroll on a
+   narrow screen, and the table scrolls inside itself when it still doesn't fit. */
+/* Only a table that is genuinely wide breaks out; a three-column summary spread
+   over 62rem is a row of numbers separated by a void. */
+.table-scroll--wide,
+.level-heading {
+  --breakout: min(11rem, calc((100vw - 100%) / 2 - 1.5rem));
+  margin-left: calc(-1 * var(--breakout));
+  margin-right: calc(-1 * var(--breakout));
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+/* A level heading titles its table, so it sits at the table's left edge rather
+   than at the prose measure the table has broken out of. */
+.level-heading {
+  margin-top: 2.5rem;
+}
+
+caption {
+  text-align: left;
+  margin-bottom: 0.75rem;
+  max-width: 60ch;
+}
+
+th {
+  font-family: var(--sc);
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-align: left;
+  color: var(--ink-2);
+  border-bottom: 0.5px solid var(--rule);
+  padding: 0 0.75rem 0.25rem 0;
+}
+
+td {
+  padding: 0.25rem 0.75rem 0.25rem 0;
+  vertical-align: baseline;
+}
+
+/* Numeric columns right-align on tabular figures; nothing centers. */
+td.figure,
+th.figure,
+td.num,
+th.num {
+  font-variant-numeric: tabular-nums lining-nums;
+  text-align: right;
+}
+
+/* A repeated grouping value is printed once at the head of its run: the cell is
+   emitted empty rather than hidden, since there is no longer anything listening
+   that would want the repetition read out. */
+td.elided {
+  color: transparent;
+}
+
+/* A significant row is marked at its left edge rather than by tinting the whole
+   row: a tinted background costs contrast on every cell to flag one. The rule
+   is 3px so it survives being the only thing in a 1px-hairline design. */
+tr.mark-gold td:first-child,
+tr.mark-ember td:first-child,
+tr.mark-arcane td:first-child {
+  border-left: 3px solid;
+  padding-left: 0.5rem;
+}
+
+tr.mark-gold td:first-child {
+  border-left-color: var(--gold);
+}
+
+tr.mark-ember td:first-child {
+  border-left-color: var(--ember);
+}
+
+tr.mark-arcane td:first-child {
+  border-left-color: var(--arcane);
+}
+
+/* ── Lists ─────────────────────────────────────────────────────────────── */
+ul,
+ol {
+  padding-left: 1.4em;
+}
+
+li {
+  margin: 0.2em 0;
+}
+
+dt {
+  font-family: var(--sc);
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+}
+
+dd {
+  margin: 0 0 0.6em;
+}
+
+/* ── Marginal notes ────────────────────────────────────────────────────── */
+.sidenote,
+.marginnote {
+  float: right;
+  clear: right;
+  margin-right: -12rem;
+  width: 10rem;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: var(--ink-2);
+  vertical-align: baseline;
+}
+
+@media (max-width: 60rem) {
+  .sidenote,
+  .marginnote {
+    float: none;
+    margin: 1rem 0;
+    width: auto;
+  }
+}
+
+/* ── Interactive ───────────────────────────────────────────────────────── */
+button.link {
+  font: inherit;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+  cursor: pointer;
+}
+
+button.link:hover {
+  color: var(--ink);
+}
+
+/* ── Copy a seed ───────────────────────────────────────────────────────── */
+/* A seed is a long opaque key that has to survive transcription into crawl's
+   own seed box, so it travels by clipboard. The button rides beside the number
+   rather than taking a column: it says the same thing on every row and a column
+   of "copy" is a column of noise.
+
+   A glyph, deliberately low contrast: the clipboard is one of the few icons a
+   reader already knows, and it repeats on every row, so it should sit under the
+   data rather than beside it. It is not the only signal — the button carries an
+   accessible name and a tooltip — and it comes up to full ink on hover and
+   focus. The confirmation is a check plus the accent, swapped by class so the
+   svg survives. */
+.copy-seed {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4em;
+  height: 1.4em;
+  margin-left: 0.35rem;
+  padding: 0;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--ink-3);
+  opacity: 0.55;
+  cursor: pointer;
+  vertical-align: -0.25em;
+  transition: opacity 120ms ease, color 120ms ease;
+}
+
+.copy-seed:hover,
+.copy-seed:focus-visible {
+  color: var(--ink);
+  opacity: 1;
+  background: var(--paper-2);
+}
+
+.copy-seed .icon {
+  display: none;
+  line-height: 0;
+}
+
+.copy-seed .icon svg {
+  width: 1em;
+  height: 1em;
+}
+
+.copy-seed .icon-copy {
+  display: block;
+}
+
+/* Copied and failed are marked by shape and hue together — a check against a
+   cross — never hue alone. */
+.copy-seed.is-done,
+.copy-seed.is-failed {
+  opacity: 1;
+}
+
+.copy-seed.is-done {
+  color: var(--verdant);
+}
+
+.copy-seed.is-failed {
+  color: var(--danger);
+}
+
+.copy-seed.is-done .icon-copy,
+.copy-seed.is-failed .icon-copy {
+  display: none;
+}
+
+.copy-seed.is-done .icon-done {
+  display: block;
+}
+
+.copy-seed.is-failed .icon-done {
+  display: block;
+  transform: rotate(45deg) scale(0.9);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .copy-seed {
+    transition: none;
+  }
+}
+
+.seed-list td:first-child {
+  white-space: nowrap;
+}
+
+h1 .copy-seed {
+  font-size: 0.55em;
+  vertical-align: 0.35em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 1px;
+}
+
+/* ── How deep the search went ──────────────────────────────────────────── */
+/* The seed page's preface. It is prose about the page rather than part of the
+   catalog, so it keeps the reading measure the surrounding paragraphs have and
+   is set apart by a rule rather than by a box -- a panel here would read as a
+   warning, and the shallow case is the ordinary one. */
+.depth-note {
+  border-left: 3px solid var(--rule);
+  padding-left: 1rem;
+  margin: 1.5rem 0;
+  color: var(--ink-2);
+}
+
+.depth-note p {
+  margin: 0.35rem 0;
+}
+
+/* A failed job is the one state that has gone wrong, and it says so in words
+   first; the hue only reinforces the sentence. */
+.depth-note .failed {
+  color: var(--danger);
+}
+
+.deepen {
+  margin-top: 0.75rem;
+}
+
+.deepen button {
+  font: inherit;
+  font-size: 0.9rem;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid currentcolor;
+  border-radius: 2px;
+  padding: 0.3em 0.9em;
+  cursor: pointer;
+}
+
+.deepen button:hover {
+  background: var(--accent);
+  color: var(--paper);
+}
+
+/* ── Status ────────────────────────────────────────────────────────────── */
+/* Color reinforces a word that is already there; it never carries the meaning
+   alone. See docs/style.md — every entry here is also set in type. */
+.is-ok {
+  color: var(--verdant);
+}
+
+.is-danger {
+  color: var(--danger);
+  font-weight: 500;
+}
+
+/* An artefact is the rarest thing on a level, so it gets the one hue reserved
+   for exceptional, plus weight. */
+.artefact {
+  font-weight: 700;
+  color: var(--gold);
+}
+
+.branded {
+  font-style: italic;
+  color: var(--ember);
+}
+
+.unique {
+  color: var(--ember);
+}
+
+.portal {
+  color: var(--arcane);
+}
+
+.useless {
+  color: var(--ink-3);
+  text-decoration: line-through;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* ── Forms ─────────────────────────────────────────────────────────────── */
+/* The term boxes hold a compact syntax (potion:haste, 3x wand:digging), so they
+   are sans and tabular like the seeds they search for. */
+.search input[type="text"],
+.jump input[type="text"] {
+  font-family: var(--sans);
+  font-variant-numeric: tabular-nums lining-nums;
+  font-size: 0.95em;
+  width: 100%;
+  max-width: 28rem;
+  padding: 0.35rem 0.5rem;
+  border: 0.5px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.search input[type="text"]:focus-visible,
+.jump input[type="text"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.search button,
+.jump button {
+  font: inherit;
+  font-family: var(--sc);
+  letter-spacing: 0.06em;
+  padding: 0.35rem 1rem;
+  border: 0.5px solid var(--ink-2);
+  background: var(--paper);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.search button:hover,
+.jump button:hover {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+
+/* The other half of what the front page does: the sample answers "show me some
+   seeds", this answers "show me that one". */
+.jump {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0 0 2rem;
+}
+
+.jump label {
+  font-family: var(--sc);
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+}
+
+.jump input[type="text"] {
+  width: auto;
+  max-width: 10rem;
+}
+
+/* ── Search ────────────────────────────────────────────────────────────── */
+.search .terms {
+  list-style: none;
+  margin: 0 0 0.5rem;
+  padding: 0;
+}
+
+.search .terms li + li {
+  margin-top: 0.35rem;
+}
+
+/* The search runs on the server and a cold conjunction is not instant, so the
+   window between the press and the swap needs to say something -- otherwise the
+   previous results sit there reading as current. It is a word, not a spinner:
+   the reduced-motion rule below strips every animation on this site, so an
+   indicator that is only motion says nothing to the reader who asked for none.
+   htmx toggles .htmx-request on this element for the life of the request. */
+.search-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+
+.search .busy {
+  font-family: var(--sc);
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.search .busy.htmx-request {
+  opacity: 1;
+}
+
+.search button:disabled {
+  color: var(--ink-3);
+  border-color: var(--rule);
+  cursor: default;
+}
+
+.search button:disabled:hover {
+  background: var(--paper);
+  color: var(--ink-3);
+  border-color: var(--rule);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .search .busy {
+    transition: none;
+  }
+}
+
+/* Evidence lines: one per term, so the reader can see why a seed matched. */
+.hits {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.hits li + li {
+  margin-top: 0.2rem;
+}
+
+/* ── The seed page ─────────────────────────────────────────────────────── */
+/* A floor is one ruled sheet with a fixed rail down its left. The rail carries
+   the part label — "notable", "also here", "shop" — in the margin rather than
+   above the content, so a reader's eye runs down a single column of contents
+   instead of restarting at each of six parts. It is the Tufte marginal note
+   applied to structure: the labels and the qualifications go in the margin, the
+   material stays in the block.
+
+   The breakout is taken once by the floor rather than by each part inside it,
+   so the rail, the labels and the content share one left edge. */
+.floor {
+  --breakout: min(11rem, calc((100vw - 100%) / 2 - 1.5rem));
+  margin-left: calc(-1 * var(--breakout));
+  margin-right: calc(-1 * var(--breakout));
+  margin-top: 3rem;
+}
+
+/* The heading column is sized to its own content rather than pinned to the
+   rail's 9rem: a portal's name carries "from D:6" after it, and a fixed column
+   breaks that onto a second line at a width the rest of the sheet never needs.
+   The facts still sit against the right edge, so the rule below reads as one. */
+.ledger-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.2rem 1.5rem;
+  border-bottom: 1px solid var(--ink);
+  padding-bottom: 0.4rem;
+}
+
+/* The floor's name is set the way a plate number sits in a catalog: it
+   identifies the sheet without competing with what is on it. */
+.ledger-depth {
+  font-family: var(--sc);
+  font-size: 1.6rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  margin: 0;
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+/* The floor's standing facts, read as a sentence rather than a scoreboard: is
+   this floor worth the trip, and what does it commit me to. An unremarkable
+   floor prints nothing here, which is itself the answer. */
+.ledger-facts {
+  font-size: 0.9rem;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums lining-nums;
+  text-align: right;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 9rem 1fr;
+  gap: 0 1.5rem;
+  padding: 0.55rem 0;
+  border-bottom: 0.5px solid var(--rule-2);
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.rail {
+  font-family: var(--sc);
+  font-size: 0.8rem;
+  letter-spacing: 0.1em;
+  color: var(--ink-3);
+  line-height: 1.5;
+  padding-top: 0.15rem;
+}
+
+/* A second shop repeats a label set directly above it, so the label is printed
+   once at the head of its run exactly as a repeated grouping value is elided in
+   a table. The cell is emitted rather than hidden so the grid keeps its column. */
+.rail.cont {
+  color: transparent;
+}
+
+.cell {
+  min-width: 0;
+}
+
+/* Every line of a floor is the same three-column shape — the thing, its flag,
+   its coordinate — so flags and coordinates stand on fixed axes and a reader
+   can run down either one or ignore both. */
+.line {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 0 1rem;
+  align-items: baseline;
+}
+
+.line + .line {
+  margin-top: 0.3rem;
+}
+
+.thing {
+  font-size: 1rem;
+}
+
+/* Crawl writes an artefact's properties as a braced clause on its own name.
+   Quieting that clause lets the item's identity read first while keeping the
+   resistances scannable, and costs no column that would be blank on every
+   ordinary row. */
+.props {
+  color: var(--ink-2);
+  font-style: italic;
+}
+
+/* A book's spell set runs to six names, which is longer than the item name it
+   belongs to, so it takes its own line under the title rather than pushing the
+   flag and coordinate columns off the sheet. Quieted like a property clause:
+   the book's identity reads first, the contents behind it. */
+.spells {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+  font-style: italic;
+  margin-left: 1.4rem;
+  text-wrap: pretty;
+}
+
+/* Crawl's own art for a feature, a unique, or an item type, set at the cap
+   height of the name beside it so a floor keeps one baseline. It is decoration:
+   the name says what this is, and a row with no tile simply prints none.
+   Nearest-neighbour because these are 32px pixel art being drawn smaller —
+   smooth scaling turns them to mud.
+
+   Not every tile is square: the hell lords and pan lords are 32x48, and a few
+   features are a pixel or two short. [object-fit: contain] letterboxes those
+   into the same box rather than stretching them, so one odd tile cannot
+   distort its art or push its row taller than the rest. */
+.tile {
+  width: 1.4rem;
+  height: 1.4rem;
+  object-fit: contain;
+  vertical-align: -0.32em;
+  margin-right: 0.35rem;
+  image-rendering: pixelated;
+  flex: none;
+}
+
+/* Significance is a word set in the palette, never a stripe alone and never a
+   color alone. One flag per line: two say nothing the rarer of them did not. */
+.flag {
+  font-family: var(--sc);
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.flag.boon {
+  color: var(--verdant);
+  font-weight: 600;
+}
+
+.flag.gold {
+  color: var(--gold);
+  font-weight: 500;
+}
+
+.flag.ember {
+  color: var(--ember);
+}
+
+.flag.arcane {
+  color: var(--arcane);
+}
+
+/* A coordinate is printed only for what stays put — see [Record.Entry.position].
+   The column is held open on rows that have none so the axis survives a floor
+   where uniques and floor items alternate. */
+.xy {
+  font-family: var(--sans);
+  font-variant-numeric: tabular-nums lining-nums;
+  font-size: 0.75rem;
+  color: var(--ink-3);
+  white-space: nowrap;
+  text-align: right;
+  min-width: 3.6rem;
+}
+
+/* Consumables and spares set as a sentence, because that is what fourteen
+   scrolls of teleportation are — not fourteen rows with a coordinate each.
+   Coordinates stay reachable on the title. */
+.cell.run {
+  color: var(--ink-2);
+}
+
+.cell.run i {
+  font-style: normal;
+}
+
+/* Each sundry is icon + name kept on one line: a tile is what says "potion" now
+   that the name does not, so the two must not be split by a wrap. The separator
+   sits on the name rather than on this box, which must stay inline for it. */
+.sundry {
+  white-space: nowrap;
+}
+
+.sundry .tile {
+  margin-right: 0.2rem;
+}
+
+.cell.run .sundry:not(:last-child) i::after {
+  content: " · ";
+  color: var(--rule);
+  white-space: normal;
+}
+
+/* Altars set as a field of names. A god outside crawl's temple pool takes the
+   weight and the gold, since a pool god stands in every seed's Temple and is
+   not a reason to cross a floor. Bold as well as gold: the palette is never the
+   only thing saying so. */
+.cell.field {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.7rem;
+}
+
+.cell.field .rare {
+  font-weight: 700;
+  color: var(--gold);
+}
+
+/* A shop is the one thing on this page read as a column of numbers, so it takes
+   the form a bill has always had: stock, a rule, and the total ruled off at the
+   foot. The total is what tells a treasury from a general store — twenty
+   artefacts and twenty potions are both "20 items". */
+.bill {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+/* The base caption is a prose measure, for the seed listing's explanatory
+   paragraph. A bill's caption is a title with a coordinate on the same right
+   axis as the prices below it, so it takes the table's width instead. */
+.bill caption {
+  max-width: none;
+  font-weight: 700;
+  text-align: left;
+  margin-bottom: 0.2rem;
+}
+
+/* A shop's coordinate is the same fact as any other line's, so it sits on the
+   same right-hand axis instead of running on after the name. The spread has to
+   happen on a block inside the caption rather than on the caption itself: a
+   [display: flex] caption is no longer a table-caption box, so it shrinks to
+   its own content and [width: 100%] has no table width to resolve against. */
+.bill-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0 1rem;
+}
+
+.shop-name {
+  min-width: 0;
+}
+
+.bill td {
+  padding: 0.1rem 0;
+  vertical-align: baseline;
+}
+
+.bill td.amt {
+  text-align: right;
+  font-variant-numeric: tabular-nums lining-nums;
+  white-space: nowrap;
+  padding-left: 1rem;
+}
+
+.bill tfoot td {
+  border-top: 0.5px solid var(--rule);
+  padding-top: 0.2rem;
+  font-family: var(--sc);
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+}
+
+.bill .tick {
+  font-family: var(--sc);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  color: var(--gold);
+  margin-left: 0.4em;
+}
+
+/* One corpus shop holds twenty artefacts. Twenty lines of it would push the
+   rest of the floor off the page, so a long bill scrolls in its own box. */
+.bill-wrap {
+  max-height: 24rem;
+  overflow-y: auto;
+}
+
+/* The branch index answers the first question asked of a seed, so it sits above
+   the floors and is set as a table of contents: the branch name leading, its
+   depth on a fixed axis so the column of depths can be read straight down. */
+.branches {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+}
+
+.branches li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.15rem 0;
+  border-bottom: 0.5px solid var(--rule-2);
+  max-width: 30rem;
+}
+
+.branch-name {
+  font-family: var(--sc);
+  letter-spacing: 0.06em;
+  color: var(--arcane);
+  min-width: 8rem;
+}
+
+.branch-level {
+  color: var(--ink-2);
+}
+
+/* The exclusive draws reuse the branch index's shape — an axis name leading, its
+   value on a fixed column — because they answer the same kind of question: one
+   line per axis, read straight down. The members not drawn trail at the edge in
+   the quiet ink, since they are what the drawn one rules out rather than
+   anything the seed holds. */
+.draws li {
+  max-width: 34rem;
+}
+
+.draw-value {
+  min-width: 11rem;
+}
+
+.drew {
+  font-weight: 700;
+  color: var(--gold);
+}
+
+.draw-alts {
+  margin-left: auto;
+  font-size: 0.85em;
+  color: var(--ink-3);
+}
+
+/* Crawl names a portal entrance for how it looks, not where it goes, so the
+   destination is set beside it — quieter than the name it annotates, since the
+   name is still the thing on the floor. */
+.destination {
+  color: var(--ink-2);
+}
+
+/* A timer is what sets a portal apart from a stair — the one entrance a player
+   can arrive at too late — so it is pushed to the far edge where the eye can
+   find the timed ones by their filled right column alone. */
+.timer {
+  margin-left: auto;
+  font-size: 0.85em;
+  color: var(--ember);
+}
+
+/* A trove is the one entrance whose price decides whether it is worth taking,
+   and it is the only one carrying both a timer and a toll — so the line wraps
+   and the toll takes the second row rather than squeezing the timer off the
+   edge. Gold rather than ember: it is what the portal costs, not what runs out.
+   The row is set bold as well, since the palette is never the only signal. */
+.toll {
+  margin-left: auto;
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--gold);
+}
+
+/* The rail needs a measure to sit in. Below it the sheet folds to a single
+   column with the label run in above its content. */
+@media (max-width: 44rem) {
+  /* Four groups on one line is more than a phone has room for. The bar wraps
+     rather than shrinking the type, and the nav takes the second row whole so
+     it does not end up split across two. */
+  .masthead-bar {
+    flex-wrap: wrap;
+  }
+
+  .masthead-nav {
+    order: 1;
+    flex-basis: 100%;
+  }
+
+  .row {
+    grid-template-columns: 1fr;
+    gap: 0.2rem;
+  }
+
+  .ledger-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .ledger-facts {
+    text-align: left;
+  }
+
+  .rail.cont {
+    display: none;
+  }
+
+  .line {
+    grid-template-columns: 1fr auto;
+  }
+
+  .xy {
+    grid-column: 2;
+  }
+}
+
+/* ── A note you read once ──────────────────────────────────────────────── */
+/* How the listing is ordered, what an exclusive draw is: true every visit, and
+   worth reading exactly one of them. Folded into a native <details> it costs a
+   line until asked for, and stays keyboard operable and printable without
+   script. */
+.help {
+  margin: 0 0 1.2em;
+  font-size: 0.85rem;
+}
+
+/* An explicit triangle, because inline-block loses the UA marker and a bare
+   line of small caps does not read as something you can open. */
+.help > summary {
+  display: inline-block;
+  list-style: none;
+  font-family: var(--sc);
+  letter-spacing: 0.06em;
+  font-size: 0.75rem;
+  color: var(--ink-3);
+  cursor: pointer;
+  padding: 0.05rem 0.4rem 0.05rem 0;
+  border-radius: 2px;
+}
+
+.help > summary::-webkit-details-marker {
+  display: none;
+}
+
+.help > summary::before {
+  content: "\25b8";
+  display: inline-block;
+  margin-right: 0.4em;
+  transition: transform 120ms ease;
+}
+
+.help[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .help > summary::before {
+    transition: none;
+  }
+}
+
+.help > summary:hover {
+  color: var(--ink);
+}
+
+.help[open] > summary {
+  color: var(--ink-2);
+  margin-bottom: 0.5rem;
+}
+
+.help-body {
+  max-width: 34rem;
+  color: var(--ink-2);
+  font-style: italic;
+  border-left: 0.5px solid var(--rule);
+  padding-left: 0.9rem;
+}
+
+.help-body p {
+  margin: 0 0 0.6em;
+}
+
+.help-body p:last-child {
+  margin-bottom: 0;
+}
+
+/* A caption is a table's own text: the disclosure inside it keeps the table's
+   left edge rather than the caption's centred default. */
+caption > .help {
+  text-align: left;
+  margin-bottom: 0.6em;
+}

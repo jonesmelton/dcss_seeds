@@ -1,0 +1,39 @@
+(executable
+ (name ingest)
+ (public_name ingest)
+ (package seed_corpus)
+ (modules ingest)
+ (libraries seed_corpus core core_unix.command_unix)
+ (preprocess
+  (pps ppx_jane)))
+
+(executable
+ (name deepen)
+ (public_name corpus-deepen)
+ (package seed_corpus)
+ (modules deepen)
+ (libraries
+  seed_corpus
+  core
+  core_unix
+  core_unix.command_unix
+  core_unix.filename_unix
+  core_unix.sys_unix)
+ (preprocess
+  (pps ppx_jane)))
+
+(executable
+ (name main)
+ (public_name seed-explorer)
+ (package seed_corpus)
+ (modules main)
+ (libraries seed_corpus seed_corpus.web dream lwt))
+
+(executable
+ (name rescore)
+ (public_name corpus-rescore)
+ (package seed_corpus)
+ (modules rescore)
+ (libraries seed_corpus core core_unix.command_unix)
+ (preprocess
+  (pps ppx_jane)))

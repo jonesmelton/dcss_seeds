@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Rebuild the trigram substring index over the `strings` dictionary, which is
+# what makes a `name~` search a lookup instead of a 129 MB scan.
+#   tools/corpus-fts-rebuild [--db <path>]
+#
+# Not part of ingest, and not driven by a trigger: an external-content fts5
+# table has none unless written, so a corpus that has just been filled carries
+# an index that does not know about the names the fill added. Searches stay
+# correct in the meantime -- the read path compares the recorded high-water mark
+# against `strings` and falls back to the dictionary scan when they disagree --
+# so this is safe to defer, and slow enough (minutes on prod I/O) to be worth
+# deferring. Run it after a fill; until then `name~` is merely as slow as it
+# always was.
+#
+# The mark is taken before the rebuild and committed with it, so a name racing
+# the rebuild is recorded as *not* covered rather than covered-but-absent. That
+# direction costs a fallback; the other returns wrong answers.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+db="$root/corpus.db"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --db) db="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
+
+[ -f "$db" ] || { echo "no corpus at $db" >&2; exit 1; }
+
+# Creating the tables is corpus-reindex's job, not this one's -- it is the tool
+# that adds what schema.sql gained, virtual tables included. A corpus predating
+# the index is sent there rather than given a second schema-creation path.
+if [ "$(sqlite3 -init /dev/null -noheader "$db" \
+    "select count(*) from sqlite_master where name in ('strings_fts', 'strings_fts_state');")" -ne 2 ]; then
+    echo "$db has no substring index; run tools/corpus-reindex --db $db first" >&2
+    exit 1
+fi
+
+before=$(sqlite3 -init /dev/null -noheader "$db" \
+    "select coalesce((select built_through from strings_fts_state where id = 1), -1);")
+target=$(sqlite3 -init /dev/null -noheader "$db" "select coalesce(max(id), 0) from strings;")
+
+echo "dictionary: $(sqlite3 -init /dev/null -noheader "$db" "select count(*) from strings;") names, max id $target"
+echo "index built through: $before"
+
+sqlite3 -init /dev/null "$db" <<SQL
+begin immediate;
+insert into strings_fts_state (id, built_through)
+values (1, coalesce((select max(id) from strings), 0))
+on conflict (id) do update set built_through = excluded.built_through;
+insert into strings_fts (strings_fts) values ('rebuild');
+commit;
+SQL
+
+# A new index the planner has no size for is the same problem as a missing one;
+# this corpus has been bitten by that twice. See schema.sql.
+sqlite3 -init /dev/null "$db" "analyze;"
+
+after=$(sqlite3 -init /dev/null -noheader "$db" \
+    "select built_through from strings_fts_state where id = 1;")
+echo "index built through: $after"
+echo "statistics: $(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_stat1;") rows"

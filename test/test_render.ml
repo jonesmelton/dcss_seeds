@@ -1,0 +1,525 @@
+open! Core
+
+(* Format buffers output internally, so a renderer that reads its Buffer
+   without flushing loses whatever is still held. Invisible while every render
+   was a single element; it surfaced as soon as a fragment returned several and
+   only the tail arrived. *)
+let%expect_test "rendering several elements keeps all of them" =
+  let open Tyxml.Html in
+  let elements = [ h2 [ txt "heading" ]; div [ txt "body" ]; p [ txt "tail" ] ] in
+  List.map elements ~f:Seed_web.render_fragment |> String.concat |> print_endline;
+  [%expect {| <h2>heading</h2><div>body</div><p>tail</p> |}]
+;;
+
+let%expect_test "a whole document renders to its closing tag" =
+  let html =
+    Seed_web.render_html (Seed_web.Index.render ~title:"t" [ Tyxml.Html.txt "x" ])
+  in
+  printf "closes: %b\n" (String.is_suffix (String.strip html) ~suffix:"</html>");
+  [%expect {| closes: true |}]
+;;
+
+module Job = Seed_corpus.Job
+module Query = Seed_corpus.Query
+
+let v = Or_error.ok_exn (Query.Version.of_string "0.34.1")
+
+let job ?started_at ?finished_at ?error () =
+  { Job.seed = "300"
+  ; version = v
+  ; depth = "Swamp:4"
+  ; queued_at = 1000
+  ; started_at
+  ; finished_at
+  ; attempts = 0
+  ; error
+  }
+;;
+
+let note ?position ?(filling = false) ~depth ~job ~csrf () =
+  Seed_web.Views.depth_note ~version:v ~seed:"300" ~depth ~job ~position ~csrf ~filling
+  |> List.map ~f:Seed_web.render_fragment
+  |> String.concat
+;;
+
+let shallow = Seed_corpus.Fill_depth.shallow
+let deep = Seed_corpus.Fill_depth.of_levels [ "Swamp:4" ]
+
+(* Without the shallow sentence the absence of a Lair reads as a fact about the
+   seed rather than about how far anyone searched. *)
+let%expect_test "a shallow seed says why its levels stop, and offers the button" =
+  let html =
+    note ~depth:shallow ~job:None ~csrf:(Some "<input name=\"dream.csrf\"/>") ()
+  in
+  printf
+    "says why:   %b\n"
+    (String.is_substring html ~substring:"not because the dungeon does");
+  printf "has button: %b\n" (String.is_substring html ~substring:"</button>");
+  printf "has token:  %b\n" (String.is_substring html ~substring:"dream.csrf");
+  printf "polls:      %b\n" (String.is_substring html ~substring:"hx-trigger");
+  [%expect
+    {|
+    says why:   true
+    has button: true
+    has token:  true
+    polls:      false
+    |}]
+;;
+
+(* A deep seed has nothing left to ask for, so no button and no token -- which
+   is also why the handler skips the queue lookup for one. *)
+let%expect_test "a deep seed states its depth and offers nothing" =
+  let html = note ~depth:deep ~job:None ~csrf:None () in
+  print_endline html;
+  [%expect
+    {| <div id="depth" class="depth-note"><p>Searched down to <strong>D:14</strong>, past the usual cap. The branches below are the whole of it.</p></div> |}]
+;;
+
+(* No progress bar in either waiting state: crawl emits nothing incremental.
+   State is carried by text, never by colour alone. *)
+let%expect_test "a waiting job says what is happening and polls for the answer" =
+  List.iter
+    [ "queued", job (); "running", job ~started_at:1010 () ]
+    ~f:(fun (label, j) ->
+      let html = note ~depth:shallow ~job:(Some j) ~csrf:(Some "") () in
+      printf
+        "%-8s polls:%b button:%b\n"
+        label
+        (String.is_substring html ~substring:"hx-trigger=\"every 5s\"")
+        (String.is_substring html ~substring:"</button>"));
+  [%expect
+    {|
+    queued   polls:true button:false
+    running  polls:true button:false
+    |}]
+;;
+
+(* seed_levels is the authority on how deep a seed is; ingest_jobs only records
+   that someone asked. The two disagree in a real window -- ingest commits the
+   levels and the generator can die before it sets finished_at. *)
+let%expect_test "a deep seed is deep even while its job still reads running" =
+  List.iter
+    [ "running", job ~started_at:1010 ()
+    ; "queued", job ()
+    ; "failed", job ~started_at:1010 ~error:"crawl exited 1" ()
+    ]
+    ~f:(fun (label, j) ->
+      let html = note ~depth:deep ~job:(Some j) ~csrf:(Some "") () in
+      printf
+        "%-8s deep:%b polls:%b button:%b\n"
+        label
+        (String.is_substring html ~substring:"past the usual cap")
+        (String.is_substring html ~substring:"hx-trigger")
+        (String.is_substring html ~substring:"</button>"));
+  [%expect
+    {|
+    running  deep:true polls:false button:false
+    queued   deep:true polls:false button:false
+    failed   deep:true polls:false button:false
+    |}]
+;;
+
+(* Position 0 is "next", never "0 ahead": a count of nothing is the one case
+   the number reads worse than the word. The build is named because the count is
+   per build -- an unqualified "3 ahead" would describe a queue nothing works
+   through. *)
+let%expect_test "a queued job says where it is in the line" =
+  List.iter [ None; Some 0; Some 1; Some 7 ] ~f:(fun position ->
+    let html = note ?position ~depth:shallow ~job:(Some (job ())) ~csrf:(Some "") () in
+    (* The sentence with the wrapper's markup stripped, so the test reads as
+       the reader's line rather than as a div. *)
+    let sentence =
+      String.split html ~on:'<'
+      |> List.filter_map ~f:(fun chunk ->
+        match String.lsplit2 chunk ~on:'>' with
+        | Some (_, text) when not (String.is_empty (String.strip text)) -> Some text
+        | _ -> None)
+      |> String.concat
+      |> String.strip
+    in
+    printf
+      "%-6s %s\n"
+      (Option.value_map position ~default:"none" ~f:Int.to_string)
+      sentence);
+  [%expect
+    {|
+    none   Queued for a deeper search, down to Swamp:4. Waiting for a free generator.
+    0      Queued for a deeper search, down to Swamp:4. Waiting for a free generator. It is next in line for this build.
+    1      Queued for a deeper search, down to Swamp:4. Waiting for a free generator. One request is ahead of it on this build.
+    7      Queued for a deeper search, down to Swamp:4. Waiting for a free generator. 7 requests are ahead of it on this build.
+    |}]
+;;
+
+let%expect_test "a failed job shows the reason and offers the button again" =
+  let html =
+    note
+      ~depth:shallow
+      ~job:(Some (job ~started_at:1010 ~error:"crawl exited 1" ()))
+      ~csrf:(Some "")
+      ()
+  in
+  printf "shows why:  %b\n" (String.is_substring html ~substring:"crawl exited 1");
+  printf "has button: %b\n" (String.is_substring html ~substring:"</button>");
+  printf "polls:      %b\n" (String.is_substring html ~substring:"hx-trigger");
+  [%expect
+    {|
+    shows why:  true
+    has button: true
+    polls:      false
+    |}]
+;;
+
+module Level = Seed_corpus.Level
+module Record = Seed_corpus.Record
+
+let entry
+      ?feat
+      ?cost
+      ?shop_type
+      ?toll_note
+      ?timeout_turns
+      ?x
+      ?y
+      ?(spells = [])
+      ?(cat = Record.Cat.Items)
+      ~name
+      ()
+  : Record.Entry.t
+  =
+  { cat
+  ; name
+  ; base_type = None
+  ; sub_type = None
+  ; quantity = None
+  ; artefact = None
+  ; branded = None
+  ; plus = None
+  ; cost
+  ; ego = None
+  ; feat
+  ; timeout_turns
+  ; unique_mons = None
+  ; native = None
+  ; type_name = None
+  ; x
+  ; y
+  ; carried_by = None
+  ; shop_type
+  ; toll_note
+  ; spells
+  ; props = []
+  }
+;;
+
+let detail ?gold entries =
+  Seed_web.Views.seed_detail
+    ~version:v
+    ~seed:"100"
+    ~job:None
+    ~position:None
+    ~csrf:None
+    ~filling:false
+    [ { Level.level = "D:5"; parent_level = None; temple_altars = None; gold; entries } ]
+  |> List.map ~f:Seed_web.render_fragment
+  |> String.concat
+;;
+
+(* A vault may name a jewellery shop "Sanarr's Fire Supplies", so what it sells
+   is a fact its name does not carry. Naming the type beside a shop whose name
+   already says it would print the same word twice. *)
+let%expect_test "a shop's type is named only when its name does not say it" =
+  List.iter
+    [ "John Lambton's Dragon-Slaying Spoils", "Armour"
+    ; "Raing's General Store", "General Store"
+    ; "Afalofit's Book Shoppe", "Book"
+    ]
+    ~f:(fun (name, shop_type) ->
+      let html =
+        detail
+          [ entry
+              ~cat:Record.Cat.Features
+              ~feat:"enter_shop"
+              ~name
+              ~shop_type
+              ~x:1
+              ~y:1
+              ()
+          ]
+      in
+      printf
+        "%-38s names it: %b\n"
+        name
+        (String.is_substring html ~substring:(sprintf "(%s)" shop_type)));
+  [%expect
+    {|
+    John Lambton's Dragon-Slaying Spoils   names it: true
+    Raing's General Store                  names it: false
+    Afalofit's Book Shoppe                 names it: false
+    |}]
+;;
+
+(* A book's spell set is the reason to pick it up and no name carries it. A
+   parchment's single spell is already its name minus the prefix. *)
+let%expect_test "a book lists its spells, a parchment does not repeat its own" =
+  List.iter
+    [ entry ~name:"Notes on Translocation" ~spells:[ "Apportation"; "Summon Forest" ] ()
+    ; entry ~name:"parchment of Apportation" ~spells:[ "Apportation" ] ()
+    ]
+    ~f:(fun e ->
+      let html = detail [ e ] in
+      printf
+        "%-28s lists spells: %b\n"
+        e.name
+        (String.is_substring html ~substring:"class=\"spells\""));
+  [%expect
+    {|
+    Notes on Translocation       lists spells: true
+    parchment of Apportation     lists spells: false
+    |}]
+;;
+
+module Search = Seed_corpus.Search
+
+(* The results are swapped, so anything inside them is destroyed by the
+   response it was waiting for -- the indicator has to live in the form. And it
+   has to be a word: the site's reduced-motion rule strips every animation. *)
+let%expect_test "the search form carries a busy indicator outside the results" =
+  let html =
+    Seed_web.Views.search_page
+      ~search:(Search.create ~version:v ~terms:[] ())
+      ~suggestions:None
+      ~rank:Search.Rank.default
+      ~more:`End
+      []
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  let form, results =
+    let i = Option.value_exn (String.substr_index html ~pattern:"id=\"results\"") in
+    String.prefix html i, String.drop_prefix html i
+  in
+  printf
+    "points at it:  %b\n"
+    (String.is_substring html ~substring:"hx-indicator=\"#search-busy\"");
+  printf "in the form:   %b\n" (String.is_substring form ~substring:"id=\"search-busy\"");
+  printf
+    "in the results: %b\n"
+    (String.is_substring results ~substring:"id=\"search-busy\"");
+  printf "is a word:     %b\n" (String.is_substring form ~substring:"searching");
+  printf
+    "guards double: %b\n"
+    (String.is_substring html ~substring:"hx-disabled-elt=\"find button\"");
+  [%expect
+    {|
+    points at it:  true
+    in the form:   true
+    in the results: false
+    is a word:     true
+    guards double: true
+    |}]
+;;
+
+(* A trove is the only entrance whose price is the difference between one and
+   another, so the toll rides in the branch index beside the timer. *)
+let%expect_test "a trove's toll is named in the branch index" =
+  let html =
+    detail
+      [ entry
+          ~cat:Record.Cat.Features
+          ~feat:"enter_trove"
+          ~name:"a portal to a secret trove of treasure"
+          ~timeout_turns:512
+          ~toll_note:"give a scroll of acquirement"
+          ~x:4
+          ~y:9
+          ()
+      ]
+  in
+  List.iter
+    [ "give a scroll of acquirement"; "toll "; "expires in " ]
+    ~f:(fun substring ->
+      printf "%-30s %b\n" substring (String.is_substring html ~substring));
+  [%expect
+    {|
+    give a scroll of acquirement   true
+    toll                           true
+    expires in                     true
+    |}]
+;;
+
+(* "floor gold", never "gold": the number counts the piles on the ground, so it
+   excludes monster drops and Gozag and is a lower bound. *)
+let%expect_test "floor gold is labelled as the lower bound it is" =
+  let shown gold =
+    let html = detail ?gold [ entry ~name:"potion of curing" ~x:1 ~y:1 () ] in
+    ( String.is_substring html ~substring:"floor gold"
+    , String.is_substring html ~substring:"431" )
+  in
+  List.iter [ Some 431; Some 0; None ] ~f:(fun gold ->
+    let labelled, amount = shown gold in
+    printf
+      "%-8s labelled: %b amount: %b\n"
+      (Sexp.to_string [%sexp (gold : int option)])
+      labelled
+      amount);
+  [%expect
+    {|
+    (431)    labelled: true amount: true
+    (0)      labelled: false amount: false
+    ()       labelled: false amount: false
+    |}]
+;;
+
+(* A fill holds the corpus write lock for hours and the generator yields to it,
+   so a button pressed mid-fill enqueues a job nothing will claim until the fill
+   ends. Saying so beats a control whose only outcome is a wait with no stated
+   cause, and beats the older behaviour where the heartbeat went stale and the
+   press came back "nothing can search that build deeper" -- which is false. *)
+let%expect_test "a fill in progress explains itself instead of offering the button" =
+  let html =
+    Seed_web.Views.depth_note
+      ~version:v
+      ~seed:"300"
+      ~depth:shallow
+      ~job:None
+      ~position:None
+      ~csrf:(Some "")
+      ~filling:true
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  printf
+    "says why:   %b\n"
+    (String.is_substring html ~substring:"not because the dungeon does");
+  printf
+    "explains:   %b\n"
+    (String.is_substring html ~substring:"Deeper searches are paused");
+  printf "has button: %b\n" (String.is_substring html ~substring:"</button>");
+  printf "polls:      %b\n" (String.is_substring html ~substring:"hx-trigger");
+  [%expect
+    {|
+    says why:   true
+    explains:   true
+    has button: false
+    polls:      false
+    |}]
+;;
+
+(* A job already queued when the fill started still polls: it is genuinely
+   waiting and will be served. Only the offer of new work is withdrawn. *)
+let%expect_test "a fill does not silence a job already in the queue" =
+  let html =
+    Seed_web.Views.depth_note
+      ~version:v
+      ~seed:"300"
+      ~depth:shallow
+      ~job:(Some (job ()))
+      ~position:(Some 0)
+      ~csrf:(Some "")
+      ~filling:true
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  printf "polls:   %b\n" (String.is_substring html ~substring:"hx-trigger");
+  printf
+    "queued:  %b\n"
+    (String.is_substring html ~substring:"Queued for a deeper search");
+  [%expect
+    {|
+    polls:   true
+    queued:  true
+    |}]
+;;
+
+(* The htmx response swaps only the results, so the form is whatever the last
+   full page render left behind. A term box is added by rendering one more blank
+   box than there are terms, which means the form has to come back with the
+   results, out of band. Without it a scripted reader is stuck at one box while
+   a scripting-off reader is not. *)
+let%expect_test "the htmx response carries a form with a box for the next term" =
+  let search =
+    Search.create ~version:v ~terms:[ Search.Term.create Search.Criterion.Artefact ] ()
+  in
+  let html =
+    Seed_web.Views.search_fragment
+      ~search
+      ~suggestions:None
+      ~rank:Search.Rank.default
+      ~more:`End
+      []
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  let boxes =
+    String.substr_index_all html ~may_overlap:false ~pattern:"name=\"has\"" |> List.length
+  in
+  (* A morph, not a replace: the reader is typing in the blank box while the
+     request is in flight, and an outerHTML swap would discard text and
+     focus. *)
+  printf
+    "swaps the form:  %b\n"
+    (String.is_substring html ~substring:"hx-swap-oob=\"outerMorph\"");
+  printf "form is targeted: %b\n" (String.is_substring html ~substring:"id=\"search\"");
+  printf "term boxes:      %d\n" boxes;
+  [%expect
+    {|
+    swaps the form:  true
+    form is targeted: true
+    term boxes:      2
+    |}]
+;;
+
+(* htmx swaps a 4xx like any other response and takes the document title from
+   it, so a rejected query leaves "Bad request" in the tab. The title is
+   therefore a property of every search response, not only the full-page
+   render. *)
+let%expect_test "the htmx response carries the title, so an error does not stick" =
+  let search =
+    Search.create ~version:v ~terms:[ Search.Term.create Search.Criterion.Artefact ] ()
+  in
+  let html =
+    Seed_web.Views.search_fragment
+      ~search
+      ~suggestions:None
+      ~rank:Search.Rank.default
+      ~more:`End
+      []
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  printf "carries a title: %b\n" (String.is_substring html ~substring:"<title>");
+  [%expect {| carries a title: true |}]
+;;
+
+(* A shop whose stock is entirely mundane emits no item rows: crawl's own
+   item_ignore_boring drops unbranded, non-enchanted weapons and armour before
+   the extractor sees them. The footer states what the corpus holds rather than
+   diagnosing why. *)
+let%expect_test "a shop with no notable stock says so without implying a gap" =
+  let shop stock =
+    detail
+      (entry
+         ~cat:Record.Cat.Features
+         ~feat:"enter_shop"
+         ~name:"an Armour Shop"
+         ~x:53
+         ~y:18
+         ()
+       :: stock)
+  in
+  List.iter
+    [ "empty", shop []
+    ; "stocked", shop [ entry ~name:"+2 plate armour" ~cost:1913 ~x:53 ~y:18 () ]
+    ]
+    ~f:(fun (label, html) ->
+      printf
+        "%-8s no notable stock: %b | not recorded: %b\n"
+        label
+        (String.is_substring html ~substring:"no notable stock")
+        (String.is_substring html ~substring:"stock not recorded"));
+  [%expect
+    {|
+    empty    no notable stock: true | not recorded: false
+    stocked  no notable stock: false | not recorded: false
+    |}]
+;;

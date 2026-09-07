@@ -1,0 +1,17 @@
+(library
+ (name test_seed_corpus)
+ (inline_tests
+  (deps
+   (file ../schema.sql)
+   (source_tree ../static/tiles)))
+ (libraries
+  seed_corpus
+  seed_web
+  core
+  core_unix
+  core_unix.filename_unix
+  sqlite3
+  threads.posix
+  core_kernel.caml_threads)
+ (preprocess
+  (pps ppx_jane)))

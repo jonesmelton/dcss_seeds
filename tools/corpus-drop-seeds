@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Remove seeds from the corpus so a fill can re-extract them.
+#   tools/corpus-drop-seeds <version> --seeds <s1,s2,...> [--db <path>] [--yes]
+#
+# For truncated seeds -- a crawl that died mid-chunk leaves a seed PRESENT but
+# short, and `corpus-fill --skip-done` skips anything present, so a truncated
+# seed is never repaired by a refill alone. Deleting it first is what makes the
+# refill see work to do. tools/corpus-check reports which seeds these are.
+#
+# entries and the per-entry tables hang off seed_levels by foreign key with
+# `on delete cascade`, and `foreign_keys` is set below because it is
+# per-connection and defaults OFF -- without it this leaves orphaned entries.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+version="${1:?usage: corpus-drop-seeds <version> --seeds s1,s2 [--db path] [--yes]}"
+shift
+
+db="$root/corpus.db"
+seeds=""
+assume_yes=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --db)    db="$2"; shift 2 ;;
+        --seeds) seeds="$2"; shift 2 ;;
+        --yes|-y) assume_yes=1; shift ;;
+        *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
+
+[ -f "$db" ] || { echo "no corpus at $db" >&2; exit 1; }
+[ -n "$seeds" ] || { echo "--seeds is required" >&2; exit 1; }
+
+# Every seed must be an integer. A seed is stored as text but is written as a
+# number everywhere, and this is interpolated into SQL -- so this is the input
+# validation, not a formatting nicety.
+case "$seeds" in
+    *[!0-9,]*) echo "--seeds takes a comma-separated list of integers: $seeds" >&2; exit 1 ;;
+esac
+
+quoted=$(printf "%s" "$seeds" | tr ',' '\n' | grep -v '^$' | sed "s/.*/'&'/" | paste -sd, -)
+[ -n "$quoted" ] || { echo "--seeds is empty" >&2; exit 1; }
+
+q() { sqlite3 -init /dev/null -noheader "$db" "$1"; }
+
+version_id=$(q "select id from versions where version = '$version';")
+[ -n "$version_id" ] || { echo "no such version in the corpus: $version" >&2; exit 1; }
+
+echo "==> $version ($db)"
+q "
+select '    seed ' || sl.seed
+    || ': ' || count(*) || ' level(s), fill depth '
+    || coalesce((select f.depth from seed_fills f
+                  where f.seed = sl.seed and f.version_id = sl.version_id), 'none')
+  from seed_levels sl
+ where sl.version_id = $version_id and sl.seed in ($quoted)
+ group by sl.seed
+ order by cast(sl.seed as integer);"
+
+present=$(q "select count(distinct seed) from seed_levels where version_id = $version_id and seed in ($quoted);")
+if [ "$present" -eq 0 ]; then
+    echo "    nothing to delete -- none of those seeds are present for $version"
+    exit 0
+fi
+
+if [ "$assume_yes" -ne 1 ]; then
+    printf "delete %s seed(s) and everything hanging off them? [y/N] " "$present"
+    read -r reply
+    case "$reply" in
+        y|Y|yes|YES) ;;
+        *) echo "aborted"; exit 1 ;;
+    esac
+fi
+
+sqlite3 -init /dev/null "$db" "
+pragma foreign_keys = on;
+begin immediate;
+delete from seed_levels where version_id = $version_id and seed in ($quoted);
+delete from seed_fills  where version_id = $version_id and seed in ($quoted);
+commit;"
+
+left=$(q "select count(distinct seed) from seed_levels where version_id = $version_id and seed in ($quoted);")
+echo "==> deleted $present seed(s); $left remaining"
+echo "    refill with: tools/corpus-fill $version -s <start> -n <count> --db $db --skip-done"
+echo "    then rescore: _build/default/bin/rescore.exe -db $db -build $version"

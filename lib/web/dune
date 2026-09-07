@@ -1,0 +1,6 @@
+(library
+ (name seed_web)
+ (public_name seed_corpus.web)
+ (libraries seed_corpus dream tyxml tyxml-htmx lwt core core_unix)
+ (preprocess
+  (pps lwt_ppx ppx_jane)))

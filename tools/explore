@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Dump seed catalogs for one version.
+#   tools/explore <version> [-d <depth>] [-o <out.jsonl>] [seed ...]
+#   tools/explore <version> -f seeds.txt
+#
+# Seeds are batched into one crawl process per chunk: process startup dominates
+# runtime, so 200 seeds in one process costs ~130ms each versus ~1.15s each as
+# separate processes. Chunks then run in parallel across cores.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+version="${1:?usage: explore <version> [-d depth] [-o out] [seeds...|-f file]}"
+shift
+
+depth=""
+out=""
+seedfile=""
+no_uniques=0
+chunk="${CHUNK:-200}"
+jobs="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
+extra=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d|--depth) depth="$2"; shift 2 ;;
+        -o|--out)   out="$2"; shift 2 ;;
+        -f|--file)  seedfile="$2"; shift 2 ;;
+        --all-items|--artefacts|--mon-items|--unique-items) extra+=("${1/--/-}"); shift ;;
+        --no-uniques) no_uniques=1; shift ;;
+        --) shift; break ;;
+        -*) echo "unknown flag: $1" >&2; exit 1 ;;
+        *) break ;;
+    esac
+done
+
+# Unique-carried loot costs ~1% runtime and is where monster gear is worth
+# looking: uniques carry artefacts ~19x as often as ordinary monsters.
+if [ "$no_uniques" -eq 0 ] && [[ ! " ${extra[*]:-} " =~ (-mon-items|-unique-items) ]]; then
+    extra+=(-unique-items)
+fi
+
+src="$root/builds/$version/crawl-ref/source"
+sandbox="$root/sandboxes/$version"
+[ -x "$src/crawl" ] || { echo "no build for '$version'; run: make provision" >&2; exit 1; }
+
+out="${out:-$root/out/$version.jsonl}"
+mkdir -p "$(dirname "$out")"
+
+seeds_tmp="$(mktemp)"
+trap 'rm -f "$seeds_tmp" "$seeds_tmp".part.*' EXIT
+if [ -n "$seedfile" ]; then
+    grep -oE '[0-9]+' "$seedfile" > "$seeds_tmp"
+elif [ $# -gt 0 ]; then
+    printf '%s\n' "$@" > "$seeds_tmp"
+else
+    echo "no seeds given (pass seeds, or -f <file>)" >&2
+    exit 1
+fi
+
+total=$(wc -l < "$seeds_tmp" | tr -d ' ')
+[ "$total" -gt 0 ] || { echo "no seeds found" >&2; exit 1; }
+
+# Batching amortises process startup, but a single chunk leaves cores idle.
+# Shrink the chunk so every worker gets one, while keeping chunks big enough
+# that startup stays amortised.
+if [ -z "${CHUNK:-}" ]; then
+    by_jobs=$(( (total + jobs - 1) / jobs ))
+    [ "$by_jobs" -lt 1 ] && by_jobs=1
+    [ "$by_jobs" -lt "$chunk" ] && chunk=$by_jobs
+fi
+
+split -l "$chunk" "$seeds_tmp" "$seeds_tmp".part.
+parts=("$seeds_tmp".part.*)
+echo "==> $version: $total seeds, ${#parts[@]} chunk(s) of $chunk, $jobs way parallel"
+
+run_chunk() {
+    local part="$1"
+    local args=(-dir "$sandbox" -script seed_dump.lua -seed)
+    while read -r s; do args+=("$s"); done < "$part"
+    [ -n "$depth" ] && args+=(-depth "$depth")
+    [ ${#extra[@]} -gt 0 ] && args+=("${extra[@]}")
+    :
+    (cd "$src" && util/fake_pty ./crawl "${args[@]}" 2>&1) | grep '^{' > "$part.out" || true
+}
+for part in "${parts[@]}"; do
+    run_chunk "$part" &
+    while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n; done
+done
+wait
+
+cat "$seeds_tmp".part.*.out > "$out"
+got=$(LC_ALL=C sed 's/.*"seed":"\([^"]*\)".*/\1/' "$out" | LC_ALL=C sort -u | wc -l | tr -d ' ')
+echo "==> $(wc -l < "$out" | tr -d ' ') records for $got/$total seeds -> $out"

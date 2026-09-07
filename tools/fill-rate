@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Summarise a corpus-fill progress log into a rate curve.
+#   tools/fill-rate [<log>] [-b <buckets>]
+#
+# corpus-fill writes one row per chunk (see its chunk_done). This bins those
+# rows into equal slices of the run and reports the rate in each, which is the
+# question a single average cannot answer: whether the decay flattens.
+#
+# A decaying-but-flattening curve reaches a large corpus. A linearly decaying
+# one does not, and the difference only shows up across a long fill. See
+# docs/corpus-scaling.md.
+set -euo pipefail
+
+log=""
+buckets=10
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -b|--buckets) buckets="$2"; shift 2 ;;
+        -*) echo "unknown flag: $1" >&2; exit 1 ;;
+        *) log="$1"; shift ;;
+    esac
+done
+log="${log:-corpus-fill-progress.tsv}"
+
+[ -s "$log" ] || { echo "no progress log at $log" >&2; exit 1; }
+
+awk -v buckets="$buckets" -F'\t' '
+NR == 1 { next }
+{
+    at[NR] = $1; seeds[NR] = $3; secs[NR] = $4; status[NR] = $6
+    n++
+    if (min_at == 0 || $1 < min_at) min_at = $1
+    if ($1 > max_at) max_at = $1
+    total_seeds += $3
+    if ($6 != "ok") failed++
+}
+END {
+    if (n == 0) { print "no chunks recorded"; exit }
+    span = max_at - min_at
+    if (span <= 0) span = 1
+
+    printf "%d chunks, %d seeds, %d chunk-failures\n", n, total_seeds, failed
+    printf "wall span %ds (%.1f h)\n\n", span, span / 3600.0
+
+    printf "%-10s %8s %9s %9s\n", "slice", "seeds", "chunks", "per_min"
+    width = span / buckets
+    if (width < 1) width = 1
+    for (i = 0; i < buckets; i++) { bs[i] = 0; bc[i] = 0; bw[i] = 0 }
+    for (r = 2; r <= NR; r++) {
+        if (seeds[r] == "") continue
+        b = int((at[r] - min_at) / width)
+        if (b >= buckets) b = buckets - 1
+        bs[b] += seeds[r]
+        bc[b]++
+        bw[b] += secs[r]
+    }
+    for (i = 0; i < buckets; i++) {
+        if (bc[i] == 0) continue
+        # Chunks run in parallel, so summed chunk-seconds overcounts wall time.
+        # Rate here is seeds per minute of aggregate WORKER time, which is what
+        # stays comparable as the job count changes.
+        rate = bw[i] > 0 ? bs[i] * 60.0 / bw[i] : 0
+        printf "%-10s %8d %9d %9.1f\n", \
+            sprintf("%ds", int(i * width)), bs[i], bc[i], rate
+    }
+
+    first = 0; last = 0; fw = 0; lw = 0
+    for (r = 2; r <= NR; r++) {
+        if (seeds[r] == "") continue
+        b = int((at[r] - min_at) / width)
+        if (b >= buckets) b = buckets - 1
+        if (b == 0) { first += seeds[r]; fw += secs[r] }
+        if (b == buckets - 1) { last += seeds[r]; lw += secs[r] }
+    }
+    if (fw > 0 && lw > 0) {
+        fr = first * 60.0 / fw
+        lr = last * 60.0 / lw
+        printf "\nfirst slice %.1f/min, last slice %.1f/min", fr, lr
+        if (fr > 0) printf "  (%+.1f%%)", (lr - fr) * 100.0 / fr
+        printf "\n"
+    }
+}
+' "$log"

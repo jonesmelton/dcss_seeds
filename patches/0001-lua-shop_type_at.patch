@@ -1,0 +1,46 @@
+diff --git a/crawl-ref/source/l-dgnit.cc b/crawl-ref/source/l-dgnit.cc
+index 080374b0e6..22f009c2d5 100644
+--- a/crawl-ref/source/l-dgnit.cc
++++ b/crawl-ref/source/l-dgnit.cc
+@@ -9,6 +9,7 @@
+ #include "dungeon.h"
+ #include "item-status-flag-type.h"
+ #include "items.h"
++#include "shopping.h"
+ #include "stash.h"
+ #include "stringutil.h"
+ 
+@@ -73,6 +74,25 @@ static int dgn_shop_inventory_at(lua_State *ls)
+     return lua_push_shop_items_at(ls, s);
+ }
+ 
++/*** What kind of shop is here?
++ * The canonical type name, independent of the shop's display name: a vault may
++ * give a shop an arbitrary name ("Overcharged Wands"), which makes the type
++ * unrecoverable from shop_name() alone.
++ * @tparam int x
++ * @tparam int y
++ * @treturn string|nil the shop type, or nil if there is no shop at (x, y)
++ * @function shop_type_at
++ */
++static int dgn_shop_type_at(lua_State *ls)
++{
++    COORDS(s, 1, 2);
++    shop_struct *shop = shop_at(s);
++    if (!shop)
++        return 0;
++
++    PLUARET(string, shop_type_name(shop->type).c_str());
++}
++
+ static int _dgn_item_spec(lua_State *ls)
+ {
+     const item_list ilist = _lua_get_ilist(ls, 1);
+@@ -255,6 +275,7 @@ const struct luaL_Reg dgn_item_dlib[] =
+     { "item_from_index", dgn_item_from_index },
+     { "items_at", dgn_items_at },
+     { "shop_inventory_at", dgn_shop_inventory_at },
++    { "shop_type_at", dgn_shop_type_at },
+     { "create_item", dgn_create_item },
+     { "item_property_remove", dgn_item_property_remove },
+     { "item_property_set", dgn_item_property_set },

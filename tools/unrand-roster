@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Regenerate data/unrand-names/<version>.txt from a version's build tree.
+
+The roster is the search form's unrand vocabulary. It cannot be derived from
+the corpus: the stored name carries a varying enchantment prefix and
+inscription (`+7 Throatcutter {drain, coup de grace}`), and an unrand that has
+not been rolled yet has no row at all -- 95 of 0.34.1's 112 appear in the
+2.0M-seed corpus (D:8, 2026-09). Frequency does not separate them either, since
+randart books collide on shared title words at the same counts a rare unrand
+sits at.
+
+So it comes from crawl's own art-data.txt, which needs a provisioned build tree
+(`make provision`). The output is checked in because the webapp must not depend
+on builds/ existing.
+"""
+import argparse, os, re, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = os.path.join(ROOT, "data", "unrand-names")
+
+# Trunk is not a version: a seed means nothing without a fixed build, so the
+# corpus ingests released builds only and a trunk roster could never be served.
+EXCLUDED_VERSIONS = ("trunk",)
+
+# Placeholder entries padding the unrand enum; never generated.
+DUMMY = re.compile(r"^DUMMY UNRANDART")
+
+# An unrand carrying either flag is defined but never enters the item pool.
+# They are a third of the file, so dropping them is the difference between the
+# roster and the enum.
+EXCLUDED_FLAGS = ("deleted", "nogen")
+
+
+def roster(path):
+    names, name, excluded = [], None, False
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith("NAME:"):
+                if name is not None and not excluded:
+                    names.append(name)
+                name = line[len("NAME:"):].strip()
+                excluded = False
+            elif line.startswith("BOOL:"):
+                flags = line[len("BOOL:"):]
+                if any(flag in flags for flag in EXCLUDED_FLAGS):
+                    excluded = True
+    if name is not None and not excluded:
+        names.append(name)
+    return sorted(n for n in names if not DUMMY.match(n))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("versions", nargs="*", help="versions to regenerate (default: every provisioned one)")
+    ap.add_argument("--check", action="store_true", help="exit non-zero if a file is stale rather than writing")
+    args = ap.parse_args()
+
+    versions = args.versions
+    if not versions:
+        builds = os.path.join(ROOT, "builds")
+        versions = sorted(
+            v for v in os.listdir(builds)
+            if v not in EXCLUDED_VERSIONS
+            and os.path.isfile(os.path.join(builds, v, "crawl-ref/source/art-data.txt"))
+        ) if os.path.isdir(builds) else []
+        if not versions:
+            print("no provisioned build trees; run `make provision`", file=sys.stderr)
+            return 1
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    stale = False
+    for version in versions:
+        src = os.path.join(ROOT, "builds", version, "crawl-ref/source/art-data.txt")
+        if not os.path.isfile(src):
+            print(f"{version}: no build tree ({src})", file=sys.stderr)
+            return 1
+        names = roster(src)
+        body = "".join(n + "\n" for n in names)
+        dest = os.path.join(OUT_DIR, f"{version}.txt")
+        current = open(dest, encoding="utf-8").read() if os.path.exists(dest) else None
+        if args.check:
+            if current != body:
+                print(f"{version}: stale ({dest})", file=sys.stderr)
+                stale = True
+            continue
+        if current != body:
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(body)
+            print(f"{version}: {len(names)} unrands -> {os.path.relpath(dest, ROOT)}")
+        else:
+            print(f"{version}: {len(names)} unrands (unchanged)")
+    return 1 if stale else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

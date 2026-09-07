@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Verify a fill landed completely.
+#   tools/corpus-check <version> [--db <path>] [--range <start>-<end>]
+#
+# Checks the things a silent extraction failure looks like: missing seeds in a
+# contiguous range, seeds short on levels, and versions that never registered.
+# See docs/extraction.md.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+version="${1:?usage: corpus-check <version> [--db path] [--range start-end]}"
+shift
+
+db="$root/corpus.db"
+range=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --db)    db="$2"; shift 2 ;;
+        --range) range="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
+
+[ -f "$db" ] || { echo "no corpus at $db" >&2; exit 1; }
+
+q() { sqlite3 -init /dev/null -noheader "$db" "$1"; }
+
+seeds=$(q "select count(distinct sl.seed) from seed_levels sl join versions v on v.id = sl.version_id where v.version = '$version';")
+if [ "$seeds" -eq 0 ]; then
+    echo "FAIL: no seeds ingested for '$version'"
+    echo "      versions present: $(q 'select group_concat(version, ", ") from versions;')"
+    exit 1
+fi
+
+entries=$(q "select count(*) from entries e join versions v on v.id = e.version_id where v.version = '$version';")
+lo=$(q "select min(cast(sl.seed as integer)) from seed_levels sl join versions v on v.id = sl.version_id where v.version = '$version';")
+hi=$(q "select max(cast(sl.seed as integer)) from seed_levels sl join versions v on v.id = sl.version_id where v.version = '$version';")
+
+echo "$version: $seeds seeds, $entries entries, range $lo..$hi"
+
+status=0
+
+# A seed with fewer levels than its peers was cut short -- usually a crawl
+# process that died mid-chunk.
+#
+# The comparison is per fill-depth cohort, not corpus-wide. A deep seed holds 43
+# non-portal levels against a shallow seed's 9, so one global threshold is set
+# by whichever depth is more numerous and the other cohort is measured against a
+# number that means nothing: with 10,000 shallow seeds and 200 deep ones a deep
+# seed truncated from 47 levels to 12 passes clean.
+#
+# Portals are excluded because their count genuinely varies per seed -- measured
+# 43 to 49 total levels across 200 deep seeds -- while the non-portal count is
+# fixed by the fill depth and had zero variance in both cohorts. Counting all
+# levels flags a seed for generating fewer bazaars than its neighbours, which is
+# a fact about the dungeon, not a truncated extraction.
+short_report=$(q "
+with counts as (
+    select sl.seed
+         , coalesce(f.depth, -1) as depth
+         , count(*) filter (where sl.parent_level_id is null) as n
+      from seed_levels as sl
+      join versions as v
+        on v.id = sl.version_id
+      left join seed_fills as f
+        on f.seed = sl.seed
+       and f.version_id = sl.version_id
+     where v.version = '$version'
+     group by sl.seed, coalesce(f.depth, -1)
+), expected as (
+    select depth
+         , max(n) as full_n
+      from counts
+     group by depth
+)
+select c.depth || ' ' || e.full_n || ' ' || count(*) || ' ' || min(c.n)
+  from counts as c
+  join expected as e
+    on e.depth = c.depth
+ where c.n < e.full_n
+ group by c.depth, e.full_n;")
+
+if [ -n "$short_report" ]; then
+    while read -r depth mode_n n min_n; do
+        [ -n "$depth" ] || continue
+        echo "WARN: $n seed(s) at fill depth $depth have fewer than $mode_n levels (min $min_n) -- re-run them with --skip-done after deleting"
+    done <<< "$short_report"
+    status=1
+else
+    cohorts=$(q "select count(*) from (select distinct f.depth from seed_fills f join versions v on v.id = f.version_id where v.version = '$version');")
+    echo "  ok: every seed has a full level count for its fill depth ($cohorts cohort(s))"
+fi
+
+# The check above compares a seed to its own depth cohort, which is exactly what
+# a truncated seed defeats: a fill cut short writes a SHORT DEPTH as well as
+# short levels, so the seed lands alone in a cohort of one, is trivially that
+# cohort's maximum, and passes. Three seeds sat truncated through a clean
+# corpus-check that way (100k, 0.34.1, 2026-09-02) -- 67207 at D:2, 66707 at
+# D:5, 67958 at D:6, each the last seed of a chunk whose ingest lost its tail.
+#
+# Extraction has exactly two caps, shallow (D:8) and deep, and membership is
+# two-valued rather than an ordering (see Fill_depth). So a depth strictly below
+# the shallow cap is not a small cohort, it is a truncation -- no operator input
+# needed to say so. A deepened seed is ABOVE the cap and unaffected.
+#
+# --skip-done does not repair these: it selects seeds absent from seed_levels,
+# and a truncated seed is present. They must be deleted first, which is what the
+# suggested command does.
+# Read from Fill_depth rather than hardcoded, so the shell and the library
+# cannot drift. The grep is deliberately narrow: it fails loudly below if the
+# definition moves, rather than silently defaulting to a cap that passes
+# everything.
+shallow_cap=$(sed -n 's/^let shallow = Depth.of_level "D:\([0-9]*\)"$/\1/p' \
+    "$root/lib/corpus/fill_depth.ml")
+if ! [ "${shallow_cap:-}" -eq "${shallow_cap:-}" ] 2>/dev/null; then
+    echo "FAIL: cannot read the shallow cap from lib/corpus/fill_depth.ml" >&2
+    exit 1
+fi
+
+truncated=$(q "
+select f.depth || ' ' || count(*) || ' ' || group_concat(f.seed, ',')
+  from seed_fills as f
+  join versions as v
+    on v.id = f.version_id
+ where v.version = '$version'
+   and f.depth < $shallow_cap
+ group by f.depth
+ order by f.depth;")
+
+if [ -n "$truncated" ]; then
+    while read -r depth n seeds; do
+        [ -n "$depth" ] || continue
+        echo "FAIL: $n seed(s) recorded at fill depth $depth, below the shallow cap D:$shallow_cap -- truncated extraction, not a cohort"
+        echo "      seeds: $seeds"
+        echo "      --skip-done will NOT repair these: it skips seeds that are"
+        echo "      present, and a truncated seed is present. Delete them first:"
+        quoted=$(printf "%s" "$seeds" | tr ',' '\n' | sed "s/.*/'&'/" | paste -sd, -)
+        echo "        tools/corpus-drop-seeds $version --db $db --seeds $seeds"
+        echo "        tools/corpus-fill $version -s <start> -n <count> --db $db --skip-done"
+        echo "      (or by hand: delete from seed_levels/seed_fills where seed in ($quoted))"
+    done <<< "$truncated"
+    status=1
+else
+    echo "  ok: no seed recorded below the shallow cap"
+fi
+
+# A seed with no seed_fills row predates the cohort column and cannot be checked
+# against its peers -- corpus-reindex derives it from the levels already stored.
+unfilled=$(q "select count(*) from (select distinct sl.seed from seed_levels as sl join versions v on v.id = sl.version_id where v.version = '$version' and not exists (select 1 from seed_fills as f where f.seed = sl.seed and f.version_id = sl.version_id));")
+if [ "$unfilled" -gt 0 ]; then
+    echo "WARN: $unfilled seed(s) have no recorded fill depth -- run: tools/corpus-reindex --db $db"
+    status=1
+fi
+
+# Gaps only mean something over a range the caller says should be contiguous.
+if [ -n "$range" ]; then
+    start="${range%%-*}"
+    end="${range##*-}"
+    want=$((end - start + 1))
+    got=$(q "select count(distinct sl.seed) from seed_levels sl join versions v on v.id = sl.version_id where v.version = '$version' and cast(sl.seed as integer) between $start and $end;")
+    if [ "$got" -ne "$want" ]; then
+        echo "FAIL: $got/$want seeds present in $start..$end -- $((want - got)) missing"
+        echo "      fill the gaps with: tools/corpus-fill $version -s $start -n $want --skip-done"
+        status=1
+    else
+        echo "  ok: $start..$end is complete"
+    fi
+fi
+
+# The search indexes are added to schema.sql over time, so a corpus created by
+# an older schema silently scans instead of seeking.
+missing=$(q "select count(*) from (select 'entries_search_type' n union all select 'entries_search_name' union all select 'entries_search_feat' union all select 'entries_search_shop' union all select 'entries_search_artefact' union all select 'entries_search_unique') where n not in (select name from sqlite_master where type = 'index');")
+if [ "$missing" -gt 0 ]; then
+    echo "WARN: $missing search index(es) missing -- searches will scan"
+    echo "      add them with: tools/corpus-reindex --db $db"
+    status=1
+else
+    echo "  ok: search indexes present"
+fi
+
+exit $status

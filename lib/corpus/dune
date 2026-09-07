@@ -1,0 +1,27 @@
+(library
+ (name seed_corpus)
+ (public_name seed_corpus)
+ (libraries core parsexp sexplib sqlite3 sqlite3_utils)
+ (preprocess
+  (pps ppx_jane)))
+
+; The unrand roster is data rather than a hand-edited table: tools/unrand-roster
+; regenerates it from a build tree, and this only transcribes it to OCaml so the
+; webapp carries the vocabulary without reading data/ at runtime. See unrand.mli.
+
+(rule
+ (target unrand.ml)
+ (deps
+  gen_unrand.py
+  %{workspace_root}/data/unrand-names/0.32.1.txt
+  %{workspace_root}/data/unrand-names/0.33.1.txt
+  %{workspace_root}/data/unrand-names/0.34.1.txt)
+ (action
+  (with-stdout-to
+   %{target}
+   (run
+    python3
+    %{dep:gen_unrand.py}
+    %{workspace_root}/data/unrand-names/0.32.1.txt
+    %{workspace_root}/data/unrand-names/0.33.1.txt
+    %{workspace_root}/data/unrand-names/0.34.1.txt))))
