@@ -34,7 +34,9 @@ val mem : t -> string -> bool
 val to_feats : t -> string list
 
 (** A god's display name from its feat. Several are multi-word proper nouns
-    ("The Shining One"), so every word is capitalised. *)
+    ("The Shining One"), so every word is capitalised. [altar_ecumenical] is
+    "Faded": crawl's own name for that feature is the one the game prints, and
+    "ecumenical" is internal spelling the player never sees. *)
 val god_name : string -> string
 
 val to_int : t -> int

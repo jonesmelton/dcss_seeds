@@ -125,6 +125,24 @@ val ingest_channel
     after every fill, and before the corpus serves. *)
 val rebuild_fts : t -> unit Or_error.t
 
+(** Whether the substring index covers the whole dictionary. False for a corpus
+    predating the index, and for any error: refusing a search that could have
+    been served beats serving wrong answers from a partial index. *)
+val fts_is_current : t -> bool
+
+(** Index the names interned since the last rebuild or catch-up, and advance the
+    mark to match, in one transaction.
+
+    For the deepen generator, which interns names on every seed it deepens and
+    would otherwise withdraw [Name_like] search for the whole corpus until
+    someone ran {!rebuild_fts} by hand. Proportional to what was added rather
+    than to the dictionary, and skips the [analyze] a full rebuild does, so it
+    is cheap enough to run per job.
+
+    Not a substitute for {!rebuild_fts} after a fill: correct, but a row at a
+    time is the wrong shape for millions of them. *)
+val catch_up_fts : t -> unit Or_error.t
+
 val search_seeds
   :  t
   -> Search.t
@@ -135,16 +153,15 @@ val search_seeds
     depends on the depth the corpus was extracted at. *)
 val version_levels : t -> version:Query.Version.t -> string list Or_error.t
 
-(** Item type pairs (as [base:sub], the token shape a term uses) and feature
-    names, for the search form's datalist. Both sorted.
+(** Item type pairs (as [base:sub], the token shape a term uses), sorted, for
+    the search form's datalist. Feature names went with the criterion in
+    2026-09-10: search covers items, so suggesting a feature suggested a term
+    that errors.
 
     A temp b-tree over every entry of the build: seconds, not milliseconds, so
     callers cache per process. The corpus only grows, so a stale value is a
     missing suggestion, never a wrong one. *)
-val distinct_criteria
-  :  t
-  -> version:Query.Version.t
-  -> (string list * string list) Or_error.t
+val distinct_criteria : t -> version:Query.Version.t -> string list Or_error.t
 
 (** {1 The deepen queue}
 

@@ -55,6 +55,11 @@ module Criterion : sig
   (** A short human-readable rendering, for echoing a query back. *)
   val to_string : t -> string
 
+  (** The noun for counting several matches, where one reads naturally. [None]
+      for criteria that name no category -- a name fragment, a unique, an item
+      type whose plural depends on the stack name crawl rendered. *)
+  val plural_noun : t -> string option
+
   (** Whether an index can serve this criterion.
 
       Constantly [true] since names were interned: the substring match that was
@@ -145,12 +150,20 @@ module Match : sig
   (** One seed that satisfied a search, with the evidence.
 
       [hits] names, per term, what was found and the shallowest level it sits
-      on -- the difference between a Trog altar on D:2 and one on D:8. *)
+      on -- the difference between a Trog altar on D:2 and one on D:8.
+
+      [name] is one exemplar: the shallowest matching item. [count] totals
+      quantity across every matching row on the seed, and [distinct] counts how
+      many differently-named items that total is spread over. They are only the
+      same fact when [distinct = 1]; a term like [Artefact] matches unrelated
+      items, so attributing [count] to [name] would claim sixteen of one storm
+      bow. *)
   type hit =
     { term : Term.t
     ; level : string
     ; name : string
     ; count : int
+    ; distinct : int
     }
   [@@deriving sexp_of]
 

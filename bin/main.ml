@@ -23,6 +23,14 @@ let () =
       Printf.eprintf "SEED_POOL_SIZE: invalid value %S\n%!" s;
       exit 1
   in
+  (match Sys.getenv_opt "SEED_SEARCH_TIMEOUT" with
+   | None | Some "" -> ()
+   | Some s ->
+     (match float_of_string_opt s with
+      | Some f when Float.compare f 0. > 0 -> Seed_web.Params.search_timeout := f
+      | _ ->
+        Printf.eprintf "SEED_SEARCH_TIMEOUT: invalid value %S\n%!" s;
+        exit 1));
   (* Escape hatch to take search down entirely; see fossil ticket 093f82b4a9. *)
   (match Sys.getenv_opt "SEED_DISABLE_SEARCH" with
    | Some ("1" | "true" | "yes") -> Seed_web.Params.search_disabled := true
@@ -52,21 +60,34 @@ let () =
      server-side store.
 
      Without SEED_SECRET Dream generates one per process, which invalidates
-     every open page's token on restart. *)
+     every open page's token on restart. The secret stays global while
+     [cookie_sessions] does not: it keys the signature the session middleware
+     verifies with, so it has to be installed outside the scope that uses it. *)
   let secret =
     match Sys.getenv_opt "SEED_SECRET" with
     | Some secret when secret <> "" -> [ Dream.set_secret secret ]
     | _ -> []
   in
+  (* [Dream.cookie_sessions] is scoped onto the three seed routes in the router,
+     not applied here -- global, it Set-Cookie'd every response including the
+     ones no session is ever read from. *)
+  (* [head_as_get] wraps the header middleware rather than the reverse: it
+     returns the response the inner stack produced, so anything that stamps
+     headers has to have already run when it drops the body. *)
   let middlewares =
-    [ Dream.logger ] @ secret @ [ Dream.cookie_sessions; Seed_web.security_headers ]
+    [ Dream.logger; Seed_web.head_as_get ] @ secret @ [ Seed_web.security_headers ]
   in
   (* Probe the port before Dream takes it. Catching [Dream.run]'s failure is too
      late: Dream's logger has already printed the Lwt backtrace by then.
 
      [interface] is a name, not an address, and the default "localhost" resolves
      to ::1 before 127.0.0.1 -- so probing a hardcoded IPv4 loopback tests an
-     address Dream is not about to bind. *)
+     address Dream is not about to bind.
+
+     SO_REUSEADDR because Lwt sets it on the listener (lwt_io.ml, before its
+     bind). Without it here the probe is stricter than the bind it predicts: a
+     previous process's socket still in TIME_WAIT fails the probe and aborts a
+     restart Dream would have completed. *)
   (let addrs =
      Unix.getaddrinfo interface (string_of_int port) [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
    in
@@ -76,6 +97,7 @@ let () =
         Fun.protect
           ~finally:(fun () -> Unix.close probe)
           (fun () ->
+             Unix.setsockopt probe Unix.SO_REUSEADDR true;
              match Unix.bind probe ai.ai_addr with
              | () -> ()
              | exception Unix.Unix_error (Unix.EADDRINUSE, _, _) ->

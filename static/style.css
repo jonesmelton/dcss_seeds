@@ -1071,10 +1071,15 @@ h1 .copy-seed {
 
 /* ── Forms ─────────────────────────────────────────────────────────────── */
 /* The term boxes hold a compact syntax (potion:haste, 3x wand:digging), so they
-   are sans and tabular like the seeds they search for. */
+   are sans and tabular like the seeds they search for.
+   Ligatures off, because `~` is syntax here and Alegreya Sans ligates it:
+   asciitilde + g/e/i/u/y (and the capitals) map to the precomposed tilde
+   letters, so `name~golden` renders as `nameg̃olden`. */
 .search input[type="text"],
 .jump input[type="text"] {
   font-family: var(--sans);
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "clig" 0;
   font-variant-numeric: tabular-nums lining-nums;
   font-size: 0.95em;
   width: 100%;
@@ -1138,8 +1143,66 @@ h1 .copy-seed {
   padding: 0;
 }
 
+/* The cap moves to the row so a box with a remove button and one without still
+   end at the same right edge. */
+.search .terms input[type="text"] {
+  max-width: none;
+  min-width: 0;
+}
+
+.search .terms li {
+  display: flex;
+  align-items: stretch;
+  gap: 0.35rem;
+  max-width: 28rem;
+}
+
 .search .terms li + li {
   margin-top: 0.35rem;
+}
+
+/* Not a control: it exists so implicit submission (Enter in a term box) resolves
+   to a search rather than to the first remove button. Hidden without
+   display:none, which would take it out of the form's default-button search. */
+.default-submit {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Same reason as the term boxes: this line spells out the syntax, `name~...`
+   included, and the serif face ligates `~` with the letter after it. */
+#search-help {
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "clig" 0;
+}
+
+/* Removal is a submit button, so it inherits the search button's small-caps
+   inversion; it is a glyph beside a field and wants none of it.
+   --ink-2 rather than --ink-3 for the glyph: --ink-3 measures 4.04:1 on paper
+   (3.97:1 dark), under the 4.5:1 this text needs, and --rule is 1.44:1, under
+   the 3:1 a control's boundary needs. */
+.search .terms .drop-term {
+  flex: none;
+  font-family: var(--sans);
+  font-size: 1em;
+  letter-spacing: normal;
+  line-height: 1;
+  min-width: 2rem;
+  padding: 0 0.55rem;
+  border-color: var(--ink-2);
+  color: var(--ink-2);
+}
+
+.search .terms .drop-term:hover {
+  background: var(--paper);
+  color: var(--ink);
+  border-color: var(--ink);
 }
 
 /* The search runs on the server and a cold conjunction is not instant, so the
@@ -1194,6 +1257,19 @@ h1 .copy-seed {
 
 .hits li + li {
   margin-top: 0.2rem;
+}
+
+/* The term's total, where it is spread over several items and so is a fact
+   about the seed rather than about the item named beside it. The separator is
+   decorative: a screen reader should hear "on D:3, 16 artefacts", not a middle
+   dot. */
+.hit-total {
+  color: var(--ink-2);
+}
+
+.hit-total::before {
+  content: " · ";
+  color: var(--rule);
 }
 
 /* ── The seed page ─────────────────────────────────────────────────────── */

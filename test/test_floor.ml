@@ -426,7 +426,7 @@ let%expect_test "a faded altar is listed but never gilded" =
       ""
         ~altars:(List.map f.altars ~f:(fun a -> a.god, a.in_pool) : (string * bool) list)
         ~facts:(Floor.standing_facts f l : string list)];
-  [%expect {| ((altars ((Ecumenical true))) (facts ())) |}]
+  [%expect {| ((altars ((Faded true))) (facts ())) |}]
 ;;
 
 let show_entrances levels =

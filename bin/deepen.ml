@@ -207,6 +207,18 @@ let one_pass db ~builds ~db_path ~ingest ~generator_id =
           ~ingest
           ~claim:(Option.value_exn job.started_at ~message:"claimed job with no claim")
       in
+      (* Unconditional, and before the outcome is recorded: ingest commits as it
+         goes, so a job that timed out or was killed has still interned whatever
+         names it reached. Skipping the catch-up on a bad outcome would leave
+         those indexed nowhere and withdraw name search corpus-wide until
+         someone rebuilt by hand.
+
+         Failure is logged, not fatal: the mark stays where it was, name search
+         stays withdrawn, and the next job retries the same range. That is the
+         status quo this replaces, not a regression. *)
+      (match Seed_corpus.Db.catch_up_fts db with
+       | Ok () -> ()
+       | Error err -> eprintf "fts catch-up failed: %s\n%!" (Error.to_string_hum err));
       let recorded =
         match Outcome.record outcome with
         | `Nothing -> Outcome.Claim_lost

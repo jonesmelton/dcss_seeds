@@ -170,6 +170,14 @@ shard, so 1.3M at K=16 peaks near 2.1 GB. That per-seed figure averages over a
 non-uniform population — validate with a single-shard dry run before committing
 a long pass.
 
+`tools/corpus-fill` derives K itself, one shard per 100k seeds in the version
+(13 at 1.3M), overridable as `SHARDS`. It did not until 2026-09-08: sharding
+landed in `Db.rescore` and `bin/rescore.ml` on 2026-09-05 but the fill's own
+final rescore kept calling it at the default K=1 — the configuration that had
+just been OOM-killed. Nothing caught it because the equivalence property is
+tested in `test_db_heat.ml` against the library, and the caller is a shell
+script.
+
 The 9.10 GiB peak is now **entirely `recompute_surprise`**, which is untouched
 and unsharded — it measured 9.06 GiB before the change and 9.10 GiB after. The
 sharded scoring phase that used to climb 9 GB → 29 GB now holds *flat* at

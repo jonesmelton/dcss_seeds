@@ -21,6 +21,29 @@ let render_fragment elt =
   Buffer.contents buf
 ;;
 
+(* [Dream.router] dispatches on method, so a table of [Dream.get] routes sends
+   every HEAD to the catch-all 404 -- which unfurlers, uptime monitors and link
+   checkers all read as the site being down, while a browser sees nothing wrong.
+   Rewriting to GET and dropping the body keeps one route table answering both
+   methods, so a route cannot be added for GET and forgotten for HEAD.
+
+   The body is dropped here rather than by the HTTP layer: httpaf's
+   [Response.body_length] takes the request method but only special-cases
+   CONNECT and the bodiless statuses, so a HEAD response left with a body sends
+   it. Content-Length is set from what GET would have returned, since RFC 9110
+   asks for the headers GET would send. *)
+let head_as_get inner request =
+  match Dream.method_ request with
+  | `HEAD ->
+    Dream.set_method_ request `GET;
+    let%lwt response = inner request in
+    let%lwt body = Dream.body response in
+    Dream.set_header response "Content-Length" (Int.to_string (String.length body));
+    Dream.set_body response "";
+    Lwt.return response
+  | _ -> inner request
+;;
+
 let security_headers inner request =
   let%lwt response = inner request in
   Dream.set_header
@@ -436,9 +459,21 @@ let deepen_seed ~reader ~writer ~lock_path version request =
 ;;
 
 (* Search runs detached unless every term is cheap. Blocking SQLite stalls all
-   concurrent requests. *)
+   concurrent requests.
+
+   Two conditions, and the second is about the set rather than any one term.
+   Only one term becomes the driver, and [driver_select] renders a
+   [min_count > 1] driver as its own flat group-by; a second such term has no
+   driver slot left and falls back to the correlated scalar-sum, which the
+   2026-09-09 decorrelation did not rewrite (it covers [min_count <= 1] only).
+   Measured on prod at 1.3M: one counted term 0.20s, two 23.2s. *)
 let search_is_cheap (search : Seed_corpus.Search.t) =
-  List.for_all search.terms ~f:(fun (term : Seed_corpus.Search.Term.t) ->
+  let counted =
+    List.count search.terms ~f:(fun (term : Seed_corpus.Search.Term.t) ->
+      term.min_count > 1)
+  in
+  counted <= 1
+  && List.for_all search.terms ~f:(fun (term : Seed_corpus.Search.Term.t) ->
     Seed_corpus.Search.Criterion.is_cheap term.criterion)
 ;;
 
@@ -463,6 +498,14 @@ let run_search reader pool search ~rank =
    Unrands prefixed with [name~]: bare name would parse as item. *)
 let criteria_cache : (string, string list) Hashtbl.t = Hashtbl.create (module String)
 
+(* The scan is minutes long at corpus scale and holds a pool connection
+   throughout, so a miss starts it in the background and renders without
+   suggestions rather than awaiting it. Awaiting it made the first search after
+   a restart -- a deploy during a traffic spike -- block for the whole scan, and
+   four concurrent cold searches launch four scans and exhaust the pool. This
+   table is what makes it one: a version present here has a scan in flight. *)
+let criteria_pending : (string, unit Lwt.t) Hashtbl.t = Hashtbl.create (module String)
+
 let unrand_options version =
   match
     Seed_corpus.Unrand.names ~version:(Seed_corpus.Query.Version.to_string version)
@@ -471,28 +514,45 @@ let unrand_options version =
   | Some names -> List.map names ~f:(fun name -> "name~" ^ name)
 ;;
 
+let criteria_scan pool version ~key =
+  let%lwt computed =
+    Lwt_preemptive.detach
+      (fun () ->
+         Seed_corpus.Pool.with_conn pool ~f:(fun db ->
+           Seed_corpus.Db.distinct_criteria db ~version))
+      ()
+  in
+  (match computed with
+   | Error err ->
+     Dream.warning (fun log ->
+       log "datalist vocabulary unavailable: %s" (Error.to_string_hum err))
+   | Ok items ->
+     let options = List.concat [ items; unrand_options version ] in
+     Hashtbl.set criteria_cache ~key ~data:options);
+  (* Cleared whether or not the scan succeeded, so a failure is retried by the
+     next miss rather than wedging the version out of ever having a datalist. *)
+  Hashtbl.remove criteria_pending key;
+  Lwt.return_unit
+;;
+
 let criteria_for pool version =
   let key = Seed_corpus.Query.Version.to_string version in
   match Hashtbl.find criteria_cache key with
-  | Some options -> Lwt.return (Some options)
+  | Some options -> Some options
   | None ->
-    let%lwt computed =
-      Lwt_preemptive.detach
-        (fun () ->
-           Seed_corpus.Pool.with_conn pool ~f:(fun db ->
-             Seed_corpus.Db.distinct_criteria db ~version))
-        ()
-    in
-    (match computed with
-     | Error err ->
-       Dream.warning (fun log ->
-         log "datalist vocabulary unavailable: %s" (Error.to_string_hum err));
-       Lwt.return None
-     | Ok (items, feats) ->
-       let options = List.concat [ items; feats; unrand_options version ] in
-       Hashtbl.set criteria_cache ~key ~data:options;
-       Lwt.return (Some options))
+    if not (Hashtbl.mem criteria_pending key)
+    then Hashtbl.set criteria_pending ~key ~data:(criteria_scan pool version ~key);
+    None
 ;;
+
+(* Test hooks: the scan is background work with no handle in the response, so a
+   test that needs it settled has no other way to wait for it. *)
+let criteria_cache_clear () =
+  Hashtbl.clear criteria_cache;
+  Hashtbl.clear criteria_pending
+;;
+
+let criteria_cache_wait () = Lwt_main.run (Lwt.join (Hashtbl.data criteria_pending))
 
 (* Body reads no corpus; db threaded through for masthead. *)
 let search_help_page db version _request =
@@ -543,46 +603,68 @@ let search_page db ~pool version request =
     with
     | Error err -> bad_request err
     | Ok (search, rank) ->
-      let%lwt result = run_search db pool search ~rank in
+      (* No terms means nothing was asked; the views render a prompt, so there is
+         no query to run and no unfiltered scan to pay for. *)
+      let%lwt result =
+        if Seed_corpus.Search.is_empty search
+        then Lwt.return (`Answered (Ok ([], `End)))
+        else
+          (* Bounds what the client waits for, not what the query occupies: the
+             abandoned search runs on to completion still holding its pool
+             connection, since there is no [sqlite3_interrupt] to bind. Enough
+             against an accidental or probing hang, not against a determined
+             one -- that needs the interrupt. *)
+          Lwt.pick
+            [ Lwt.map (fun r -> `Answered r) (run_search db pool search ~rank)
+            ; Lwt.map (fun () -> `Timed_out) (Lwt_unix.sleep !Params.search_timeout)
+            ]
+      in
       (match result with
-       (* A rebuild in progress is a transient state of the corpus, not a bad
-          query: the reader's search is well-formed and will work shortly. *)
-       | Error err when Seed_corpus.Search.is_index_rebuilding err ->
+       | `Timed_out ->
+         Dream.warning (fun log -> log "search over %.0fs budget" !Params.search_timeout);
          temporarily_unavailable
-           "Searching by name is briefly unavailable while the name index rebuilds after \
-            a corpus update. Every other kind of search still works; try this one again \
-            in a few minutes."
-       (* Too broad to rank is a reader query issue, not a fault. *)
-       | Error err when Seed_corpus.Search.Rank.is_too_broad err ->
-         bad_request
-           (Error.of_string
-              (Printf.sprintf
-                 "That search matches more than %d seeds, which is too many to rank by \
-                  %s. Add another term to narrow it, or rank by seed."
-                 Seed_corpus.Search.Rank.sort_limit
-                 (Seed_corpus.Search.Rank.to_string rank)))
-       | Error err ->
-         Dream.error (fun log -> log "%s" (Error.to_string_hum err));
-         or_error_response (Or_error.error_string "search failed")
-       | Ok (matches, more) ->
-         let%lwt suggestions = criteria_for pool version in
-         let body = Views.search_page ~search ~suggestions ~rank ~more matches in
-         if Option.is_some (Dream.header request "HX-Request")
-         then
-           Dream.html
-             (String.concat
-                (List.map
-                   (Views.search_fragment ~search ~suggestions ~rank ~more matches)
-                   ~f:render_fragment))
-         else
-           Dream.html
-             (render_html
-                (Index.render
-                   ~version
-                   ~builds:(served_builds db)
-                   ~here:Index.Page.Search
-                   ~title:Views.search_title
-                   body))))
+           "That search took too long to answer and was stopped. Narrowing it with \
+            another term will usually make it fast enough."
+       | `Answered result ->
+         (match result with
+          (* A rebuild in progress is a transient state of the corpus, not a bad
+          query: the reader's search is well-formed and will work shortly. *)
+          | Error err when Seed_corpus.Search.is_index_rebuilding err ->
+            temporarily_unavailable
+              "Searching by name is briefly unavailable while the name index rebuilds \
+               after a corpus update. Every other kind of search still works; try this \
+               one again in a few minutes."
+          (* Too broad to rank is a reader query issue, not a fault. *)
+          | Error err when Seed_corpus.Search.Rank.is_too_broad err ->
+            bad_request
+              (Error.of_string
+                 (Printf.sprintf
+                    "That search matches more than %d seeds, which is too many to rank \
+                     by %s. Add another term to narrow it, or rank by seed."
+                    Seed_corpus.Search.Rank.sort_limit
+                    (Seed_corpus.Search.Rank.to_string rank)))
+          | Error err ->
+            Dream.error (fun log -> log "%s" (Error.to_string_hum err));
+            or_error_response (Or_error.error_string "search failed")
+          | Ok (matches, more) ->
+            let suggestions = criteria_for pool version in
+            let body = Views.search_page ~search ~suggestions ~rank ~more matches in
+            if Option.is_some (Dream.header request "HX-Request")
+            then
+              Dream.html
+                (String.concat
+                   (List.map
+                      (Views.search_fragment ~search ~suggestions ~rank ~more matches)
+                      ~f:render_fragment))
+            else
+              Dream.html
+                (render_html
+                   (Index.render
+                      ~version
+                      ~builds:(served_builds db)
+                      ~here:Index.Page.Search
+                      ~title:Views.search_title
+                      body)))))
 ;;
 
 (* Styled 404 as trailing catch-all route; [Dream.router] gives bare bodiless
@@ -598,13 +680,26 @@ let router ~reader ~writer ~pool ~lock_path =
     ; Dream.get "/:version/search" (with_version (search_page reader ~pool))
     ; Dream.get "/:version/search/help" (with_version (search_help_page reader))
     ; Dream.get "/:version/about" (with_version (about_page reader))
-    ; Dream.get "/:version/seed/:seed" (with_version (seed_detail_page reader ~lock_path))
-    ; Dream.get
-        "/:version/seed/:seed/depth"
-        (with_version (depth_fragment ~polling:true reader ~lock_path))
-    ; Dream.post
-        "/:version/seed/:seed/deepen"
-        (with_version (deepen_seed ~reader ~writer ~lock_path))
+      (* Scoped rather than global because a session is a Set-Cookie on every
+         response it touches, and these three routes are the only ones that need
+         one: the CSRF token is bound to a session, and the deepen button is the
+         only mutation. Global, it also cookied the index, search, /health and
+         every static file -- a credential handed to readers who never post, and
+         one that suppresses caching downstream. Scope middlewares run only on a
+         match, so the prefix is what keeps them off everything else. *)
+    ; Dream.scope
+        ""
+        [ Dream.cookie_sessions ]
+        [ Dream.get
+            "/:version/seed/:seed"
+            (with_version (seed_detail_page reader ~lock_path))
+        ; Dream.get
+            "/:version/seed/:seed/depth"
+            (with_version (depth_fragment ~polling:true reader ~lock_path))
+        ; Dream.post
+            "/:version/seed/:seed/deepen"
+            (with_version (deepen_seed ~reader ~writer ~lock_path))
+        ]
     ; Dream.get "/static/**" (Dream.static "static")
     ; Dream.any "/**" not_found
     ]

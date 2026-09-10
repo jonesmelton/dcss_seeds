@@ -23,7 +23,7 @@ https://github.com/crawl/tiles (`ARTISTS.md`).
 
 | directory | source | files | covers |
 |---|---|---|---|
-| `altars/` | `dngn/altars/` | 82 | all 27 god altars, including `ecumenical` |
+| `altars/` | `dngn/altars/` | 82 | all 27 god altars, including the faded altar (`ecumenical`) |
 | `gateways/` | `dngn/gateways/` | 127 | branch entrances and exits, portal vaults, every stair and hatch variant |
 | `shops/` | `dngn/shops/` | 12 | the eight shop types, plus `enter_shop` and `abandoned_shop` |
 | `misc/` | `dngn/` | 3 | the transporter pair |

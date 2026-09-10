@@ -57,6 +57,14 @@ module Criterion = struct
     | Unique name -> name
   ;;
 
+  (* The noun for counting several of what this criterion matches. [Artefact] is
+     the only one with a plural that reads: an item type's plural depends on the
+     stack name crawl rendered, and a name fragment names no category at all. *)
+  let plural_noun = function
+    | Artefact -> Some "artefacts"
+    | Item _ | Shop_item _ | Floor_item _ | Name_like _ | Feature _ | Unique _ -> None
+  ;;
+
   (* Constantly true since interning: a substring match runs over the string
      dictionary rather than over entries, and since the trigram index, as a
      lookup there rather than a scan. Kept, with [partition_terms], because a
@@ -152,6 +160,7 @@ module Match = struct
     ; level : string
     ; name : string
     ; count : int
+    ; distinct : int
     }
   [@@deriving sexp_of]
 

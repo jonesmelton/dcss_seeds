@@ -212,8 +212,14 @@ echo "==> ${elapsed}s; corpus now holds $got seeds / $rows entries for $version"
 # fill completes, not per batch. This is the fill's first post-fill
 # maintenance phase; it runs only after every worker above has exited, so it
 # reads a settled corpus rather than one still under a parallel-writer race.
-echo "==> $version: rescoring heat"
+# Unsharded this was OOM-killed at 29.0 GiB on the 1.3M corpus. K bounds
+# residency only -- scores are byte-identical at any K -- so it tracks corpus
+# size, not the machine. Budget ~120MB + 24KB per seed per shard.
+shards="${SHARDS:-$(( (got + 99999) / 100000 ))}"
+[ "$shards" -lt 1 ] && shards=1
+
+echo "==> $version: rescoring heat ($shards shard(s))"
 rescore_started=$(date +%s)
-"$rescore" -db "$db" -build "$version"
+"$rescore" -db "$db" -build "$version" -shards "$shards"
 rescore_elapsed=$(( $(date +%s) - rescore_started ))
 echo "==> rescore ${rescore_elapsed}s; fill ${elapsed}s; total $(( elapsed + rescore_elapsed ))s"

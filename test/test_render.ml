@@ -469,6 +469,155 @@ let%expect_test "the htmx response carries a form with a box for the next term" 
     |}]
 ;;
 
+(* Each filled box gets a remove button naming its own term, so a reader can
+   take one condition off a conjunction without retyping the rest. The blank box
+   gets none -- there is nothing to remove -- and no placeholder either: a
+   term-shaped placeholder in the box below a term reads as a duplicate of it. *)
+let%expect_test "each term box carries a remove button, the blank box does not" =
+  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
+  let search =
+    Search.create ~version:v ~terms:[ term "name~bear"; term "potion:experience" ] ()
+  in
+  let html =
+    Seed_web.Views.search_page
+      ~search
+      ~suggestions:None
+      ~rank:Search.Rank.default
+      ~more:`End
+      []
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  let count pattern =
+    String.substr_index_all html ~may_overlap:false ~pattern |> List.length
+  in
+  printf "term boxes:       %d\n" (count "name=\"has\"");
+  printf "remove buttons:   %d\n" (count "name=\"drop\"");
+  printf
+    "names its term:   %b\n"
+    (String.is_substring html ~substring:"value=\"name~bear\"");
+  printf
+    "names its box:    %b\n"
+    (String.is_substring html ~substring:"value=\"0:name~bear\"");
+  (* Two boxes holding the same term get 0 and 1, so each X names its own. *)
+  printf
+    "dupes distinct:   %b\n"
+    (let dupes =
+       Search.create ~version:v ~terms:[ term "name~bear"; term "name~bear" ] ()
+     in
+     let html =
+       Seed_web.Views.search_page
+         ~search:dupes
+         ~suggestions:None
+         ~rank:Search.Rank.default
+         ~more:`End
+         []
+       |> List.map ~f:Seed_web.render_fragment
+       |> String.concat
+     in
+     String.is_substring html ~substring:"value=\"0:name~bear\""
+     && String.is_substring html ~substring:"value=\"1:name~bear\"");
+  printf "labelled:         %b\n" (String.is_substring html ~substring:"Remove name~bear");
+  printf
+    "no placeholder:   %b\n"
+    (not (String.is_substring html ~substring:"placeholder"));
+  (* Every box carries a value attribute, the blank one included. Morph syncs an
+     input's value property only on the branch that *sets* an attribute; the
+     branch that removes one calls removeAttribute and nothing else. A box going
+     from a value to none -- which is what the last box does whenever a term is
+     removed from the middle -- would keep showing the old term. *)
+  printf
+    "blank has value:  %b\n"
+    (String.is_substring html ~substring:"name=\"has\" value=\"\"");
+  [%expect
+    {|
+    term boxes:       3
+    remove buttons:   2
+    names its term:   true
+    names its box:    true
+    dupes distinct:   true
+    labelled:         true
+    no placeholder:   true
+    blank has value:  true
+    |}]
+;;
+
+(* Implicit submission activates the first submit button in tree order, and the
+   remove buttons precede the search button. Without a default ahead of them,
+   pressing Enter in a term box submits "drop=0:<first term>" -- the reader
+   silently loses an unrelated term instead of searching. *)
+let%expect_test "the first submit button in the form is a search, not a removal" =
+  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
+  let search =
+    Search.create ~version:v ~terms:[ term "potion:haste"; term "artefact" ] ()
+  in
+  let html =
+    Seed_web.Views.search_page
+      ~search
+      ~suggestions:None
+      ~rank:Search.Rank.default
+      ~more:`End
+      []
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  let form =
+    let i = Option.value_exn (String.substr_index html ~pattern:"<form") in
+    let j = Option.value_exn (String.substr_index html ~pattern:"</form>") in
+    String.sub html ~pos:i ~len:(j - i)
+  in
+  let first =
+    let i = Option.value_exn (String.substr_index form ~pattern:"<button") in
+    String.sub form ~pos:i ~len:(String.index_from_exn form i '>' - i + 1)
+  in
+  printf "%s\n" first;
+  printf "carries no drop: %b\n" (not (String.is_substring first ~substring:"drop"));
+  [%expect
+    {|
+    <button type="submit" class="default-submit" tabindex="-1" aria-hidden="true">
+    carries no drop: true
+    |}]
+;;
+
+(* Morph matches by id first and only falls back to a positional soft match, so
+   without ids the blank box is matched onto the previous blank -- the one the
+   reader typed the just-submitted term into -- and morph leaves a dirty input's
+   value property alone. The result is the submitted term echoed into the empty
+   box below it. Ids are positional, so box n only ever matches box n and the
+   new blank comes back empty. *)
+let%expect_test "term boxes carry positional ids, blank box included" =
+  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
+  let search =
+    Search.create ~version:v ~terms:[ term "name~lance"; term "artefact" ] ()
+  in
+  let html =
+    Seed_web.Views.search_page
+      ~search
+      ~suggestions:None
+      ~rank:Search.Rank.default
+      ~more:`End
+      []
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  let ids =
+    String.substr_index_all html ~may_overlap:false ~pattern:"id=\"term-"
+    |> List.map ~f:(fun i ->
+      let start = i + String.length "id=\"" in
+      String.sub html ~pos:start ~len:(String.index_from_exn html start '"' - start))
+  in
+  List.iter ids ~f:(printf "%s\n");
+  [%expect
+    {|
+    term-row-0
+    term-0
+    term-row-1
+    term-1
+    term-row-2
+    term-2
+    |}]
+;;
+
 (* htmx swaps a 4xx like any other response and takes the document title from
    it, so a rejected query leaves "Bad request" in the tab. The title is
    therefore a property of every search response, not only the full-page
@@ -489,6 +638,40 @@ let%expect_test "the htmx response carries the title, so an error does not stick
   in
   printf "carries a title: %b\n" (String.is_substring html ~substring:"<title>");
   [%expect {| carries a title: true |}]
+;;
+
+(* A term-less search is a reader who has not asked anything yet, not a request
+   for the whole corpus. Answering it with the first page of an unfiltered scan
+   prints seeds 1, 10, 100, 1000 -- string order, no relation to the reader --
+   and pays for a full-table read to do it. *)
+let%expect_test "a search with no terms prompts instead of listing seeds" =
+  let html =
+    Seed_web.Views.search_page
+      ~search:(Search.create ~version:v ~terms:[] ())
+      ~suggestions:None
+      ~rank:Search.Rank.default
+      ~more:`End
+      []
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  printf "has a form:     %b\n" (String.is_substring html ~substring:"id=\"search\"");
+  printf "prompts:        %b\n" (String.is_substring html ~substring:"Add a term");
+  printf "no results table: %b\n" (not (String.is_substring html ~substring:"<table"));
+  printf
+    "no all-seeds heading: %b\n"
+    (not (String.is_substring html ~substring:"all seeds on"));
+  printf
+    "no empty-corpus claim: %b\n"
+    (not (String.is_substring html ~substring:"have been ingested"));
+  [%expect
+    {|
+    has a form:     true
+    prompts:        true
+    no results table: true
+    no all-seeds heading: true
+    no empty-corpus claim: true
+    |}]
 ;;
 
 (* A shop whose stock is entirely mundane emits no item rows: crawl's own
@@ -521,5 +704,41 @@ let%expect_test "a shop with no notable stock says so without implying a gap" =
     {|
     empty    no notable stock: true | not recorded: false
     stocked  no notable stock: false | not recorded: false
+    |}]
+;;
+
+(* The exemplar carries no quantity when the term's total is spread over other
+   items; only the seed-level total is stated, and its separator is decorative. *)
+let%expect_test "a heterogeneous hit states its total apart from its exemplar" =
+  let module Search = Seed_corpus.Search in
+  let version = Or_error.ok_exn (Seed_corpus.Query.Version.of_string "0.34.1") in
+  let term = Search.Term.create Search.Criterion.Artefact in
+  let hit ~name ~count ~distinct =
+    { Search.Match.term; level = "D:3"; name; count; distinct }
+  in
+  let matches =
+    [ { Search.Match.seed = "1000158"
+      ; hits = [ hit ~name:"+8 storm bow {elec, penet}" ~count:16 ~distinct:16 ]
+      }
+    ; { Search.Match.seed = "1000200"
+      ; hits = [ hit ~name:"2 potions of haste" ~count:2 ~distinct:1 ]
+      }
+    ]
+  in
+  let search = Search.create ~version ~terms:[ term ] () in
+  let html =
+    Seed_web.Views.search_results ~search ~rank:Search.Rank.default ~more:`End matches
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  String.substr_index_all html ~may_overlap:false ~pattern:{|<ul class="hits">|}
+  |> List.iter ~f:(fun pos ->
+    let rest = String.subo html ~pos in
+    let stop = Option.value_exn (String.substr_index rest ~pattern:"</ul>") in
+    print_endline (String.sub rest ~pos:0 ~len:stop));
+  [%expect
+    {|
+    <ul class="hits"><li>+8 storm bow {elec, penet} on <span class="sc">D:3</span><span class="hit-total">16 artefacts</span></li>
+    <ul class="hits"><li>2 potions of haste ×2 on <span class="sc">D:3</span></li>
     |}]
 ;;

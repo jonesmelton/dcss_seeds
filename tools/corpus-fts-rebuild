@@ -5,16 +5,23 @@
 #
 # Not part of ingest, and not driven by a trigger: an external-content fts5
 # table has none unless written, so a corpus that has just been filled carries
-# an index that does not know about the names the fill added. Searches stay
-# correct in the meantime -- the read path compares the recorded high-water mark
-# against `strings` and falls back to the dictionary scan when they disagree --
-# so this is safe to defer, and slow enough (minutes on prod I/O) to be worth
-# deferring. Run it after a fill; until then `name~` is merely as slow as it
-# always was.
+# an index that does not know about the names the fill added.
+#
+# Until this runs, `name~` is *refused*, not served slowly. The read path
+# compares the recorded high-water mark against `strings` and returns a 503 when
+# they disagree. There is deliberately no scan fallback: the unindexed form is a
+# 129 MB dictionary scan per query, cheap to trigger from a URL and slow enough
+# that a handful of concurrent ones -- curious readers with bad timing, no
+# malice required -- take the site down. Refusing one kind of search beats
+# offering everyone a denial-of-service primitive.
+#
+# So this is not safe to defer. Run it after every fill, and before the corpus
+# serves; nothing else will, and nothing retries on its own.
 #
 # The mark is taken before the rebuild and committed with it, so a name racing
 # the rebuild is recorded as *not* covered rather than covered-but-absent. That
-# direction costs a fallback; the other returns wrong answers.
+# direction costs a refusal until the next rebuild; the other returns wrong
+# answers.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

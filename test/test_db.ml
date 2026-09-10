@@ -492,3 +492,43 @@ let%expect_test "a failing statement reports the extended code and sqlite's mess
       Db.close contender;
       Db.close holder)
 ;;
+
+(* A deepened seed reaches levels the fill never saw, so it interns names the
+   dictionary did not have. That is an ordinary ingest, and until the index
+   catches up every one of those names is invisible to `name~` -- and because
+   currency is a high-water mark over the whole dictionary, one new name
+   withdraws name search for the entire corpus, not just for that seed. *)
+let%expect_test "catching the index up covers names interned after the rebuild" =
+  let db = fresh_db () in
+  let record = Or_error.ok_exn (Reader.parse_line sample_line) in
+  ignore (Db.write_batch db [ record ] : Db.Counts.t);
+  Or_error.ok_exn (Db.rebuild_fts db);
+  print_s [%sexp (Db.fts_is_current db : bool)];
+  [%expect {| true |}];
+  let deepened =
+    String.substr_replace_first
+      sample_line
+      ~pattern:{|(level "D:2")|}
+      ~with_:{|(level "D:9")|}
+    |> String.substr_replace_first ~pattern:"Wamnu's Compendium" ~with_:"Xomnu's Grimoire"
+  in
+  ignore
+    (Db.write_batch db [ Or_error.ok_exn (Reader.parse_line deepened) ] : Db.Counts.t);
+  print_s [%sexp (Db.fts_is_current db : bool)];
+  [%expect {| false |}];
+  Or_error.ok_exn (Db.catch_up_fts db);
+  print_s [%sexp (Db.fts_is_current db : bool)];
+  [%expect {| true |}];
+  show
+    db
+    "select s.val from strings s where s.id in (select rowid from strings_fts where \
+     strings_fts match '\"Grimoire\"')";
+  [%expect {| Xomnu's Grimoire |}];
+  (* The rebuild's own coverage must survive the catch-up. *)
+  show
+    db
+    "select s.val from strings s where s.id in (select rowid from strings_fts where \
+     strings_fts match '\"kobold\"')";
+  [%expect {| kobold |}];
+  Db.close db
+;;

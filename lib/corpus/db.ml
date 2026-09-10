@@ -1550,21 +1550,35 @@ let driver_select (term : Search.Term.t) =
   else `Group_by (where, bind, Sqlite3.Data.INT (Int64.of_int term.min_count))
 ;;
 
-(* Non-driver terms become correlated [exists] (or scalar-sum for
-   [min_count > 1]) against a second aliased row. Correct under both [where]
-   and [group by] driver shapes. *)
-let correlated_select (term : Search.Term.t) ~alias =
+(* Non-driver terms constrain [e.seed] against a second aliased row. Correct
+   under both [where] and [group by] driver shapes.
+
+   For [min_count <= 1] the shape is an *uncorrelated* [in (select ...)]. Any
+   correlation makes SQLite re-run the inner select per candidate seed, which
+   for [Name_like] means an fts5 dictionary scan per seed. Both decorrelations
+   are needed and neither is sufficient: seed only, 26.3s; version only, 105s;
+   both, 0.14s (`bear` + `hat`, 1.3M, 2026-09-09).
+
+   The inner keyset bound is redundant against the outer [e.seed > ?], but it
+   caps what gets materialised -- [artefact] as a non-driver materialises 1.13M
+   seeds without it (4.7s vs 1.1s).
+
+   [entries.seed] is not null, so [in] and [exists] agree; that is a
+   precondition of the rewrite, not an incidental property. *)
+let correlated_select (term : Search.Term.t) ~alias ~version ~after =
   let where, bind = criterion_where term.criterion ~alias in
   if term.min_count <= 1
   then
     ( sprintf
-        "exists (select 1 from entries %s where %s.version_id = e.version_id and %s and \
-         %s.seed = e.seed)"
+        "e.seed in (select %s.seed from entries %s where %s.version_id = %s and %s and \
+         %s.seed > ?)"
         alias
         alias
+        alias
+        version_id_sql
         where
         alias
-    , bind )
+    , (version_bind version :: bind) @ [ Sqlite3.Data.TEXT after ] )
   else
     ( sprintf
         "(select sum(coalesce(%s.quantity, 1)) from entries %s where %s.version_id = \
@@ -1627,12 +1641,14 @@ let search_seeds_sql (search : Search.t) =
       | [] -> assert false
       | (_, driver) :: rest -> driver, List.map rest ~f:snd
     in
+    let after = Option.value search.page.after ~default:"" in
     let rest_selects =
-      List.mapi rest ~f:(fun i term -> correlated_select term ~alias:(sprintf "a%d" i))
+      List.mapi rest ~f:(fun i term ->
+        correlated_select term ~alias:(sprintf "a%d" i) ~version:search.version ~after)
     in
     let rest_wheres, rest_binds = List.unzip rest_selects in
     let version_bind = version_bind search.version in
-    let after_bind = Sqlite3.Data.TEXT (Option.value search.page.after ~default:"") in
+    let after_bind = Sqlite3.Data.TEXT after in
     let limit_bind = Sqlite3.Data.INT (Int64.of_int (search.page.limit + 1)) in
     (match driver_select driver with
      | `Where (driver_where, driver_bind) ->
@@ -1793,14 +1809,20 @@ let term_hit_name row ~term =
    single sub_type reaches the corpus under several names; grouping by name
    would split one term's evidence.
 
-   The shallowest contributing name is used as the label. *)
+   The shallowest contributing name is the label, and [distinct] says how many
+   names the total spans -- a term matching unrelated items cannot attribute
+   its total to that one label. *)
 let group_term_hits rows ~term =
   let totals = String.Table.create () in
+  let names = String.Table.create () in
   let shallowest = String.Table.create () in
   List.iter rows ~f:(fun (seed, level, name, quantity) ->
     Hashtbl.update totals seed ~f:(function
       | None -> quantity
       | Some existing -> existing + quantity);
+    Hashtbl.update names seed ~f:(function
+      | None -> String.Set.singleton name
+      | Some seen -> Set.add seen name);
     let depth = Depth.of_level level in
     Hashtbl.update shallowest seed ~f:(function
       | Some existing when Tuple3.get1 existing <= depth -> existing
@@ -1811,7 +1833,8 @@ let group_term_hits rows ~term =
       | Some (_, level, name) -> level, name
       | None -> "", term_label term
     in
-    (seed, { Search.Match.term; level; name; count }) :: acc)
+    let distinct = Hashtbl.find names seed |> Option.value_map ~default:1 ~f:Set.length in
+    (seed, { Search.Match.term; level; name; count; distinct }) :: acc)
   |> List.sort ~compare:(fun (a, _) (b, _) -> String.compare a b)
 ;;
 
@@ -1895,35 +1918,8 @@ order by 1
     version_id_sql
 ;;
 
-(* [val not like 'altar\_%' escape '\\']: search no longer supports altar
-   features at all (product decision -- see [Params.criterion]), so the
-   datalist that suggests feature names for the blank term box must not offer
-   one a query would then reject. The escape mirrors [like_contains]: '_' is a
-   wildcard, and 'altar_' contains a literal one. *)
-let feat_names_sql =
-  sprintf
-    {|
-  select s.val
-    from entries e
-    join strings s
-      on s.id = e.feat_id
-   where e.version_id = %s
-     and e.feat_id is not null
-     and s.val not like 'altar\_%%' escape '\'
-group by 1
-order by 1
-|}
-    version_id_sql
-;;
-
 let distinct_criteria t ~version =
-  let open Or_error.Let_syntax in
-  let%map items =
-    with_stmt t item_pairs_sql ~bind:[ version_bind version ] ~f:seeds_of_stmt
-  and feats =
-    with_stmt t feat_names_sql ~bind:[ version_bind version ] ~f:seeds_of_stmt
-  in
-  items, feats
+  with_stmt t item_pairs_sql ~bind:[ version_bind version ] ~f:seeds_of_stmt
 ;;
 
 (* The distinct (portal, parent) pairs a version holds, which is what a depth
@@ -1986,6 +1982,39 @@ let fts_is_current t =
   with
   | Ok current -> current
   | Error _ -> false
+;;
+
+(* Index only what the mark does not yet cover, and move the mark to match.
+
+   The rebuild's contract is that `strings` is append-only, and this leans on it
+   harder: rows at or below the mark are never revisited, so a rewritten row
+   would stay stale behind a mark that reads as current. `insert or ignore` is
+   the only writer and never rewrites, so the property holds.
+
+   Both statements go in one transaction because the mark is a claim about the
+   index. Committing the mark without the rows indexed is the silent false
+   negative the mechanism exists to prevent; the reverse costs a re-index of
+   rows already covered, which is why the mark is read once, inside the
+   transaction, rather than passed in.
+
+   No `analyze` here, unlike the full rebuild: this runs per deepened seed, and
+   a whole-database pass at that cadence costs more than the planner gains from
+   a dictionary that grew by a few rows. *)
+let catch_up_fts t =
+  match
+    with_immediate_txn t ~f:(fun t ->
+      exec_script
+        t
+        "insert into strings_fts (rowid, val) select s.id, s.val from strings s where \
+         s.id > coalesce((select built_through from strings_fts_state where id = 1), 0)";
+      exec_script
+        t
+        "insert into strings_fts_state (id, built_through) values (1, coalesce((select \
+         max(id) from strings), 0)) on conflict (id) do update set built_through = \
+         excluded.built_through")
+  with
+  | exception exn -> Or_error.of_exn exn
+  | () -> Ok ()
 ;;
 
 (* Rebuild the trigram index and record how far it reached, in one transaction.

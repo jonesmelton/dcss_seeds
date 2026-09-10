@@ -249,7 +249,9 @@ answered in low single-digit milliseconds warm (1.3M, 0.34.1, `D:8`,
   re-running the grouped subquery per candidate row. Timed out past 100
   seconds where every other shape above was sub-5ms. This is why
   `search_is_cheap` still refuses any `min_count > 1` term outright rather
-  than trusting `Criterion.is_cheap` alone — see below. Out of scope to fix
+  than trusting `Criterion.is_cheap` alone — see below.~~ (That guard was
+  dropped when the driver was fixed, and restored 2026-09-10 in the narrower
+  form described below: two or more counted terms, not one.) Out of scope to fix
   here (it is a `driver_rank`/query-builder change); reported, not patched.~~
 
 **Fixed 2026-09-05.** `Db.driver_select` no longer renders a `min_count > 1`
@@ -267,8 +269,24 @@ SQL (1.3M, 0.34.1, `D:8`, 2026-09-05, prod, median of 3 warm runs): `2x
 potion:haste` alone answers in **~1ms**, `SEARCH e USING COVERING INDEX
 entries_search_type`, no temp b-tree; combined with a second plain term
 (`wand:digging`) it answers in **~6ms**, driver and correlated arm both
-`USING COVERING INDEX`. `Seed_web.search_is_cheap` no longer special-cases
-`min_count` — see below.
+`USING COVERING INDEX`.
+
+**Amended 2026-09-10.** `Seed_web.search_is_cheap` special-cases `min_count`
+again, but on the *count* of such terms rather than their presence. Only one
+term becomes the driver, and the flat group-by above is what makes a
+`min_count > 1` driver cheap. A **second** counted term has no driver slot left
+and falls back to the correlated scalar-sum, which the 2026-09-09 decorrelation
+did not touch — that rewrite covers the `min_count <= 1` branch only. Measured
+on prod (1.3M, 0.34.1, 2026-09-10, box contended by a neighbor process, so
+these are pessimistic): `9x artefact` alone **0.20s**, `9x floor potion:haste`
+alone **0.24s**, the two together **23.2s**. A counted term beside a plain one
+stays cheap (0.21s), since the counted one takes the driver slot.
+
+Until this landed the predicate checked only `Criterion.is_cheap`, so those
+23.2 seconds ran *inline on the Lwt scheduler thread*, blocking every other
+request in the process — and the search timeout could not fire there, because
+an inline query never yields. That combination is what made `is_cheap`'s
+accuracy a liveness property rather than a tuning knob.
 
 - **`Shop_item` seeks `entries_search_shop` but is not covering.** The query's
   own `e.cost is not null` predicate re-checks `cost` against the table even
@@ -325,10 +343,19 @@ lose:
 
   The cost is a step that follows every fill: `tools/corpus-fts-rebuild`, which
   is not part of ingest. It does not follow every *deploy* — the index is
-  derived from `strings`, which only a fill appends to, so shipping code cannot
-  make it stale. It is release-blocking only once, before the index first
-  serves, and afterwards for a change that alters the dictionary or the index
-  itself.
+  derived from `strings`, so shipping code cannot make it stale.
+
+  A fill is not the only writer that appends there. Deepening runs the same
+  ingest, and a deepened seed reaches levels the fill never saw, so it interns
+  names the dictionary lacks; since currency is a high-water mark over the whole
+  dictionary, one such name withdraws `name~` corpus-wide. The generator closes
+  that by calling `Db.catch_up_fts` after every job — index the rows above the
+  mark, advance the mark, one transaction — which is proportional to what was
+  added rather than to the dictionary, and skips the `analyze` a full rebuild
+  does. The full rebuild stays the right shape for a fill's millions of rows.
+
+  It is release-blocking only once, before the index first serves, and
+  afterwards for a change that alters the dictionary or the index itself.
 
 **One path is a deliberate exception:** `Rank.Shallowest` fetches the whole
 matched set rather than a page, which is why `Rank.sort_limit` caps it at 5000
@@ -370,6 +397,22 @@ wait (in practice absorbed by the thread-pool cap agreeing with the pool
 size), and two concurrent requests on two different pooled connections can see
 different snapshots if a write lands between their checkouts — accepted for a
 read-mostly corpus.
+
+**A search request is bounded even though a checkout is not.** `SEED_SEARCH_TIMEOUT`
+(default 30s) races the search against a timer and answers the styled 503 when
+the timer wins, so a reader is never left waiting on a query that will not
+finish. Two gaps, both deliberate as of 2026-09-10 and both left for the load
+test (`ops/loadtest.md`) to size:
+
+- It does not cancel the query. sqlite3-ocaml 5.4.1 binds neither
+  `sqlite3_interrupt` nor a progress handler, so the abandoned search runs to
+  completion still holding its pool connection. The timeout bounds what a client
+  waits for, not what a query occupies; closing this needs a C stub.
+- It covers only the detached path. A search `search_is_cheap` calls cheap runs
+  inline on the scheduler thread and never yields, so no Lwt timer can fire —
+  which makes an `is_cheap` misjudgment the one failure the timeout cannot
+  contain, and the reason that predicate's accuracy is a liveness property
+  rather than a performance one.
 
 ### Consequence for the corpus library's interface
 
@@ -809,18 +852,28 @@ Measured on the 1.3M corpus (0.34.1, `D:8`, 2026-09-05, server, warm):
 | `feat_names_sql` | 13.5s |
 | `version_levels` (`levels_sql`) | 9.5s |
 
-So the first search request after a restart pays ~140s to build the datalist,
-detached but real, and the reader who triggers it waits for it. That is a
-cold-start cost of over two minutes on a page whose useful output is 10.5 KB,
-and it grows linearly — at 10M it is ~18 minutes. The cache is what makes this
-survivable and there is no fallback if the process restarts under load. Two
-options, neither taken as of 2026-09-05: precompute the vocabulary into a table
-at fill time (it changes only when a fill adds a genuinely new item type, which
-is rare after the first few thousand seeds), or warm the cache at startup so
-the cost lands before the first request rather than on it. The first is
-strictly better — the vocabulary is a *build* fact, and recomputing it per
-process is asking the corpus a question whose answer was already known when the
-rows were written.
+So building the datalist costs ~140s, and it grows linearly — at 10M it is ~18
+minutes.
+
+**No reader waits for it.** As of 2026-09-10 `criteria_for` is not an Lwt
+function: a cache hit returns the options, and a miss returns `None` and starts
+the scan in the background. The page renders without suggestions until it lands,
+which the views already supported — `suggestions` is an option, and `None` drops
+both the input's `list` attribute and the `<datalist>` element. A second table,
+`criteria_pending`, keyed the same way, is what keeps concurrent cold requests
+from each launching their own scan: without it, four cold searches start four
+140s scans and occupy the entire pool. It is cleared whether the scan succeeded
+or failed, so a failure is retried by the next miss rather than wedging that
+version out of ever having a datalist.
+
+Warming the cache at startup was the alternative and was rejected: it only
+removes the cost if startup blocks on it, which turns every deploy into a ~140s
+outage — precisely the case that mattered, a deploy during a traffic spike.
+Precomputing the vocabulary into a table at fill time is still the strictly
+better fix and is still not taken: the vocabulary is a *build* fact, and
+recomputing it per process asks the corpus a question whose answer was known
+when the rows were written. What the background scan buys is that the cost no
+longer lands on a reader; it does not make the cost go away.
 
 Unrands are in the list too, and they arrive by a different route. They cannot
 be observed: the stored name carries a varying enchantment prefix and
@@ -878,9 +931,9 @@ a quietly different answer. `Depth` still ranks (`Rank.Shallowest`, floor
 ordering) and heat still caps — `Db.level_within_cap` is that path and is
 unaffected.
 
-### Evidence, and the two traps in producing it
+### Evidence, and the three traps in producing it
 
-A match carries the evidence that satisfied it, per term. Two things there are
+A match carries the evidence that satisfied it, per term. Three things there are
 easy to get wrong and were:
 
 - **A seed matching a term several times must appear once.** The per-criterion
@@ -892,6 +945,16 @@ easy to get wrong and were:
   shallowest level's share alone (`x1`) and leave the reader unable to see why
   the seed matched. Evidence is grouped by seed, totalled, and reported against
   the shallowest contributing level.
+- **The total belongs to the term, not to the item named beside it.** Grouping
+  by seed is right, but it makes `name` an *exemplar* — the shallowest matching
+  item — while `count` spans every matching item on the seed. For
+  `3x potion:haste` those are the same fact. For `artefact` they are not: a seed
+  with sixteen unrelated randarts rendered as `+8 storm bow {elec, penet} ×16`,
+  claiming sixteen of one bow. A hit therefore carries `distinct`, the number of
+  differently-named items the total spans, and the view quantifies the exemplar
+  only when `distinct = 1`; otherwise it states the total separately
+  (`· 16 artefacts`, falling back to `matches` for a criterion naming no
+  category — see `Criterion.plural_noun`).
 
 ### Covering is the whole game
 

@@ -53,12 +53,16 @@ let mem t feat =
 
 let to_feats t = List.filteri pool ~f:(fun i _ -> t land (1 lsl i) <> 0)
 
-let god_name feat =
-  String.chop_prefix feat ~prefix:"altar_"
-  |> Option.value ~default:feat
-  |> String.split ~on:'_'
-  |> List.map ~f:String.capitalize
-  |> String.concat ~sep:" "
+(* Crawl's internal name for the faded altar is "ecumenical", a word the game
+   never shows the player -- it only ever prints "faded altar". *)
+let god_name = function
+  | "altar_ecumenical" -> "Faded"
+  | feat ->
+    String.chop_prefix feat ~prefix:"altar_"
+    |> Option.value ~default:feat
+    |> String.split ~on:'_'
+    |> List.map ~f:String.capitalize
+    |> String.concat ~sep:" "
 ;;
 
 let to_int t = t

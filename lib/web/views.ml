@@ -825,20 +825,47 @@ let search_form ?(oob = false) (search : Search.t) ~suggestions =
     | Some _ -> [ a_list suggestions_id ]
     | None -> []
   in
+  (* Every box carries an id and a value attribute, the empty one included.
+     Morph reuses a node by id and syncs an input's value property only on the
+     branch that *sets* an attribute -- where the new node has none it calls
+     removeAttribute and stops, leaving a box that lost its term still showing
+     it. Unkeyed and valueless, both halves bite: the new blank box soft-matches
+     the old blank the reader just typed the submitted term into. *)
+  let box ?(value = "") i =
+    input
+      ~a:
+        ([ a_input_type `Text; a_id (sprintf "term-%d" i); a_name "has"; a_value value ]
+         @ list_attr)
+      ()
+  in
+  (* Remove is a submit button, not a link: a link would carry only what the
+     last search held and discard whatever is typed in the other boxes. It names
+     the term and which of the boxes holding it this is, counting from the top
+     -- not the box's position. See Params.without_dropped. *)
+  let seen = String.Table.create () in
   let existing =
-    List.map search.terms ~f:(fun term ->
+    List.mapi search.terms ~f:(fun i term ->
       let value = Search.Term.to_query_string term in
-      li [ input ~a:([ a_input_type `Text; a_name "has"; a_value value ] @ list_attr) () ])
+      let nth = Hashtbl.find_or_add seen value ~default:(fun () -> ref 0) in
+      let this = !nth in
+      incr nth;
+      li
+        ~a:[ a_id (sprintf "term-row-%d" i) ]
+        [ box i ~value
+        ; button
+            ~a:
+              [ a_button_type `Submit
+              ; a_name "drop"
+              ; a_text_value (sprintf "%d:%s" this value)
+              ; a_class [ "drop-term" ]
+              ; a_title (sprintf "Remove %s" value)
+              ; a_aria "label" [ sprintf "Remove %s" value ]
+              ]
+            [ txt "×" ]
+        ])
   in
-  let blank =
-    li
-      [ input
-          ~a:
-            ([ a_input_type `Text; a_name "has"; a_placeholder "potion:haste" ]
-             @ list_attr)
-          ()
-      ]
-  in
+  let last = List.length search.terms in
+  let blank = li ~a:[ a_id (sprintf "term-row-%d" last) ] [ box last ] in
   let action = version_path search.version ^ "/search" in
   let suggestion_list =
     match suggestions with
@@ -865,14 +892,26 @@ let search_form ?(oob = false) (search : Search.t) ~suggestions =
        ; Tyxml_htmx.hx_disabled_elt "find button"
        ]
        @ if oob then [ Tyxml_htmx.hx_swap_oob "outerMorph" ] else [])
-    (suggestion_list
+    (* Implicit submission activates the first submit button in tree order, and
+       every remove button precedes the search button. Without this one ahead of
+       them, Enter in a term box submits a drop and silently deletes the first
+       term. Hidden from pointer, tab order and the accessibility tree: it is
+       not a control, it is the definition of what Enter means here. *)
+    ((button
+        ~a:
+          [ a_button_type `Submit
+          ; a_class [ "default-submit" ]
+          ; a_tabindex (-1)
+          ; a_aria "hidden" [ "true" ]
+          ]
+        []
+      :: suggestion_list)
      @ [ ul ~a:[ a_class [ "terms" ] ] (existing @ [ blank ])
        ; p
            ~a:[ a_id "search-help"; a_class [ "subtitle" ] ]
            [ txt
                "One term per box: potion:haste, 3x potion:haste, floor potion:haste, \
-                shop wand:digging, enter_shop, artefact, unique:Sigmund, \
-                name~Throatcutter. "
+                shop wand:digging, artefact, name~Throatcutter. "
            ; a
                ~a:[ a_href (search_help_path search.version) ]
                [ txt "Full syntax, with examples" ]
@@ -885,93 +924,117 @@ let search_form ?(oob = false) (search : Search.t) ~suggestions =
        ])
 ;;
 
+(* [count] belongs to the term, not to [name], and the two coincide only when
+   one item supplied the whole total. Spread over several names -- an artefact
+   search, a name fragment matching a family -- [name] is an exemplar, and
+   quantifying it would claim sixteen of one storm bow. *)
 let hit_line (h : Search.Match.hit) =
-  let count = if h.count > 1 then sprintf " ×%d" h.count else "" in
-  li [ txt h.name; txt count; txt " on "; span ~a:[ a_class [ "sc" ] ] [ txt h.level ] ]
+  let quantity = if h.count > 1 && h.distinct = 1 then sprintf " ×%d" h.count else "" in
+  let total =
+    if h.distinct > 1
+    then (
+      let noun =
+        match Search.Criterion.plural_noun h.term.criterion with
+        | Some noun -> noun
+        | None -> "matches"
+      in
+      [ span ~a:[ a_class [ "hit-total" ] ] [ txt (sprintf "%d %s" h.count noun) ] ])
+    else []
+  in
+  li
+    ([ txt h.name
+     ; txt quantity
+     ; txt " on "
+     ; span ~a:[ a_class [ "sc" ] ] [ txt h.level ]
+     ]
+     @ total)
+;;
+
+(* A term-less search is an unasked question, not a request for the corpus.
+   Rendering the first page of it lists seeds in string order -- 1, 10, 100 --
+   which answers nothing and costs an unfiltered scan to produce. *)
+let search_prompt =
+  [ p [ txt "Add a term above to find seeds. A seed must satisfy every box you fill." ] ]
 ;;
 
 let search_results ~(search : Search.t) ~rank ~more matches =
-  let heading = h2 [ txt (Search.to_string search) ] in
-  let row (m : Search.Match.t) =
-    tr
-      [ td
-          [ a
-              ~a:
-                [ a_href (seed_href ~version:search.version ~seed:m.seed)
-                ; a_class [ "seed" ]
-                ]
-              [ txt m.seed ]
-          ; copy_seed m.seed
-          ]
-      ; td [ ul ~a:[ a_class [ "hits" ] ] (List.map m.hits ~f:hit_line) ]
-      ]
-  in
-  let next =
-    match List.last matches with
-    | Some (last : Search.Match.t) when [%compare.equal: [ `More | `End ]] more `More ->
-      (* Seed order pages by keyset, so the cursor is the last seed; any other
+  if Search.is_empty search
+  then search_prompt
+  else (
+    let heading = h2 [ txt (Search.to_string search) ] in
+    let row (m : Search.Match.t) =
+      tr
+        [ td
+            [ a
+                ~a:
+                  [ a_href (seed_href ~version:search.version ~seed:m.seed)
+                  ; a_class [ "seed" ]
+                  ]
+                [ txt m.seed ]
+            ; copy_seed m.seed
+            ]
+        ; td [ ul ~a:[ a_class [ "hits" ] ] (List.map m.hits ~f:hit_line) ]
+        ]
+    in
+    let next =
+      match List.last matches with
+      | Some (last : Search.Match.t) when [%compare.equal: [ `More | `End ]] more `More ->
+        (* Seed order pages by keyset, so the cursor is the last seed; any other
          ranking pages by offset into the ranked order, so it is a count. *)
-      let after =
-        if Search.Rank.equal rank Search.Rank.Seed
-        then last.seed
-        else (
-          let consumed =
-            Option.value_map search.page.after ~default:0 ~f:(fun s ->
-              Option.value (Int.of_string_opt s) ~default:0)
-          in
-          Int.to_string (consumed + List.length matches))
-      in
-      [ p
-          [ a
-              ~a:
-                [ a_href
-                    (sprintf
-                       "%s/search?%s"
-                       (version_path search.version)
-                       (search_query_string search ~rank ~after:(Some after)))
-                ; a_rel [ `Next ]
-                ]
-              [ txt "Next page →" ]
-          ]
-      ]
-    | _ -> []
-  in
-  let count = List.length matches in
-  let tally =
-    if count = 0
-    then []
+        let after =
+          if Search.Rank.equal rank Search.Rank.Seed
+          then last.seed
+          else (
+            let consumed =
+              Option.value_map search.page.after ~default:0 ~f:(fun s ->
+                Option.value (Int.of_string_opt s) ~default:0)
+            in
+            Int.to_string (consumed + List.length matches))
+        in
+        [ p
+            [ a
+                ~a:
+                  [ a_href
+                      (sprintf
+                         "%s/search?%s"
+                         (version_path search.version)
+                         (search_query_string search ~rank ~after:(Some after)))
+                  ; a_rel [ `Next ]
+                  ]
+                [ txt "Next page →" ]
+            ]
+        ]
+      | _ -> []
+    in
+    let count = List.length matches in
+    let tally =
+      if count = 0
+      then []
+      else
+        [ p
+            ~a:[ a_class [ "subtitle" ] ]
+            [ span ~a:[ a_class [ "num" ] ] [ txt (Int.to_string count) ]
+            ; txt (if count = 1 then " seed" else " seeds")
+            ; txt
+                (match more with
+                 | `More -> " on this page, and more beyond it."
+                 | `End -> ".")
+            ]
+        ]
+    in
+    ([ heading ] @ tally)
+    @
+    if List.is_empty matches
+    then [ p [ txt "No seed in this build matches every term." ] ]
     else
-      [ p
-          ~a:[ a_class [ "subtitle" ] ]
-          [ span ~a:[ a_class [ "num" ] ] [ txt (Int.to_string count) ]
-          ; txt (if count = 1 then " seed" else " seeds")
-          ; txt
-              (match more with
-               | `More -> " on this page, and more beyond it."
-               | `End -> ".")
+      [ div
+          ~a:[ a_class [ "table-scroll"; "table-scroll--wide" ] ]
+          [ table
+              ~thead:(thead [ tr [ th_col "seed"; th_col "what was found" ] ])
+              (List.map matches ~f:row)
           ]
       ]
-  in
-  ([ heading ] @ tally)
-  @
-  if List.is_empty matches
-  then
-    [ p
-        [ txt
-            (if Search.is_empty search
-             then "No seeds have been ingested for this build yet."
-             else "No seed in this build matches every term.")
-        ]
-    ]
-  else
-    [ div
-        ~a:[ a_class [ "table-scroll"; "table-scroll--wide" ] ]
-        [ table
-            ~thead:(thead [ tr [ th_col "seed"; th_col "what was found" ] ])
-            (List.map matches ~f:row)
-        ]
-    ]
-    @ next
+      @ next)
 ;;
 
 (* Placeholder when search is disabled. No form, no query parsing. *)
@@ -1102,19 +1165,7 @@ let search_help ~version =
       [ [ "3x potion:haste" ], "at least three potions of haste"
       ; [ "3x floor potion:haste" ], "three potions of haste on the ground, not for sale"
       ]
-  ; h2 [ txt "Features" ]
-  ; p
-      [ txt
-          "Branch entrances and shops are named in crawl's own vocabulary, with no \
-           prefix. The blank term box suggests them as you type. Altars are not \
-           searchable."
-      ]
-  ; examples
-      [ [ "enter_shop" ], "any shop at all"
-      ; [ "enter_lair" ], "the Lair entrance"
-      ; [ "enter_sewer" ], "a sewer portal"
-      ]
-  ; h2 [ txt "Artefacts, uniques and names" ]
+  ; h2 [ txt "Artefacts and names" ]
   ; p
       [ txt "An unrand's display name carries a varying enchantment prefix, so "
       ; code [ txt "name~" ]
@@ -1127,7 +1178,20 @@ let search_help ~version =
   ; examples
       [ [ "artefact" ], "any artefact, randart or unrand"
       ; [ "name~Throatcutter" ], "the unrand, at whatever enchantment it rolled"
-      ; [ "unique:Sigmund" ], "Sigmund, generated somewhere in the extracted floors"
+      ]
+  ; help_note
+      ~label:"Why a result sometimes names one item and counts another number"
+      [ p
+          [ txt
+              "A term matching several different items names the shallowest one it found \
+               and states the total beside it, as in "
+          ; code [ txt "+8 storm bow {elec, penet} on D:3 · 16 artefacts" ]
+          ; txt
+              ". The bow is one of the sixteen, not sixteen bows. A term matching a \
+               single item quantifies it directly instead ("
+          ; code [ txt "2 potions of haste ×2" ]
+          ; txt ")."
+          ]
       ]
   ; help_note
       ~label:"Why name~ does not find a potion of haste"
@@ -1156,8 +1220,8 @@ let search_help ~version =
            one a set intersection an index can answer quickly."
       ]
   ; examples
-      [ ( [ "enter_lair"; "unique:Sigmund" ]
-        , "the Lair entrance and Sigmund, both generated" )
+      [ ( [ "3x scroll:acquirement"; "armour:crystal plate armour" ]
+        , "three scrolls of acquirement and a crystal plate armour, on one seed" )
       ; ( [ "shop wand:digging"; "artefact" ]
         , "a wand of digging for sale, and an artefact somewhere in the extracted floors"
         )
@@ -1169,6 +1233,17 @@ let search_help ~version =
            extracted to D:8. \"No Wyrmbane here\" and \"not searched deep enough to \
            know\" are different answers, and a term matching nothing may be either. Each \
            seed's page says how deep it went, and offers to go deeper."
+      ]
+  ; p
+      [ txt
+          "Search covers items. Altars, shops, portals and the other features, and \
+           the            uniques standing on a level, are not terms you can search on \
+           -- but every            seed's page lists all of them, level by level. \
+           Uniques are missing for a            reason worth naming: the useful question \
+           about an early unique is usually            the negative one, and a search \
+           that can only ask for a seed "
+      ; em [ txt "with" ]
+      ; txt " Sigmund answers the opposite of what you wanted."
       ]
   ; p [ a ~a:[ a_href (version_path version ^ "/search") ] [ txt "← Back to search" ] ]
   ]

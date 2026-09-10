@@ -25,6 +25,10 @@ let corpus =
        "100%_pure" would also be matched by the fragment "100%pure", which is
        what the escape exists to prevent. *)
   ; {|#SEED#((format 4)(version "0.34.1")(seed "7")(level "D:2")(cats (items (((artefact t)(base_type "weapon")(kind "item")(name "+2 Blade of 100%_pure {holy}")(plus 2)(quantity 1)(sub_type "long sword")(text "+2 Blade of 100%_pure"))))))|}
+    (* A hoard: four distinct artefacts, three sharing the shallowest level.
+       Nothing here is a stack, so any per-item count is 1. *)
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "20")(level "D:2")(cats (items (((artefact t)(base_type "jewellery")(kind "item")(name "ring of the Pariah {rC+ Str+5}")(quantity 1)(sub_type "ring")(text "ring of the Pariah"))((artefact t)(base_type "jewellery")(kind "item")(name "amulet \"Koruvve\" {Dissipate rF++ Str+4}")(quantity 1)(sub_type "amulet")(text "amulet Koruvve"))((artefact t)(base_type "weapon")(kind "item")(name "+6 whip \"Husch\" {vamp, rElec Dex+3}")(plus 6)(quantity 1)(sub_type "whip")(text "+6 whip Husch"))))))|}
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "20")(level "D:7")(cats (items (((artefact t)(base_type "armour")(kind "item")(name "+2 pair of gloves of Evolution {Harm Regen+ Fire}")(plus 2)(quantity 1)(sub_type "gloves")(text "+2 pair of gloves of Evolution"))))))|}
     (* Two on the floor and a third behind a counter: three by the unqualified
        count, two by the floor count. *)
   ; {|#SEED#((format 4)(version "0.34.1")(seed "6")(level "D:4")(cats (items (((base_type "potion")(kind "item")(name "2 potions of haste")(quantity 2)(sub_type "haste")(text "2 potions of haste"))((base_type "potion")(cost 120)(kind "item")(name "potion of haste")(quantity 1)(sub_type "haste")(text "potion of haste"))))))|}
@@ -202,9 +206,35 @@ let%expect_test "artefact is its own criterion" =
   [%expect
     {|
     seeds on 0.34.1 with an artefact
+      20: ring of the Pariah {rC+ Str+5} x4 on D:2
       3: +7 Throatcutter {drain, coup de grace} x1 on D:1
       7: +2 Blade of 100%_pure {holy} x1 on D:2
       [end]
+    |}];
+  Db.close db
+;;
+
+(* A heterogeneous term matches distinct items, so the evidence total is a
+   count of *the category*, not of the named exemplar. Reporting "ring of the
+   Pariah x4" would claim four of one ring. *)
+let%expect_test "a heterogeneous term separates its exemplar from its total" =
+  let db = fresh_db () in
+  let show (h : Search.Match.hit) =
+    sprintf "%s | count %d | distinct %d | %s" h.name h.count h.distinct h.level
+  in
+  let search =
+    Search.create ~version ~terms:[ Search.Term.create Search.Criterion.Artefact ] ()
+  in
+  (match Db.search_seeds db search ~rank:Search.Rank.default with
+   | Error err -> print_endline (Error.to_string_hum err)
+   | Ok (matches, _) ->
+     List.iter matches ~f:(fun (m : Search.Match.t) ->
+       List.iter m.hits ~f:(fun h -> printf "%s: %s\n" m.seed (show h))));
+  [%expect
+    {|
+    20: ring of the Pariah {rC+ Str+5} | count 4 | distinct 4 | D:2
+    3: +7 Throatcutter {drain, coup de grace} | count 1 | distinct 1 | D:1
+    7: +2 Blade of 100%_pure {holy} | count 1 | distinct 1 | D:2
     |}];
   Db.close db
 ;;
@@ -217,6 +247,7 @@ let%expect_test "an empty search lists every seed of the version" =
     all seeds on 0.34.1
       1:
       2:
+      20:
       3:
       4:
       5:
@@ -1038,5 +1069,83 @@ let%expect_test "a raw Feature altar criterion no longer reads the Temple mask" 
   in
   printf "%s\n" (Int.Set.sexp_of_t matched |> Sexp.to_string_hum);
   [%expect {| (9002) |}];
+  Db.close db
+;;
+
+(* A [Name_like] non-driver term is where the search cost used to explode: its
+   dictionary lookup sat inside the correlation and re-ran per candidate seed
+   (26s-149s at 1.3M, measured 2026-09-09). The fix decorrelates it into an
+   [in (select ...)], which only stays correct if the subquery carries its own
+   version and keyset bounds. Term order must not change the matched set. *)
+let%expect_test "Name_like as non-driver matches in both term orders" =
+  let db = fresh_db () in
+  let name_term = Search.Term.create (Search.Criterion.Name_like "Throatcutter") in
+  let item_term = Search.Term.create (Search.Criterion.Item haste) in
+  let name_first = matched_set db [ name_term; item_term ] in
+  let item_first = matched_set db [ item_term; name_term ] in
+  printf "name first: %s\n" (Int.Set.sexp_of_t name_first |> Sexp.to_string_hum);
+  printf "item first: %s\n" (Int.Set.sexp_of_t item_first |> Sexp.to_string_hum);
+  printf "equal: %b\n" (Set.equal name_first item_first);
+  [%expect
+    {|
+    name first: (3)
+    item first: (3)
+    equal: true
+    |}];
+  Db.close db
+;;
+
+(* The keyset bound is pushed into the decorrelated subquery, so a wrong [after]
+   bind would drop seeds only on pages after the first -- invisible to any
+   single-page test. Paging a two-term search one seed at a time is what
+   catches it. *)
+let%expect_test "Name_like as non-driver survives keyset paging" =
+  (* The shared fixture holds one artefact, and [Name_like] only ever matches
+     names that [Display_name.of_entry] could not rebuild -- so a local fixture
+     is needed to get enough matching seeds for the page boundary to exist. *)
+  let db = Db.open_ ":memory:" in
+  Db.exec_script db (In_channel.read_all "../schema.sql");
+  let records =
+    List.init 6 ~f:(fun i ->
+      sprintf
+        {|#SEED#((format 4)(version "0.34.1")(seed "%d")(level "D:1")(cats (items (((base_type "potion")(kind "item")(name "potion of haste")(quantity 1)(sub_type "haste")(text "potion of haste"))((artefact t)(base_type "weapon")(kind "item")(name "+%d Throatcutter {drain}")(plus %d)(quantity 1)(sub_type "long sword")(text "+%d Throatcutter"))))))|}
+        (100 + i)
+        (i + 1)
+        (i + 1)
+        (i + 1))
+    |> List.map ~f:(fun line -> Or_error.ok_exn (Reader.parse_line line))
+  in
+  ignore (Db.write_batch db records : Db.Counts.t);
+  Or_error.ok_exn (Db.rebuild_fts db);
+  let terms =
+    [ Search.Term.create (Search.Criterion.Item haste)
+    ; Search.Term.create (Search.Criterion.Name_like "Throatcutter")
+    ]
+  in
+  let page ~after ~limit =
+    let search =
+      Search.create ~version ~terms ~page:(Query.Page.create ?after ~limit ()) ()
+    in
+    Or_error.ok_exn (Db.search_seeds db search ~rank:Search.Rank.Seed)
+  in
+  let rec collect after acc =
+    let matches, more = page ~after ~limit:1 in
+    let acc = acc @ List.map matches ~f:(fun (m : Search.Match.t) -> m.seed) in
+    match more with
+    | `End -> acc
+    | `More -> collect (Some (List.last_exn matches).Search.Match.seed) acc
+  in
+  let paged = String.Set.of_list (collect None []) in
+  let whole =
+    let matches, _ = page ~after:None ~limit:1000 in
+    String.Set.of_list (List.map matches ~f:(fun (m : Search.Match.t) -> m.seed))
+  in
+  printf "paged: %s\n" (String.Set.sexp_of_t paged |> Sexp.to_string_hum);
+  printf "equal to single page: %b\n" (Set.equal paged whole);
+  [%expect
+    {|
+    paged: (100 101 102 103 104 105)
+    equal to single page: true
+    |}];
   Db.close db
 ;;

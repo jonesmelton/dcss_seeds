@@ -21,8 +21,32 @@ let%expect_test "a bare Item term is cheap" =
   [%expect {| true |}]
 ;;
 
-let%expect_test "min_count above 1 is cheap now that the driver's group-by streams" =
+(* One [min_count > 1] term is cheap: [driver_select] renders it as the driver's
+   own flat group-by (fixed 2026-09-05). A second one cannot also be the driver,
+   so it compiles to the correlated scalar-sum that the 2026-09-09 decorrelation
+   left untouched -- the branch it rewrote is [min_count <= 1] only. Measured on
+   prod (1.3M, 0.34.1, 2026-09-10, box contended): one such term 0.20s, two of
+   them 23.2s, inline on the scheduler thread where the search timeout cannot
+   fire. So the count of them, not their presence, is what decides. *)
+let%expect_test "one min_count above 1 is cheap; two are not" =
   printf "%b\n" (is_cheap [ Search.Term.create ~min_count:3 haste ]);
+  [%expect {| true |}];
+  printf
+    "%b\n"
+    (is_cheap
+       [ Search.Term.create ~min_count:3 haste
+       ; Search.Term.create ~min_count:3 Search.Criterion.Artefact
+       ]);
+  [%expect {| false |}];
+  (* A [min_count > 1] term beside an ordinary one stays cheap: the counted term
+     takes the driver slot and the plain one is an ordinary uncorrelated
+     [exists]. *)
+  printf
+    "%b\n"
+    (is_cheap
+       [ Search.Term.create ~min_count:3 haste
+       ; Search.Term.create Search.Criterion.Artefact
+       ]);
   [%expect {| true |}]
 ;;
 
