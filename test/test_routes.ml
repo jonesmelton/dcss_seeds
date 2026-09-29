@@ -158,10 +158,9 @@ let%expect_test "HEAD sends no body but reports the length GET would" =
     |}]
 ;;
 
-(* Ranked [shallowest] so the search detaches: the timeout is an Lwt race and
-   the cheap path runs inline on the scheduler thread, where no timer can fire.
-   That is the mechanism's real limit, not a property of this fixture -- a
-   search [is_cheap] misjudges is one the timeout cannot shed. *)
+(* Ranked [shallowest] so the timeout race is exercised on a path that runs a
+   real query; every search detaches now, so any rank would do. The timeout is
+   an Lwt race and the scheduler has to be free to lose it. *)
 let%expect_test "search over its time budget answers a styled 503" =
   with_router ~f:(fun handle ->
     let target =
@@ -212,6 +211,7 @@ let%expect_test "cold datalist renders the search page without suggestions" =
     let target =
       sprintf "/%s/search?has=potion:haste" (Served.to_string Served.current)
     in
+    Seed_web.criteria_cache_wait ();
     Seed_web.criteria_cache_clear ();
     let cold =
       Lwt_main.run (Dream.body (handle (Dream.request ~method_:`GET ~target "")))

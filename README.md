@@ -1,5 +1,7 @@
 # dcss-seed-explorer
 
+**Live at <https://dcss.garden>.**
+
 Asks *what does this DCSS seed contain, and how early* (items, shops, altars,
 portals) and lets you compare seeds against each other. An extraction pipeline
 dumps seeds as s-expressions, those load into a SQLite corpus, and a web app
@@ -127,6 +129,28 @@ rendered.
 
 See `docs/corpus.md` for the data model and `docs/architecture.md` for the
 web app.
+
+There are no accounts and no tracking. The reverse proxy's access log is the
+only place client IPs are stored, and it keeps them for 30 days before they
+roll off; the app itself sees only the proxy.
+
+## Limits
+
+Known tradeoffs, stated rather than left to be discovered:
+
+- **Search has no negation.** You can ask which seeds *have* an unrand; there is
+  no operator to ask which lack it. The seed page lists every unique, feature,
+  and shop level by level, so the negative question is answerable by eye but not
+  by query.
+- **An item's unidentified appearance is not recorded.** Dumps carry the
+  identified name (`potion of heal wounds`), never the seed-determined colour
+  (`puce potion`). It is a pure function of the seed, but it is absent from the
+  wire format, so surfacing it means a format bump and a full re-fill.
+- **The item filter is crawl's own, with two holes plugged.** `item_ignore_boring`
+  plus artefacts and bardings is what a fill keeps. It still drops anything
+  useless to the scanning character, so scrolls of identify, potions of
+  moonshine, large rocks, and corpses are never in the corpus — and that is a
+  fill-time decision, not something a re-ingest can recover.
 
 ## Licence
 

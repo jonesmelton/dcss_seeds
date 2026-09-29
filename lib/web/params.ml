@@ -34,6 +34,12 @@ let deepen_disabled = ref false
    This bounds what a client waits for, not what a query occupies. *)
 let search_timeout = ref 60.
 
+(* Seconds a search waits for a free pool connection before answering 503. Kept
+   well under [search_timeout]: a saturated pool is a capacity fact, and there
+   is nothing to gain by making the client wait out the whole query budget for
+   it. Set from SEED_POOL_TIMEOUT in {!Main}. *)
+let pool_timeout = ref 5.
+
 (* "3x " is an affix on a criterion rather than a criterion of its own, so it is
    peeled off before the prefix dispatch below.
 

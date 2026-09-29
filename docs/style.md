@@ -30,13 +30,15 @@ some things a general-audience site could not assume:
   feature.
 - They are overwhelmingly on a desktop browser with a real keyboard.
 
-It also licenses one *omission*. DCSS is not playable by a screen reader user in
-any practical sense, so this app has no screen-reader audience to serve and we do
-not carry that burden. **Do not spend design effort on assistive-technology
-affordances**: no ARIA choreography, no live regions, no visually-hidden labels
-duplicating visible ones, no `scope` on every `<th>`. Where semantic HTML gives
-correct structure for free, use it — `<th>`, `<label>`, `<button>` — because it
-is also the simplest correct markup, not because something is listening.
+It also sets the scope of assistive-technology support. **Screen-reader
+support is calibrated against upstream crawl**: DCSS is not playable by a screen
+reader today, so this app does not attempt to exceed the game's own
+accessibility. That keeps ARIA choreography, live regions, visually-hidden
+labels duplicating visible ones, and `scope` on every `<th>` out of scope —
+they would describe an experience a reader cannot have here. Where semantic HTML
+gives correct structure for free, use it — `<th>`, `<label>`, `<button>` —
+because it is also the simplest correct markup. If crawl gains screen-reader
+support, this calibration is the thing to revisit.
 
 What we *do* keep, because it is ordinary web competence and benefits everyone:
 
@@ -779,15 +781,16 @@ palette on the ordinary.
 
 ## Accessibility: what we keep {#accessibility-what-we-keep}
 
-Narrowed from a general-audience standard, per [Audience](#audience). We are not
-serving screen readers. We are still writing competent HTML.
+Calibrated, per [Audience](#audience), against what upstream crawl supports:
+screen-reader affordances are out of scope while the game is not playable that
+way. We are still writing competent HTML.
 
 - Meet **WCAG AA contrast** for all text in both themes, including secondary ink.
 - **Never let color be the sole carrier of meaning** — for grayscale, print, and
   color vision deficiency, not for assistive technology.
 - Make **every interactive element keyboard-operable** with a visible focus
-  state. This is the one we care most about; a keyboard-only power user is a
-  plausible reader here in a way a screen-reader user is not.
+  state. This is the one we care most about: a keyboard-only power user is a
+  plausible reader here.
 - **Honor reduced-motion.** Motion is always optional.
 - Use **semantic elements** — `<th>`, `<label>`, `<button>`, `<nav>` — because
   correct markup is the simplest markup and it gets browser behavior for free.

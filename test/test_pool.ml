@@ -72,3 +72,33 @@ let%expect_test "a pooled connection is read-only" =
     Pool.close pool);
   [%expect {| write refused: true |}]
 ;;
+
+(* The bounded checkout is what turns a saturated pool into a fast 503 instead
+   of a request that waits out the search budget. Structural: hold the only
+   connection on another thread, then ask for it with a deadline. *)
+let%expect_test
+    "checkout past its deadline raises Saturated and the connection comes back"
+  =
+  with_corpus_file ~f:(fun path ->
+    let pool = Pool.create path ~size:1 in
+    let holding =
+      Caml_threads.Thread.create
+        (fun () -> Pool.with_conn pool ~f:(fun (_ : Db.t) -> Caml_unix.sleepf 0.25))
+        ()
+    in
+    Caml_unix.sleepf 0.05;
+    (match
+       Pool.with_conn pool ~timeout:0.05 ~f:(fun (_ : Db.t) -> print_endline "got one")
+     with
+     | () -> print_endline "got one (unexpected)"
+     | exception Pool.Saturated -> print_endline "saturated");
+    Caml_threads.Thread.join holding;
+    (* The connection must be back, or this call hangs. *)
+    Pool.with_conn pool ~f:(fun (_ : Db.t) -> print_endline "recovered");
+    Pool.close pool);
+  [%expect
+    {|
+    saturated
+    recovered
+    |}]
+;;

@@ -298,6 +298,11 @@ request in the process — and the search timeout could not fire there, because
 an inline query never yields. That combination is what made `is_cheap`'s
 accuracy a liveness property rather than a tuning knob.
 
+**Superseded 2026-09-29.** Every search detaches now, so the `min_count` count
+guard — and `Seed_web.search_is_cheap` with it — is retired; see *The blocking
+rule* below. The 23.2-second shape is still slow, but it occupies a pool
+connection and a worker thread rather than the scheduler.
+
 - **A `Shop` criterion seeks `entries_search_shop` but is not covering.** The query's
   own `e.cost is not null` predicate re-checks `cost` against the table even
   though the partial index's `where cost is not null` already guarantees it —
@@ -398,31 +403,35 @@ match, since Lwt's own default cap (4) would otherwise throttle concurrency
 back down regardless of pool size.
 
 The dedicated `reader` connection from *Writer stance*, below, is unaffected
-and still exists: cheap, inline (non-detached) queries keep using it directly,
-since a sub-ms indexed seek has no reason to pay pool-checkout overhead. Only
-detached queries — the ones `search_is_cheap` (`lib/web/seed_web.ml`) has
-already decided are not cheap — go through the pool. See `Pool`'s `.mli` for
-the two tradeoffs that come with it: checkout has no bound or timeout on the
-wait (in practice absorbed by the thread-pool cap agreeing with the pool
-size), and two concurrent requests on two different pooled connections can see
-different snapshots if a write lands between their checkouts — accepted for a
-read-mostly corpus.
+and still exists: inline (non-detached) reads — the seed listing, a seed page,
+the store-backed vocabulary — keep using it directly. Every *search* now
+detaches and goes through the pool, not only the ones a cheapness predicate
+cleared: `Seed_web.search_is_cheap` and its inline shortcut were removed
+2026-09-29, because it asked about the plan when cost is set by the matched set.
+See `Pool`'s `.mli` for the two tradeoffs that come with it: checkout is bounded
+by `SEED_POOL_TIMEOUT` (default 5s), answering 503 with `Pool.Saturated` rather
+than waiting out the search budget, and two concurrent requests on two different
+pooled connections can see different snapshots if a write lands between their
+checkouts — accepted for a read-mostly corpus.
 
-**A search request is bounded even though a checkout is not.** `SEED_SEARCH_TIMEOUT`
-(default 60s) races the search against a timer and answers the styled 503 when
-the timer wins, so a reader is never left waiting on a query that will not
-finish. Two gaps, both deliberate as of 2026-09-10 and both left for the load
-test (`ops/loadtest.md`) to size:
+**A search request is bounded twice.** `SEED_POOL_TIMEOUT` (default 5s) bounds
+the wait for a pool connection; `SEED_SEARCH_TIMEOUT` (default 60s) then races
+the running search against a timer and answers the styled 503 when the timer
+wins, so a reader is never left waiting on a query that will not finish. One
+gap, deliberate as of 2026-09-10 and left for the load test (`ops/loadtest.md`)
+to size:
 
 - It does not cancel the query. sqlite3-ocaml 5.4.2 binds neither
   `sqlite3_interrupt` nor a progress handler, so the abandoned search runs to
   completion still holding its pool connection. The timeout bounds what a client
   waits for, not what a query occupies; closing this needs a C stub.
-- It covers only the detached path. A search `search_is_cheap` calls cheap runs
-  inline on the scheduler thread and never yields, so no Lwt timer can fire —
-  which makes an `is_cheap` misjudgment the one failure the timeout cannot
-  contain, and the reason that predicate's accuracy is a liveness property
-  rather than a performance one.
+
+~~It covers only the detached path. A search `search_is_cheap` calls cheap runs
+inline on the scheduler thread and never yields, so no Lwt timer can fire —
+which makes an `is_cheap` misjudgment the one failure the timeout cannot
+contain, and the reason that predicate's accuracy is a liveness property
+rather than a performance one.~~ **Closed 2026-09-29** by detaching every
+search: a query never blocks the scheduler, so the timer can always fire.
 
 ### Consequence for the corpus library's interface
 
@@ -1106,11 +1115,13 @@ in the partial index — so it cost a table lookup per row, 5.6s against 10ms.
 ### The blocking rule, concretely
 
 `docs/architecture.md` says a query that is not index-backed must run under
-`Lwt_preemptive.detach`. For search that means: **detach unless every term is
-indexed and none carries a `min_count`.** Measured over 2000 seeds, a single
-indexed term answers in well under a millisecond, while a conjunction involving
-a grouped `min_count` term costs ~6ms warm and ~120ms cold — and cold cost grows
-with the corpus. `Seed_web.search_is_cheap` is that rule in code.
+`Lwt_preemptive.detach`. For search the rule is now unconditional: **every
+search detaches.** The original rule detached only what
+`Seed_web.search_is_cheap` judged not cheap, but that predicate asked about the
+*plan* when cost is set by the *matched set* (see the struck tables below), so
+it let expensive searches run inline on the scheduler thread. It was removed
+2026-09-29; the per-search pool checkout (`SEED_POOL_TIMEOUT`) is now the only
+admission control.
 
 On the finished 100k corpus every indexed shape landed in single- or
 double-digit milliseconds (`unique` 6ms, `shop` 2ms, `min_count` 25ms,
@@ -1175,7 +1186,9 @@ same as every other shape (~1ms alone, ~6ms combined with a second term;
 1.3M, 0.34.1, `D:8`, 2026-09-05, prod). `Seed_web.search_is_cheap` no longer
 carries a `min_count` guard at all — the rule is simply **cheap iff every term
 is `Criterion.is_cheap`**, `min_count` included, because there is no longer a
-term-level hazard for it to guard against.
+term-level hazard for it to guard against. ~~That rule held until 2026-09-29,
+when the predicate was retired outright: every search detaches, so there is no
+inline path left for cheapness to gate.~~
 
 `Name_like` was the standing example of a scan; interning removed that,
 measured 16.9s to 0.10s (100k, 0.34.1, D:8, 2026-08-28, M-series laptop). Its
@@ -1271,10 +1284,9 @@ corpus's own order" — the listing caption already declines to promise which.
 A reader paging across the moment the store flips between current and stale
 can see one seed twice, or not at all, exactly once, at that boundary.
 
-`Search.Rank.sort_limit`, `Search.Rank.is_too_broad`, and
-`Seed_web.search_is_cheap` are untouched by any of this — they still govern the
-SQL path above and retire only when it does, which is gated on a
-production-scale equivalence run, not on this landing.
+`Search.Rank.sort_limit` and `Search.Rank.is_too_broad` are untouched by any of
+this — they still govern the SQL path above and retire only when it does, which
+is gated on a production-scale equivalence run, not on this landing.
 
 ## Rendering
 

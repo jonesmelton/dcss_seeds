@@ -476,39 +476,24 @@ let deepen_seed ~reader ~writer ~lock_path version request =
             ~f:render_fragment))
 ;;
 
-(* Search runs detached unless every term is cheap. Blocking SQLite stalls all
-   concurrent requests.
-
-   Two conditions, and the second is about the set rather than any one term.
-   Only one term becomes the driver, and [driver_select] renders a
-   [min_count > 1] driver as its own flat group-by; a second such term has no
-   driver slot left and falls back to the correlated scalar-sum, which the
-   2026-09-09 decorrelation did not rewrite (it covers [min_count <= 1] only).
-   Measured on prod at 1.3M: one counted term 0.20s, two 23.2s. *)
-let search_is_cheap (search : Seed_corpus.Search.t) =
-  let counted =
-    List.count search.terms ~f:(fun (term : Seed_corpus.Search.Term.t) ->
-      term.min_count > 1)
-  in
-  counted <= 1
-  && List.for_all search.terms ~f:(fun (term : Seed_corpus.Search.Term.t) ->
-    Seed_corpus.Search.Criterion.is_cheap term.criterion)
-;;
-
-(* Non-default ranking reads the whole matched set, never cheap. Cheap path
-   stays on [reader]; detached path checks out of [pool] to avoid serializing
-   on the shared connection. *)
-let run_search reader pool search ~rank =
-  if
-    search_is_cheap search
-    && Seed_corpus.Search.Rank.equal rank Seed_corpus.Search.Rank.Seed
-  then Lwt.return (Seed_corpus.Db.search_seeds reader search ~rank)
-  else
-    Lwt_preemptive.detach
-      (fun () ->
-         Seed_corpus.Pool.with_conn pool ~f:(fun db ->
-           Seed_corpus.Db.search_seeds db search ~rank))
-      ()
+(* Every search detaches, checking out of [pool] under a deadline so a
+   saturated pool answers instead of queueing: [Saturated] is the fifth
+   concurrent search failing fast, not waiting out the search timeout. Blocking
+   SQLite on the scheduler thread would stall every concurrent request *and* the
+   timeout below, which is an Lwt race the scheduler has to be free to lose. The
+   old cheapness predicate was wrong in exactly that direction at corpus scale
+   -- it asked about the plan when cost is set by the matched set -- so the
+   inline shortcut is gone. See [Pool]'s saturation note. *)
+let run_search pool search ~rank =
+  Lwt_preemptive.detach
+    (fun () ->
+       match
+         Seed_corpus.Pool.with_conn pool ~timeout:!Params.pool_timeout ~f:(fun db ->
+           Seed_corpus.Db.search_seeds db search ~rank)
+       with
+       | result -> `Answered result
+       | exception Seed_corpus.Pool.Saturated -> `Saturated)
+    ()
 ;;
 
 (* Datalist vocabulary is a scan; detached and cached per version for process
@@ -536,8 +521,15 @@ let criteria_scan pool version ~key =
   let%lwt computed =
     Lwt_preemptive.detach
       (fun () ->
-         Seed_corpus.Pool.with_conn pool ~f:(fun db ->
-           Seed_corpus.Db.distinct_criteria db ~version))
+         try
+           Seed_corpus.Pool.with_conn pool ~timeout:!Params.pool_timeout ~f:(fun db ->
+             Seed_corpus.Db.distinct_criteria db ~version)
+         with
+         | Seed_corpus.Pool.Saturated ->
+           (* The scan yields its slot rather than occupying a worker waiting
+              for one; the next miss retries because [criteria_pending] is
+              cleared below. *)
+           Or_error.error_string "search pool busy")
       ()
   in
   (match computed with
@@ -669,11 +661,13 @@ let answer_search db ~pool version request ~boxes ~page ~rank ~terms =
          against an accidental or probing hang, not against a determined
          one -- that needs the interrupt. *)
       Lwt.pick
-        [ Lwt.map (fun r -> `Answered r) (run_search db pool search ~rank)
+        [ run_search pool search ~rank
         ; Lwt.map (fun () -> `Timed_out) (Lwt_unix.sleep !Params.search_timeout)
         ]
   in
   match result with
+  | `Saturated ->
+    temporarily_unavailable "Every search slot is busy right now. Try again in a moment."
   | `Timed_out ->
     Dream.warning (fun log -> log "search over %.0fs budget" !Params.search_timeout);
     temporarily_unavailable

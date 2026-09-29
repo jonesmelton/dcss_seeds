@@ -37,6 +37,12 @@ val deepen_disabled : bool ref
     Generous by design -- it shed pathology, not slow-but-working searches. *)
 val search_timeout : float ref
 
+(** Seconds a search may wait for a free pool connection before the handler
+    answers 503, distinct from {!search_timeout}: the pool is saturated, so the
+    query has not started and there is nothing to wait out. Kept well under
+    {!search_timeout}. Set from SEED_POOL_TIMEOUT in {!Main}. *)
+val pool_timeout : float ref
+
 (** {1 Search}
 
     Terms arrive as repeated [?has=] parameters, each a compact string a reader

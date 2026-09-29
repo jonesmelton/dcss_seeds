@@ -31,6 +31,14 @@ let () =
       | _ ->
         Printf.eprintf "SEED_SEARCH_TIMEOUT: invalid value %S\n%!" s;
         exit 1));
+  (match Sys.getenv_opt "SEED_POOL_TIMEOUT" with
+   | None | Some "" -> ()
+   | Some s ->
+     (match float_of_string_opt s with
+      | Some f when Float.compare f 0. > 0 -> Seed_web.Params.pool_timeout := f
+      | _ ->
+        Printf.eprintf "SEED_POOL_TIMEOUT: invalid value %S\n%!" s;
+        exit 1));
   (* Escape hatch to take search down entirely; see fossil ticket 093f82b4a9. *)
   (match Sys.getenv_opt "SEED_DISABLE_SEARCH" with
    | Some ("1" | "true" | "yes") -> Seed_web.Params.search_disabled := true

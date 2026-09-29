@@ -5,9 +5,8 @@ the access log rather than from a profiler. Each entry is what someone was
 trying to find out, what the site did, and how long they waited.
 
 The engine-level account of *why* these are slow is `AGENTS.md`, "Search cost is
-linear in a term's matched rows" — the `distinct` nested under a sort, and
-`search_is_cheap` not asking how many rows a term matches. This document does
-not repeat it. It exists because that analysis names query shapes, and the thing
+linear in a term's matched rows" — the `distinct` nested under a sort. This
+document does not repeat it. It exists because that analysis names query shapes, and the thing
 to fix is a question a person asked. A shape that is expensive but nobody types
 is not urgent; a shape three different people reached for in one afternoon is,
 whatever it costs.
@@ -83,9 +82,9 @@ and drawbacks (`*Noise`) do not. Someone tried all three within four minutes of
 successfully running a two-school query, which is exactly what you would expect:
 the syntax taught them that props are searchable, and they generalised.
 
-`*Noise` is worth singling out. It is the drawback that actually matters — see
-`docs/game-model.md` on `*Noise` against attack delay — so a reader asking to
-*avoid* it is asking the sharpest available question and being told no.
+`*Noise` is worth singling out. It is the drawback that actually matters, so a
+reader asking to *avoid* it is asking the sharpest available question and being
+told no.
 
 ### `floor` combined with `name~`
 

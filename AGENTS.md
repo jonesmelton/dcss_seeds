@@ -82,13 +82,17 @@ it. See `lib/corpus/pool.mli`.
 
 `SEED_SEARCH_TIMEOUT` (default 60, seconds) bounds how long a search request
 waits before the handler abandons it and answers the styled 503. Generous by
-design: it sheds pathology, not slow-but-working searches. Two limits are worth
-knowing, both recorded in `Params.search_timeout`. It does not cancel the query
---- sqlite3-ocaml 5.4.2 binds neither `sqlite3_interrupt` nor a progress
-handler, so an abandoned search runs to completion still holding its pool
-connection --- and it covers only the detached path, since a search
-`search_is_cheap` calls cheap runs inline on the scheduler thread where no Lwt
-timer can fire.
+design: it sheds pathology, not slow-but-working searches. Its one limit is
+recorded in `Params.search_timeout`: it does not cancel the query ---
+sqlite3-ocaml 5.4.2 binds neither `sqlite3_interrupt` nor a progress handler,
+so an abandoned search runs to completion still holding its pool connection.
+Every search detaches (see the search-cost invariant below), so the timer can
+always fire; it is the race the handler is free to lose.
+
+`SEED_POOL_TIMEOUT` (default 5, seconds) bounds how long a search waits for a
+free pool connection before answering 503. Distinct from `SEED_SEARCH_TIMEOUT`
+and deliberately shorter: a saturated pool means the query never started, so
+there is nothing to wait out. See `lib/corpus/pool.mli`.
 
 `SEED_DISABLE_SEARCH=1` takes search off entirely: the search page and its
 help page render a placeholder instead of running any query. Predates the
@@ -311,7 +315,7 @@ These are in the schema and the readme, and they are the ones that produce plaus
 - **Seed order is a paging cursor, not a ranking, and the UI says so.** A seed is an opaque 64-bit key, so no order over seeds means anything to a reader; the listing carries a caption saying it is in no particular order. Keyset paging still needs a *total* order — "unordered" in SQL is arbitrary **and** unstable, so pages would repeat and skip rows — and seed is the one every row has. That order is lexicographic, not numeric, because seeds are `text` (a 64-bit seed can exceed SQLite's signed integer range), so `"1025"` sorts between `"10101"` and `"10447"`. Don't "fix" it to numeric: that costs a padded sort key or a second column to buy a counting order that implies structure the data lacks.
 - **A ranking applied to a page is not a ranking.** Sorting the rows a keyset page returned reorders that page and nothing else, so page two restarts and the result reads as sorted while being wrong. `Rank.Shallowest` therefore fetches the whole matched set, ranks it, and pages by *offset*; past `Rank.sort_limit` (5000) the search is refused with a 400 rather than answered with a page-local order.
 - **Depth is reach order, not generation order.** Crawl generates Temple before D:1 but a player reaches it around D:5, so ranking by `explorer.generation_order` calls Temple the shallowest thing in every seed. `Depth` uses `branch-data.h` `mindepth`. A portal's own name carries no depth, so ranking one means knowing the level its entrance sat on: format 2 records that as `seed_levels.parent_level`, and a portal ranks at its parent's depth. A level ingested before format 2 has no parent, stays unrankable and sorts last — the corpus cannot prove where it sits.
-- **Search cost is linear in a term's matched rows, not in the page size — the `distinct` is nested under a sort.** `select distinct seed from entries where ...` sits in a subquery that the outer `order by seed limit 51` reads, so SQLite materialises *every* distinct seed through a temp b-tree before the limit applies (`SCAN (subquery-4)` + `USE TEMP B-TREE FOR ORDER BY`). A term matching a million seeds sorts a million rows to return 51. Measured warm on prod (1.3M, 0.34.1, `D:8`, 2026-09-05, end to end over HTTP): `wand:digging` 0.11s, `potion:haste` 1.74s, `artefact` 2.48s, three-term 3.70s, `name~Throatcutter` 7.02s — and `limit=1` costs the same as `limit=200`. The same query without `distinct` returns in 1ms against 1.40s with it. It scales with the corpus: `potion:haste` is 25ms at 10k and 1.40s at 1.3M. The `distinct` is load-bearing and must not simply be dropped (it is what keeps a seed with three matching entries from appearing three times and shrinking the keyset page); the fix is to stop nesting it under a sort. **`Seed_web.search_is_cheap` is still wrong in the direction that hurts**, though less so since 2026-09-10. It asks whether every term is indexed and whether *at most one* carries `min_count > 1`; it does not ask how many rows a term matches, which is what actually costs. `artefact` and a long `Name_like` are both still called cheap and both still run inline on the Lwt scheduler, where they stall every concurrent request and the search timeout cannot fire. The `min_count` half was the acute case — two counted terms measured 23.2s inline (see below) — and is fixed; the general case is not. Until the query shape is fixed, the honest move is to detach every search. See `docs/architecture.md`.
+- **Search cost is linear in a term's matched rows, not in the page size — the `distinct` is nested under a sort.** `select distinct seed from entries where ...` sits in a subquery that the outer `order by seed limit 51` reads, so SQLite materialises *every* distinct seed through a temp b-tree before the limit applies (`SCAN (subquery-4)` + `USE TEMP B-TREE FOR ORDER BY`). A term matching a million seeds sorts a million rows to return 51. Measured warm on prod (1.3M, 0.34.1, `D:8`, 2026-09-05, end to end over HTTP): `wand:digging` 0.11s, `potion:haste` 1.74s, `artefact` 2.48s, three-term 3.70s, `name~Throatcutter` 7.02s — and `limit=1` costs the same as `limit=200`. The same query without `distinct` returns in 1ms against 1.40s with it. It scales with the corpus: `potion:haste` is 25ms at 10k and 1.40s at 1.3M. The `distinct` is load-bearing and must not simply be dropped (it is what keeps a seed with three matching entries from appearing three times and shrinking the keyset page); the fix is to stop nesting it under a sort. **Every search detaches now** (2026-09), which is the honest response to this shape: the web layer's `search_is_cheap` -- which asked about the plan when cost is set by the matched set -- is gone, and a search cannot stall the scheduler thread or the timeout that rides it. The underlying `distinct`-under-a-sort cost is untouched, and `Rank.Shallowest` still refuses past `Rank.sort_limit`. See `docs/architecture.md`.
 
 - **Full-corpus vocabulary queries are minutes, not seconds, and are cached only per process.** `Db.distinct_criteria` (the search form's datalist) is 71.5s for `item_pairs_sql` at 1.3M (0.34.1, `D:8`, prod, 2026-09-07, warm, zfs 16K/lz4); `version_levels` is 9.5s. Superseded: ~~126s plus 13.5s for `feat_names_sql`~~ at 64K/zstd, where most of the difference was record amplification. `feat_names_sql` is gone entirely as of 2026-09-10 — features are no longer searchable, so suggesting one suggested a term that errors. `Seed_web.criteria_for` caches the result per version for the life of the process, but **no reader waits for it**: a miss returns `None`, renders without the datalist, and fills in the background under a single-flight guard, so a restart costs suggestions rather than a ~70s stall. The output is 10.5 KB. When the search store is current the item pairs come from its catalog instead (`Search_index.item_pairs`, 1ms against 340ms at 10k, local, 2026-09-16), so the minutes-long scan only runs against a stale store. `Db.seed_count` is not: it reads `seed_fill_counts`, a trigger-kept counter, in microseconds. Counting `seed_fills` was 43ms at 1.3M and linear in the corpus (see `docs/architecture.md`).
 
@@ -349,7 +353,12 @@ Several are **per-connection** and default off — the classic silent-breakage s
 
 ## Accessibility
 
-**We do not serve screen readers.** DCSS is not playable by a screen reader user in any practical sense, so this app has no such audience and does not carry that burden: no ARIA live regions, no `scope` on `<th>`, no visually-hidden label duplication, no skip links. That is a deliberate, documented narrowing (`docs/style.md`, "Audience") — not an oversight to be helpfully corrected. Don't add them back.
+Screen-reader support is calibrated against upstream crawl: DCSS is not
+playable by a screen reader today, so the app does not attempt to exceed the
+game's own accessibility, and ARIA live regions, `scope` on `<th>`,
+visually-hidden label duplication and skip links are out of scope for that
+reason. If crawl gains screen-reader support, this calibration is the thing to
+revisit (`docs/style.md`, "Audience").
 
 What remains, because it is ordinary web competence:
 
