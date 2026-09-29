@@ -193,7 +193,16 @@ end
 -- collection
 
 explorer.reset_to_defaults()
-local item_notable = explorer.item_notable
+
+-- Same wrapper as seed_dump_sexp.lua, for the same reason: item_ignore_boring
+-- calls an unbranded +0 artefact plain gear and calls a barding useless.
+local function item_notable_default(item)
+    return item.artefact
+        or item.sub_type == "barding"
+        or explorer.item_ignore_boring(item)
+end
+
+local item_notable = item_notable_default
 if all_items then item_notable = function (_) return true end end
 if arts_only then item_notable = explorer.arts_only end
 
@@ -228,7 +237,7 @@ end
 
 -- dgn.items_at reads player map knowledge, so the level must be mapped first
 -- or the floor comes back empty; shops read shop->stock directly and don't.
-local function scan_position(p)
+local function scan_position(p, prices)
     local stack = dgn.items_at(p.x, p.y)
     if stack then
         for _, item in ipairs(stack) do
@@ -242,9 +251,10 @@ local function scan_position(p)
 
     local shop = dgn.shop_inventory_at(p.x, p.y)
     if shop then
-        for _, entry in ipairs(shop) do
+        local costs = assert(prices[p.x .. "," .. p.y])
+        for i, entry in ipairs(shop) do
             if item_notable(entry[1]) then
-                local rec = item_record(entry[1], entry[2])
+                local rec = item_record(entry[1], costs[i])
                 rec.x, rec.y = p.x, p.y
                 emit(rec)
             end
@@ -289,7 +299,25 @@ local function scan_position(p)
     end
 end
 
+-- The price charged, read before wiz.identify_all_items(); see
+-- seed_dump_sexp.lua, which has the same pass.
+local function shop_prices()
+    local prices = { }
+    local gxm, gym = dgn.max_bounds()
+    for p in iter.rect_iterator(dgn.point(1, 1), dgn.point(gxm - 2, gym - 2)) do
+        local shop = dgn.shop_inventory_at(p.x, p.y)
+        if shop then
+            local costs = { }
+            for i, entry in ipairs(shop) do costs[i] = entry[2] end
+            prices[p.x .. "," .. p.y] = costs
+        end
+    end
+    return prices
+end
+
 local function scan_level()
+    local prices = shop_prices()
+
     -- must run per level: item.pluses() returns false, not a number, for
     -- unidentified items, and identification does not persist across levels.
     wiz.identify_all_items()
@@ -305,7 +333,7 @@ local function scan_level()
 
     local gxm, gym = dgn.max_bounds()
     for p in iter.rect_iterator(dgn.point(1, 1), dgn.point(gxm - 2, gym - 2)) do
-        scan_position(p)
+        scan_position(p, prices)
     end
 end
 

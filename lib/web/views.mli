@@ -16,7 +16,7 @@ val seed_list
 (** One seed's catalog, prefaced by how deep it was searched.
 
     [job] is the outstanding deepen request, [position] how many are ahead of
-    it, [csrf] the hidden field Dream's form check requires -- [None] suppresses
+    it, [csrf] the token Dream's form check requires -- [None] suppresses
     the button, which is what a deep seed gets. [filling] withdraws it for a
     different reason; see [depth_note]. *)
 val seed_detail
@@ -71,9 +71,11 @@ val search_unavailable : [> Html_types.flow5 ] Tyxml.Html.elt list
 (** The search surface: the form prefilled with the search being shown, and the
     matches with their evidence. A plain GET whose fields are the query string,
     so a result set is a link and the page works with scripting off.
-    [suggestions] feeds a datalist on the blank term box. *)
+    [suggestions] feeds a datalist on the blank term box. [resolved] pairs a
+    bare word with the term it was read as, echoed above the results. *)
 val search_page
-  :  search:Seed_corpus.Search.t
+  :  ?resolved:(string * Seed_corpus.Search.Term.t) list
+  -> search:Seed_corpus.Search.t
   -> suggestions:string list option
   -> rank:Seed_corpus.Search.Rank.t
   -> more:[ `More | `End ]
@@ -94,11 +96,53 @@ val search_title : string
     form left untouched never grows one. The [<title>] travels for the same
     reason as in {!search_title}. *)
 val search_fragment
-  :  search:Seed_corpus.Search.t
+  :  ?resolved:(string * Seed_corpus.Search.Term.t) list
+  -> search:Seed_corpus.Search.t
   -> suggestions:string list option
   -> rank:Seed_corpus.Search.Rank.t
   -> more:[ `More | `End ]
   -> Seed_corpus.Search.Match.t list
+  -> [> Html_types.flow5 ] Tyxml.Html.elt list
+
+(** One search box as the reader left it. *)
+module Box : sig
+  type offer =
+    { prompt : string
+    ; terms : string list (** Whole terms, each a link replacing this box. *)
+    }
+
+  type problem =
+    { message : string
+    ; offer : offer option
+    }
+
+  type t =
+    { value : string
+    ; problem : problem option
+    }
+
+  val of_terms : Seed_corpus.Search.Term.t list -> t list
+end
+
+(** A search that did not run: the form with every box as typed, a problem
+    note tied to each box that has one, and an announced summary. [problems]
+    are about the search rather than a box -- a bad [limit], too many terms, a
+    match set too broad to rank. *)
+val search_rejected
+  :  version:Seed_corpus.Query.Version.t
+  -> rank:Seed_corpus.Search.Rank.t
+  -> boxes:Box.t list
+  -> problems:string list
+  -> suggestions:string list option
+  -> [> Html_types.flow5 ] Tyxml.Html.elt list
+
+(** {!search_rejected} in {!search_fragment}'s shape. *)
+val search_rejected_fragment
+  :  version:Seed_corpus.Query.Version.t
+  -> rank:Seed_corpus.Search.Rank.t
+  -> boxes:Box.t list
+  -> problems:string list
+  -> suggestions:string list option
   -> [> Html_types.flow5 ] Tyxml.Html.elt list
 
 val search_results

@@ -234,6 +234,30 @@ create table seed_fills (
 
 create index seed_fills_cohort on seed_fills (version_id, depth, seed);
 
+-- count(*) of seed_fills per version, kept by trigger so the search store's
+-- currency check is a primary-key read rather than a covering-index scan (88ms
+-- at 1,299,999 seeds, prod, 2026-09-16, on every store-served search). A deepen
+-- upserts through `on conflict do update`, which fires neither trigger. An
+-- `insert or replace` would count twice, since delete triggers do not fire on a
+-- replace; tools/corpus-check compares this with count(*).
+create table seed_fill_counts (
+    version_id integer primary key,
+    seeds integer not null,
+    foreign key (version_id) references versions (id)
+) strict;
+
+create trigger seed_fills_counted after insert on seed_fills
+begin
+    insert into seed_fill_counts (version_id, seeds)
+         values (new.version_id, 1)
+    on conflict (version_id) do update set seeds = seeds + 1;
+end;
+
+create trigger seed_fills_uncounted after delete on seed_fills
+begin
+    update seed_fill_counts set seeds = seeds - 1 where version_id = old.version_id;
+end;
+
 create index seed_levels_version_seed on seed_levels (version_id, seed);
 
 create index seed_levels_parent on seed_levels (version_id, parent_level_id, seed) where parent_level_id is not null;
@@ -251,9 +275,10 @@ create index ingest_jobs_pending on ingest_jobs (version_id, queued_at) where fi
 -- ("haste"), so base_type disambiguates it -- no two base types share one
 -- today, but that is a property of the data, not a guarantee.
 --
--- cost trails `seed` for Floor_item's `cost is null` test. Earlier in the key it
--- would break the sorted-seed order keyset pagination needs for `distinct` to
--- stream and `limit` to terminate early.
+-- cost trails `seed` for the `Floor` position's `cost is null` test, which every
+-- unqualified item term carries since shop stock stopped being a default
+-- (2026-09-15). Earlier in the key it would break the sorted-seed order keyset
+-- pagination needs for `distinct` to stream and `limit` to terminate early.
 create index entries_search_type on entries (version_id, base_type_id, sub_type_id, seed, level_id, quantity, cost) where sub_type_id is not null;
 
 -- Exact-name seek, and the second stage of a substring search (strings_fts
@@ -338,3 +363,96 @@ create table strings_fts_state (
     id integer primary key check (id = 1),
     built_through integer not null
 ) strict;
+
+-- The seed-granular search store. Derived from `entries` and rebuildable
+-- wholesale, like strings_fts -- but unlike it, a stale store is not refused:
+-- search falls back to the SQL predicate path, which is the same semantics
+-- implemented twice rather than a dictionary scan. See
+-- docs/plans/seed-search-index.md and lib/corpus/search_index.mli.
+
+-- A seed's position in the store's own order, which is what lets a posting be a
+-- small integer. Assigned by the index builder, never by ingest: a build
+-- appends `max(ord) + 1` over the seeds that lack one, in (length(seed), seed)
+-- order, so an ordinal once assigned never moves and a rebuild reproduces the
+-- assignment rather than guessing at it. Ingest is parallel, so insert order is
+-- timing-dependent and could not have been that rule.
+--
+-- (length(seed), seed) is numeric order for the decimal strings crawl emits, so
+-- append order tracks ascending seed number -- which is what makes an ascending
+-- fill an append rather than an insertion into the middle.
+--
+-- `built_depth` is the seed's `seed_fills.depth` as of the last build, so the
+-- overlay re-derives only seeds deepened past what their postings cover. Null
+-- on a store built before the column existed, which reads as deepened.
+create table seed_ordinals (
+    version_id integer not null,
+    seed text not null,
+    ord integer not null,
+    built_depth integer,
+    primary key (version_id, seed),
+    foreign key (version_id) references versions (id)
+) strict, without rowid;
+
+-- Not declared unique, though it is: `tools/corpus-reindex` replays schema.sql
+-- by grepping `create index`, and a `create unique index` would be invisible to
+-- the one tool whose job is adding what a corpus is missing. Uniqueness comes
+-- from the assignment rule (append max(ord) + 1) rather than from a constraint,
+-- and SQLite's unique indexes treat NULLs as distinct anyway, which makes the
+-- same declaration on search_criteria half a guarantee.
+create index seed_ordinals_ord on seed_ordinals (version_id, ord);
+
+-- The criterion catalog: the closed vocabulary search is over -- 1,294 rows for
+-- 0.34.1 (10,000 seeds, D:8, local, 2026-09-15), and the same order at 130x the
+-- seeds, which is what makes the id space safe to bake into the format. `kind` is Criterion_id.Kind.to_int and decides what a_id and b_id
+-- mean; both are `strings` ids. `card` is the list's total postings, which is
+-- what picks the driver -- postings merge shortest-list-first, so selectivity
+-- is read here rather than guessed at by a static rank table.
+create table search_criteria (
+    id integer primary key,
+    version_id integer not null,
+    kind integer not null,
+    a_id integer,
+    b_id integer,
+    card integer not null,
+    foreign key (version_id) references versions (id)
+) strict;
+
+create index search_criteria_key on search_criteria (version_id, kind, a_id, b_id);
+
+-- One criterion's postings, cut into blocks of Posting.block_size and sorted by
+-- ordinal. `first_ord` leads the key after criterion_id, so seeking a paging
+-- cursor is a b-tree descent: SQLite's index is the skip list the format does
+-- not have to carry. `postings` is Posting.encode_block output; `n` is its
+-- length, kept for the round-trip check against search_criteria.card.
+create table search_postings (
+    criterion_id integer not null,
+    first_ord integer not null,
+    n integer not null,
+    postings blob not null,
+    primary key (criterion_id, first_ord)
+) strict, without rowid;
+
+-- The store's currency marks, read before the build and written inside its
+-- transaction -- the order strings_fts_state establishes, and for the same
+-- reason: a mark taken after the build records seeds ingested during it as
+-- covered.
+--
+-- `built_seeds` is the currency mark and `built_through` is diagnostic only.
+-- Counting seeds rather than rows is what makes deepening survivable: a deepen
+-- re-ingests one seed's levels, minting ~457 fresh `entries` ids and moving
+-- `max(id)`, while the seed count stands still -- so a row mark reports stale
+-- after every job and a seed mark reports stale only after a fill. The seeds
+-- deepening did change are covered by the overlay in `Search_index.page`, not
+-- by this mark. The count also moves *down* when seeds are dropped, which the
+-- high-water mark could not see at all: `max(id)` falls while the mark stands,
+-- reporting current over postings for seeds that no longer exist.
+--
+-- The default of -1 is what an `alter table` on a corpus built by an older
+-- writer lands (`tools/corpus-reindex`): no seed count is -1, so such a store
+-- reads as stale until it is rebuilt.
+create table search_index_state (
+    version_id integer primary key,
+    built_through integer not null,
+    built_seeds integer not null default -1,
+    built_at integer not null default (unixepoch())
+) strict, without rowid;

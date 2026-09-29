@@ -3,7 +3,8 @@
 export OPAM_SWITCH_PREFIX := justfile_directory() / "_opam"
 export OCAMLPATH := justfile_directory() / "_opam/lib"
 export CAML_LD_LIBRARY_PATH := justfile_directory() / "_opam/lib/stublibs"
-export PATH := justfile_directory() / "_opam/bin:" + env_var("PATH")
+export PATH := justfile_directory() / "_opam/bin:" + justfile_directory() / "builds/sqlite/bin:" + env_var("PATH")
+export PKG_CONFIG_PATH := justfile_directory() / "builds/sqlite/lib/pkgconfig:" + env_var_or_default("PKG_CONFIG_PATH", "")
 
 # list recipes
 default:
@@ -49,6 +50,18 @@ dev-all db="corpus.db":
 ingest *args:
     dune exec bin/ingest.exe -- {{args}}
 
+# build the seed-granular search index over a corpus
+index db="corpus.db" *args:
+    dune exec bin/index.exe -- -db {{db}} {{args}}
+
+# check the search store against the SQL path: just equiv corpus.db 0.34.1
+equiv db build *args:
+    dune exec bin/search_equiv.exe -- -db {{db}} -build {{build}} {{args}}
+
+# time the search store against the SQL path, first and deep pages
+bench db build *args:
+    dune exec bin/search_bench.exe -- -db {{db}} -build {{build}} {{args}}
+
 # run the test suite
 test:
     dune runtest
@@ -73,9 +86,21 @@ fmt-check:
 db path="corpus.db":
     sqlite3 -init /dev/null {{path}} < schema.sql
 
-# install dependencies into the local switch
-deps:
-    opam install . --deps-only --with-test --with-dev-setup --yes
+# install the locked dependencies into the local switch, over the pinned sqlite
+deps: sqlite
+    opam install . --deps-only --with-test --with-dev-setup --locked --yes
+
+# build the pinned sqlite into builds/sqlite (no-op when already built)
+sqlite:
+    tools/provision-sqlite
+
+# rebuild the sqlite bindings against builds/sqlite, after bumping the pin
+sqlite-relink: sqlite
+    opam reinstall sqlite3 --yes
+
+# regenerate the *.opam.locked files after changing depends in dune-project
+lock:
+    opam lock .
 
 # build, format-check, and test — the merge gate
 ci: fmt-check build test

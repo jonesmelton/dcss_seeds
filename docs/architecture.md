@@ -166,10 +166,9 @@ is what actually happened. Measured warm on prod (1.3M, 0.34.1, `D:8`,
 | three-term | 3.70s |
 | `has=name~Throatcutter` | 7.02s |
 
-`seed_count` itself is now 43ms, not 11ms — still a covering seek on
-`seed_fills_cohort`, but counting 1.3M index entries instead of 100k, so it is
-linear in the corpus. The masthead used to run three of them inline on every
-page render; it now reads each once and caches it per process (below).
+`seed_count` was 43ms at 1.3M, not 11ms, because counting on
+`seed_fills_cohort` is linear in the corpus. It now reads a trigger-kept counter
+instead (below).
 
 **Cost tracks the term's total matched rows, not the page size.** `limit=1` and
 `limit=200` cost the same (1.78s for `potion:haste`), while `wand:digging` at
@@ -225,17 +224,28 @@ answered in low single-digit milliseconds warm (1.3M, 0.34.1, `D:8`,
 | shape | ms | plan |
 |---|---|---|
 | empty listing | <1 | `USING COVERING INDEX` |
-| bare `Item` (`potion:haste`) | <1 | `USING COVERING INDEX` |
+| `Item` with no position predicate (the pre-2026-09-15 union) | <1 | `USING COVERING INDEX` |
 | 2-term combo | ~1 | `USING COVERING INDEX` (both arms) |
 | 3-term combo | ~2-3 | `USING COVERING INDEX` (all arms) |
 | `Artefact` | <1 | `USING COVERING INDEX` |
 | `Unique` (`Sigmund`) | <1 | `USING COVERING INDEX` |
-| `Shop_item` (`potion:haste`) | <1 | `USING INDEX` (not covering — see below) |
-| `Floor_item` (`potion:haste`) | <1 | `USING COVERING INDEX` |
+| `Item (_, Shop)` (`shop potion:haste`) | <1 | `USING INDEX` (not covering — see below) |
+| `Item (_, Floor)` (`potion:haste`) | <1 | `USING COVERING INDEX` |
 | `Feature` (`enter_shop`) | <1 | `USING COVERING INDEX` |
 | worst two common terms | ~1-2 | `USING COVERING INDEX` (both arms) |
 ~~| `Item` with `min_count=2`, **as driver** | **>100s (timed out)** | `SEARCH e USING COVERING INDEX entries_seed (seed>?)` — no seek |~~
 | `Name_like` (`Throatcutter`) | ~3400 | `SCAN strings`, `USE TEMP B-TREE FOR DISTINCT` |
+
+Two rows changed meaning under the 2026-09-15 position change without being
+re-measured. The first `Item` row is the *union* shape — no `cost` test at all
+— which no term produces any more; it is kept because the multi-term rows
+below it were measured against that same shape. And `Name_like` now carries the
+position predicate like the other two, so `cost is null` rides along on
+`entries_search_name`, which does not carry `cost` and therefore stops covering:
+`name~dragon` (the worst case, 33,523 distinct names) goes 1.252s → 1.769s,
++41% (1.3M, 0.34.1, prod, 2026-09-10). Accepted rather than fixed — it is
+nowhere near the 60s `SEED_SEARCH_TIMEOUT`, and adding `cost` to that index buys
+a query path the posting-list store replaces.
 
 ~~Two findings this pass surfaced that the query-shape fix does not touch:~~
 
@@ -288,7 +298,7 @@ request in the process — and the search timeout could not fire there, because
 an inline query never yields. That combination is what made `is_cheap`'s
 accuracy a liveness property rather than a tuning knob.
 
-- **`Shop_item` seeks `entries_search_shop` but is not covering.** The query's
+- **A `Shop` criterion seeks `entries_search_shop` but is not covering.** The query's
   own `e.cost is not null` predicate re-checks `cost` against the table even
   though the partial index's `where cost is not null` already guarantees it —
   SQLite does not use a partial index's own qualifier to satisfy an identical
@@ -399,12 +409,12 @@ different snapshots if a write lands between their checkouts — accepted for a
 read-mostly corpus.
 
 **A search request is bounded even though a checkout is not.** `SEED_SEARCH_TIMEOUT`
-(default 30s) races the search against a timer and answers the styled 503 when
+(default 60s) races the search against a timer and answers the styled 503 when
 the timer wins, so a reader is never left waiting on a query that will not
 finish. Two gaps, both deliberate as of 2026-09-10 and both left for the load
 test (`ops/loadtest.md`) to size:
 
-- It does not cancel the query. sqlite3-ocaml 5.4.1 binds neither
+- It does not cancel the query. sqlite3-ocaml 5.4.2 binds neither
   `sqlite3_interrupt` nor a progress handler, so the abandoned search runs to
   completion still holding its pool connection. The timeout bounds what a client
   waits for, not what a query occupies; closing this needs a C stub.
@@ -546,33 +556,27 @@ logic, no SQL.
   need another `/static` file and a listener to do the same job. The current
   build is marked by weight and the word "showing", never by colour alone.
 
-  The counts come from one `Db.seed_count` per served build, **read once and
-  then cached for the life of the process**. That query is a covering seek on
-  `seed_fills_cohort` rather than the scan it looks like, which is what keeps it
-  off `Lwt_preemptive.detach` — but a covering seek that *counts* is linear in
-  what it counts, and the cost moved with the corpus: ~~11ms for the full
-  100k~~ (2026-08-29, M-series laptop) is now **43ms for the full 1.3M** (1.3M,
-  0.34.1, `D:8`, 2026-09-05, server), with the two 10k builds under 1ms each.
-  Running all three inline was ~45ms of every response, and would have been
-  ~330ms at 10M — scheduler-blocking work on a page that reads nothing else.
+  The counts come from one `Db.seed_count` per served build, read per render
+  from `seed_fill_counts`, a per-version counter kept by trigger on
+  `seed_fills`. Counting was a covering seek on `seed_fills_cohort`, and a seek
+  that *counts* is linear in what it counts: ~~11ms for the full 100k~~
+  (2026-08-29, M-series laptop), then 43ms for the full 1.3M (0.34.1, `D:8`,
+  2026-09-05, server). So the count was cached per process, which under-reported
+  a build being filled alongside the server until restart.
 
-  Cached rather than stored as a column: the count is derivable, and a stored
-  one is a second source of truth that ingest, deepen, and the truncated-fill
-  repair that deletes rows would each have to keep honest — for a number whose
-  only consumer is a picker.
-
-  What the cache gives up is exactness during a fill. Nothing the server itself
-  does can move the number: the deepen queue only deepens a seed the corpus
-  already holds, which upserts `depth` on an existing `seed_fills` row without
-  adding one. But the webapp does serve while a manual fill runs, and the
-  masthead will under-report that build until the next restart, where a
-  per-render count would have shown it growing. That is accepted while fills are
-  occasional and manual; constant background filling would invalidate it and is
-  the trigger to revisit. Only a successful read is cached — a build whose count
-  errors is dropped from the panel rather than shown as zero (a corpus that
-  failed to answer is not a corpus with no seeds), and leaving the error
-  uncached means a transient failure is retried on the next render instead of
-  hiding the build until restart.
+  A stored count was first rejected as a second source of truth that ingest,
+  deepen and the truncated-fill repair would each have to keep honest, for a
+  number only the picker read. Two things changed that (2026-09-16). The search
+  store's currency check needs the same count on every store-served search, at
+  88ms per search at 1.3M. And a trigger keeps the counter honest without any
+  writer knowing about it: a fill's insert and a repair's delete each fire one,
+  and a deepen's `on conflict do update` fires neither. The one write that
+  would drift it, `insert or replace`, is not used on `seed_fills`, and
+  `tools/corpus-check` compares the counter with `count(*)`. The read is a
+  primary-key lookup, 16-22µs at 10k and flat in corpus size, so the cache is
+  gone and the count is exact during a fill. A build whose count errors is
+  dropped from the panel rather than shown as zero: a corpus that failed to
+  answer is not a corpus with no seeds.
 
   Every emitted link carries the build, including the masthead. A link that
   falls back to `/` moves the reader to `current` and lands them on a page that
@@ -729,7 +733,7 @@ the `sub_type` those rows carry.
 ## The search vocabulary
 
 "Which seeds have X" is the product question, and `lib/corpus/search.ml` is
-where it is answered in the abstract. Four decisions shape everything else.
+where it is answered in the abstract. Five decisions shape everything else.
 
 **A criterion is a type, not a name.** `entries.name` is a display string
 carrying enchantment, brand and artefact epithet (`+3 greatsling "Punk" {acid,
@@ -759,17 +763,47 @@ that question and always was the better one.
 future criterion could reintroduce it — reopening the seam costs more than
 leaving it open.
 
-**Where an item sits is a criterion, not a modifier.** A price is the only
-thing separating shop stock from floor loot (`cost` present), so the three item
-criteria are peers: `Item` is the union, `Shop_item` and `Floor_item` partition
-it, and the partition is total — measured 2388 + 282 = 2670 rows for
-`wand:digging` (10k seeds, 0.34.1, D:8, 2026-09-01). Written as a criterion
-rather than a flag on `Item` because it has to reach `min_count`: two potions on
-the floor and a third behind a counter satisfy `3x potion:haste` and not `3x
-floor potion:haste`, so a floor search is not an `Item` result with the shop
-hits struck off and can match strictly fewer seeds. A search-wide "exclude
-shops" toggle could not express that, and would make a term's meaning depend on
-state outside the term.
+**Where an item sits is part of the criterion, not a modifier on it.** A price
+is the only thing separating shop stock from floor loot (`cost` present), and
+`Criterion.position` — `Floor` or `Shop` — is a *field* on `Item`, `Name_like`
+and `Props` rather than a constructor beside them. The two values partition the
+union totally: measured 2388 + 282 = 2670 rows for `wand:digging` (10k seeds,
+0.34.1, D:8, 2026-09-01). It is a field and not a constructor per combination
+because that grows multiplicatively, and `Props` was the third criterion to want
+one; `Shop_item` and `Floor_item` were deleted for it (2026-09-15).
+
+**`Floor` is the default** as of the same change: `potion:haste` is floor-only,
+`shop ` is the per-term opt-in, `floor ` is accepted, redundant and never
+emitted. The union has no spelling left, which is a real loss taken
+deliberately — "is it there" and "can I afford it" are different questions and
+the second is the rarer one. There is no `anywhere ` prefix; if one is ever
+wanted, `docs/plans/shop-exclusion-default.md` records the evidence problem it
+brings with it (`group_term_hits` collapses a term to one hit per seed, so the
+shop share of a union count would be exactly what the reader opted into and
+could not see).
+
+The partition is what makes this a criterion rather than a filter, because it
+reaches `min_count`: two potions on the floor and a third behind a counter
+satisfy neither `3x potion:haste` nor `3x shop potion:haste`, so a floor search
+is not a union result with the shop hits struck off and can match strictly
+fewer seeds (2,435 → 2,142 seeds, 12% of matches lost, 10k local, 0.34.1,
+2026-09-10). A search-wide "exclude shops" toggle is still rejected on exactly
+that ground, and the changed default is not one: a toggle makes one term text
+denote different sets depending on state outside the term, where `potion:haste`
+denotes floor-only always, fixed by the term text alone with nothing outside it
+consulted.
+
+`Artefact` is the one criterion still holding the union, and it takes no
+position at all — `shop artefact` is an error, not a narrowing. A generic
+artefact search is a weak question and qualifying it would need parse syntax it
+does not have (`artefact` carries no colon for a prefix to lead). The
+inconsistency is visible rather than theoretical, because artefacts are where
+shop stock concentrates: 42.7% of artefact entries sit in a shop against 14.4%
+of named entries (1.3M, 0.34.1, prod, 2026-09-10). The help text states it for
+that reason — an asymmetry that is explained is a decision, one that is
+discovered is a bug. `name~` breaks the symmetry the other way and has no shop
+form: gold binds the early game, so an unrand you can afford in a shop is one
+you could have afforded off the floor.
 
 `cost is null` used to fall outside the covering index, so the floor arm read
 the index for the seek and the table for the test — a shape that read as cheap
@@ -777,8 +811,55 @@ at 10k seeds (measured at parity with the unqualified form, 20ms end-to-end
 over HTTP, 10k seeds, 0.34.1, 2026-09-01) and was not: at 300k it cost 4.65s
 against 0.08s for the bare `Item` shape (0.34.1, 2026-09-03, warm, prod).
 `entries_search_type` now carries `cost` as its trailing column, so the test is
-covering and the criterion is volume-bound like the other common-row ones. See
-`db.ml`'s `Floor_item` branch and the index's comment in `schema.sql`.
+covering and the criterion is volume-bound like the other common-row ones. That
+holds for `Item` only: `entries_search_name` carries no `cost`, so `Name_like`
+pays the non-covering shape now that it takes a position too — the measurement
+is under *The sharp edge: blocking the scheduler*. See `db.ml`'s
+`position_where` and the index's comment in `schema.sql`.
+
+**A property set is one criterion, because the properties share an item.**
+`entry_props` holds one row per artefact property per item, and "a staff with
+Conj and Alch" is a question about one object. Expressed as conjunction it would
+not be: a Conj ring on D:3 beside an Alch staff on D:5 satisfies the seed-level
+reading, and the evidence rendering cannot say so — `hit_line` renders name,
+count and level, so two unrelated items are two indistinguishable lines. That is
+the failure the `by D:n` removal was about, one level up. So `Props` carries the
+whole set and correlates every `exists` on the same `entries.id`.
+
+The base type folds in for the same reason. `item:staff` beside `props:Conj,Alch`
+is two seed-scoped terms and leaks the same way, and it is not a rare leak:
+school enhancers roll off-staff about 45% of the time (staff 223, armour 170,
+jewellery 15 across the ten school properties, 10k local corpus, 0.34.1) — so
+`Fire`+`rF` lands on armour in 12 seeds against staves in 4.
+
+Two things are deliberately not in the grammar. There is **no count**: two of a
+property is not a more interesting seed than one, and the two ways it could go
+wrong are both dull (every build holds several `rF+`; nobody wants two `rMut`).
+There is **no strength**, so a bare property means "at least 1" — which is also
+the grouping mechanism, since `props:rF` covering `rF+` and `rF++` is just the
+floor, and `entry_props.value` runs negative on about one row in five of `Str`,
+`rF`, `Slay` and their kin. A resistance you asked for is not answered by a
+vulnerability.
+
+**Drawbacks are excluded on domain grounds, not technical ones.** `*Noise`,
+`^Contam`, `-Tele`, `Bane` and the rest are not searchable because nobody picks
+a seed for a drawback: whether one is worth living with is decided once you hold
+the item, and it changes what you carry rather than what you play. This is
+unlike the uniques dropped 2026-09-10, where the wanted question was the
+negative one and search has no negation — there is no missing operator here and
+nothing waiting on one. `*Rage` is the exception and stays, being a build to
+commit to. `nupgr` is excluded on a third ground: `ARTP_NO_UPGRADE` is an engine
+flag on self-upgrading unrands, never shown to a player. The sigils (`*`, `^`,
+`-`) are how the list is derived, not why — see `Search.Prop`.
+
+The vocabulary is listed in code rather than read from the corpus. It is closed
+and small (55 names), the parse boundary is synchronous, and an unknown property
+has to be *rejected*: a property search that runs and matches nothing reports
+that the build holds no such artefact, which is false and indistinguishable from
+true. The concrete case is a hand-typed `props:Conj+Alch` — `Dream.queries`
+decodes a raw `+` to a space, so it arrives as one property named `Conj Alch`.
+That is also why the separator is a comma: `+Blink` and `+Inv` are property
+names, so a `+` separator would spell a set holding one as `Conj++Blink`.
 
 **Conjunction is a flat query, one driver plus correlated predicates.** Each
 criterion is one covering index seek; the query used to combine them with
@@ -811,7 +892,8 @@ that silently only holds within one page.
 A search is a conjunction, so more terms only ever shrink the result — but the
 cost of building the per-term subqueries grows with the count, and `has=` is a
 repeated query parameter that anything can send. `Params.max_terms` (10) is the
-ceiling, applied in `Params.terms_of_strings` before any term is parsed. It is a
+ceiling, applied in `Params.boxes` (and `Params.terms_of_strings`, which the
+bench and equivalence tools use) before any term is parsed. It is a
 constant rather than configuration because no real question needs an eleventh
 term.
 
@@ -831,7 +913,7 @@ reads no corpus — but it is still version-scoped, and every example on it is a
 link into a real search on the build being read rather than inert syntax. Both
 halves are deliberate: an example naming an item a build does not generate
 would demonstrate the exact mistake the path-scoped address exists to prevent,
-and a reader learns what `3x floor potion:haste` means faster by
+and a reader learns what `3x shop potion:haste` means faster by
 following it than by parsing a grammar. It carries the ordinary masthead, so
 `served_builds` is the one query the handler does run.
 
@@ -869,11 +951,16 @@ version out of ever having a datalist.
 Warming the cache at startup was the alternative and was rejected: it only
 removes the cost if startup blocks on it, which turns every deploy into a ~140s
 outage — precisely the case that mattered, a deploy during a traffic spike.
-Precomputing the vocabulary into a table at fill time is still the strictly
-better fix and is still not taken: the vocabulary is a *build* fact, and
-recomputing it per process asks the corpus a question whose answer was known
-when the rows were written. What the background scan buys is that the cost no
-longer lands on a reader; it does not make the cost go away.
+Precomputing the vocabulary into a table was the better fix, and the search
+store's catalog turned out to be that table. When the store is current,
+`Db.distinct_criteria` reads its item pairs from `search_criteria`'s floor and
+shop item rows, unioned with the deep cohort's own entries, since a deepened
+level can hold a pair the build never saw (`Search_index.item_pairs`). The
+output is identical: 427 pairs, 340ms for the scan against 1ms for the catalog
+(10,000 seeds, 0.34.1, local, 2026-09-16), and the catalog's cost depends on
+the vocabulary and the cohort, not the corpus. A stale store, or a cohort past
+the overlay cap, falls back to `item_pairs_sql`, so the background scan and the
+single-flight guard stay, as the fallback's protection.
 
 Unrands are in the list too, and they arrive by a different route. They cannot
 be observed: the stored name carries a varying enchantment prefix and
@@ -900,6 +987,32 @@ name would parse as an item and fail.
 The list does not replace the help text. It covers the *nouns*; the affixes
 (`3x`, `shop `, `unique:`) are grammar a datalist cannot express,
 and `name~` is only pre-filled for the unrands.
+
+### A rejected search hands the form back
+
+Every 400 from the search route re-renders the search page with each box as
+the reader typed it, a note under each box that failed, and a `role="alert"`
+summary whose entries link to those boxes; each failing input carries
+`aria-invalid` and an `aria-describedby` pointing at its note. The results are
+emptied, since the last query's results under a query that did not run read as
+its answer. A bad `limit` or `rank`, too many terms, and a set too broad to rank
+land in the same summary. Other routes keep the bare 400 page. htmx 4 swaps a
+4xx like a 2xx (its `noSwap` is 204 and 304 only), so a scripted search gets the
+fragment shape: the form out of band, as on success.
+
+A bare word (no colon, no `name~`) is looked up before it is refused, because
+unprefixed words were a tenth of human search terms and fell into three intents:
+a name fragment (`hat`, `spectral`), a bare base type (`talisman`), and a
+misspelled sub type (`aquirement`). `Params.box` resolves it against the item
+pairs and the property list. One exact match runs, and the box shows the term it
+became, with a line above the results saying so. Several exact matches, or a
+near miss (a whole word of a sub type, or one edit or transposition away from
+one), run nothing and are offered as links; with no match the offer is `name~<word>`,
+never run automatically, because `name~` is the one criterion whose cost the
+vocabulary does not bound. The vocabulary is the store's catalog, read
+synchronously (`Db.catalog_item_pairs`, ~850 rows, no cohort), falling back to
+the datalist cache; with neither, nothing resolves and the reader is told the
+syntax. A word containing `_` keeps the feature rejection.
 
 ### Depth is reach order, not generation order
 
@@ -1086,6 +1199,83 @@ So `Name_like` cannot run inline no matter how good the index is, and the
 remaining work for common fragments is the `distinct` nesting, not the search
 index. See `docs/corpus-scaling.md`.
 
+### A seed-granular store answers "which seeds"; SQL still answers "with what"
+
+Search is now two implementations of one predicate semantics. `Db.search_seeds`
+drives the seed-granular posting-list store (`lib/corpus/search_index.mli`,
+`docs/plans/seed-search-index.md`) when it is current for the version, and
+falls back to everything above — the SQL predicate path this whole section
+describes — when it is not.
+
+That is a fallback, not a refusal, and the two stale-index failure modes look
+alike without being alike. A stale trigram index refuses (`stale_index_tag`,
+above) because its fallback is a 129 MB dictionary scan reachable from a public
+query parameter — an amplification factor, not a slow correct answer. A stale
+search store falls back instead, because its fallback *is* the implementation
+that has been answering every search in production up to now: refusing would
+trade a correct, slow answer for no answer, for a store whose only failure mode
+is being one fill behind. Not one *deepen* behind: deepening changes no seed
+count, so it leaves the store current, and the seeds it did change — the deep
+cohort, every seed deeper than the build recorded it — are subtracted from the posting
+stream and re-derived through this section's SQL on every search. That is sound
+only because deepening is a strict prefix extension of a shallow fill
+(`fill_depth.mli`), so a stale posting is true-but-incomplete, never wrong. The
+store also holds no names, levels or evidence,
+so the second round trip — `term_hits`, per seed, per term — is unchanged
+regardless of which path found the seeds.
+
+Not every criterion the store helps with is answered exactly. A multi-property
+`props:` only narrows: the store intersects each property's own posting list
+down to a candidate set, but membership at seed granularity can't confirm the
+properties landed on *one* item — it can't tell a Conj ring from an Alch staff
+on the same seed apart, which is the whole reason `Criterion.Props` exists
+(above). So a narrowing criterion's candidates are re-checked against SQL
+before they page — the two-stage shape the design predicted, and the case it
+is right for.
+
+`name~` is not that case either, and is handled in the other order. Driving on
+the store and re-checking the fragment per candidate batch would be backwards:
+the merge drives on its *rarest* list, a `name~` term's companions are
+typically far broader than the fragment, and `name~Wyrmbane potion:haste` would
+walk the ~1M-posting haste list re-running the trigram lookup per batch. So the
+fragment is resolved *first* — the same two-stage `strings_fts`-then-`like`
+lookup the SQL path uses, grouped per seed into an in-memory posting list with
+the builder's depth and count — and that list joins the merge as an exact term,
+where it is almost always the driver. Production traffic is what justified it:
+of 2,472 human searches carrying `name~`, the ones combining it with another
+term had a p99 of 58.4s and 123 over 5s, nearly all a selective unrand name
+beside a property or item term (access log, 2026-09-09 to 2026-09-26).
+
+Resolution is unbounded for a broad fragment (`name~the` is 762,835 names and
+over 300k seeds), so it stops at `Search_index.max_name_seeds` (20,000) and the
+store declines past it, leaving the search on the SQL path as before. 97.5% of
+human fragment occurrences resolve under that cap (315 distinct fragments, 1.3M,
+0.34.1, D:8, prod, 2026-09-26); the rest are mostly readers using `name~` for
+enchantment level or property strength (`+10`, `Slay+3`, `speed`). A declined
+fragment pays the partial resolution first, on top of the SQL path: 0.50s
+(`hat`) to 1.01s (`the`) to reach the cap.
+
+What it bought, first page warm, store against the SQL path (1.3M, 0.34.1, D:8,
+prod clone, cores 1-3,5-7, neighbor idle, ARC cap 10 GB, 2026-09-29): the shape
+still slow in production, `name~` beside a bare `props:`, went from 1.5-8.2s to
+0.11-0.42s (`name~heavy crossbow "Sniper"; props:Dex` 8.22s → 0.11s). What it
+cost: a selective fragment beside a selective term, and a lone fragment, are
+~0.07s slower (`name~hood of the Assassin` alone 0.07s → 0.13s, `name~robe of
+Vines; props:Conj` 0.10s → 0.18s), since the whole fragment is resolved on every
+page. A lone fragment under `Shallowest` is now answered where the SQL path
+refused it past `Rank.sort_limit` (`name~Throatcutter`, 0.07s).
+
+Paging order is the one place the two paths visibly disagree: the store pages
+by ordinal (append order), the SQL path by seed text, and both are "the
+corpus's own order" — the listing caption already declines to promise which.
+A reader paging across the moment the store flips between current and stale
+can see one seed twice, or not at all, exactly once, at that boundary.
+
+`Search.Rank.sort_limit`, `Search.Rank.is_too_broad`, and
+`Seed_web.search_is_cheap` are untouched by any of this — they still govern the
+SQL path above and retire only when it does, which is gated on a
+production-scale equivalence run, not on this landing.
+
 ## Rendering
 
 **TyXML, not a template language.** Views are OCaml functions returning typed
@@ -1217,6 +1407,16 @@ web layer tests the same lock to say so: the seed page withdraws the deepen
 button and explains that searches are paused, rather than offering a control
 whose only outcome is an unexplained wait. A job already queued keeps polling —
 only the offer of new work is withdrawn.
+
+The lock is derived from the database path, which is exactly what makes it
+blind to a second process reading a frozen *copy* of the corpus: a read-only
+instance opens its own `<copy>-write.lock`, one the live fill never touches, so
+it sees no lock and would enqueue happily into a database nothing will ever
+drain. `SEED_DISABLE_DEEPEN` (`Params.deepen_disabled`) is the explicit
+counterpart for that case — checked alongside the lock everywhere the lock is,
+so a read-only instance withdraws the offer, refuses the POST, and (see
+`Seed_web.health`) stops treating generator liveness as a health signal, for
+the same reason: no generator will ever heartbeat there.
 
 The lock is consulted rather than a flag in the corpus because it is
 self-healing: a fill killed mid-run releases it when its fd closes, where a

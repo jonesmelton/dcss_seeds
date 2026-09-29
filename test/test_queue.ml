@@ -407,6 +407,46 @@ let%expect_test "a pass that raises does not end the generator" =
     |}]
 ;;
 
+(* The loop's sleep is a fixed poll interval, so wall-clock between failures
+   says little: the count is what separates the first BUSY of an incident from
+   one that has survived several passes and is not clearing on its own. A pass
+   that returns without raising resets it. *)
+let%expect_test "a failure streak counts up and resets on a clean pass" =
+  let open Seed_corpus.Deepen.Failure_streak in
+  printf "%d\n" (count zero);
+  let streak = failed zero in
+  printf "%d\n" (count streak);
+  let streak = failed streak in
+  printf "%d\n" (count streak);
+  printf "%d\n" (count (passed streak));
+  [%expect
+    {|
+    0
+    1
+    2
+    0
+    |}]
+;;
+
+let%expect_test "a failure line names the count and the build and seed in flight" =
+  let version = Or_error.ok_exn (Query.Version.of_string "0.34.1") in
+  let context = { Seed_corpus.Deepen.Context.version; seed = Some "1234567890" } in
+  printf
+    "%s\n"
+    (Seed_corpus.Deepen.failure_message
+       ~consecutive:3
+       (Some context)
+       "exec_script failed: BUSY (5): database is locked; statement: begin immediate");
+  printf
+    "%s\n"
+    (Seed_corpus.Deepen.failure_message ~consecutive:1 None "heartbeat failed");
+  [%expect
+    {|
+    pass failed: consecutive=3 version=0.34.1 seed=1234567890: exec_script failed: BUSY (5): database is locked; statement: begin immediate
+    pass failed: consecutive=1: heartbeat failed
+    |}]
+;;
+
 (* The position a reader is told is only honest if it is the position
    [claim_job] will work through, so it counts by the same rule. A generator
    claims per version, so a job on another build is not ahead. *)

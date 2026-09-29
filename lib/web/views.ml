@@ -199,7 +199,7 @@ let seed_list ~version ~(page : Query.Page.t) summaries =
       [ p
           [ a
               ~a:[ a_href (sprintf "%s/?limit=%d" (version_path version) page.limit) ]
-              [ txt "Show me some others →" ]
+              [ txt "More →" ]
           ]
       ]
   in
@@ -242,11 +242,9 @@ let seed_list ~version ~(page : Query.Page.t) summaries =
                         ; p
                             [ txt
                                 "Everything here is what the first eight floors (D:8) \
-                                 hold: artefacts are the ones lying on the floor, not \
-                                 shop stock, heat is a rough unsorted mark of how the \
-                                 seed compares to others at that same D:8 depth, and a \
-                                 dash means nothing that shallow rather than nothing at \
-                                 all."
+                                 hold: heat is a rough unsorted mark of how the seed \
+                                 compares to others at D:8 depth, and a dash means \
+                                 nothing that shallow rather than nothing at all."
                             ]
                         ; p
                             [ txt "Under "
@@ -254,14 +252,7 @@ let seed_list ~version ~(page : Query.Page.t) summaries =
                             ; txt
                                 ": \"acq\" is a scroll of acquirement and \"xp\" \
                                  a                                  potion of \
-                                 experience, both lying on the floor \
-                                 rather                                  than for sale. \
-                                 They lead the cell because they \
-                                 are                                  worth the same to \
-                                 every character, where an altar or \
-                                 a                                  portal is worth a \
-                                 detour only if you want what \
-                                 is                                  behind it."
+                                 experience, on the floor."
                             ]
                         ]
                     ])
@@ -568,9 +559,7 @@ let branch_index entrances =
   then
     [ p
         ~a:[ a_class [ "subtitle" ] ]
-        [ txt
-            "No branch or portal entrance within the extracted floors. Deeper than them, \
-             not absent."
+        [ txt "No branch or portal entrance within the extracted floors. Might be deeper."
         ]
     ]
   else
@@ -657,8 +646,7 @@ let deepen_button ~version ~seed ~csrf =
           ; Tyxml_htmx.hx_target ("#" ^ depth_note_id)
           ; Tyxml_htmx.hx_swap_raw "outerHTML"
           ]
-        [ (* CSRF tag spliced as raw markup; server-generated, no reader input. *)
-          Unsafe.data csrf
+        [ input ~a:[ a_input_type `Hidden; a_name "dream.csrf"; a_value csrf ] ()
         ; button
             ~a:[ a_button_type `Submit ]
             [ txt (sprintf "Search down to %s" Fill_depth.deep_cap) ]
@@ -724,7 +712,8 @@ let depth_note ~version ~seed ~depth ~job ~position ~csrf ~filling =
       [ p
           (txt
              (sprintf
-                "Queued for a deeper search, down to %s. Waiting for a free generator."
+                "Queued for a deeper search, down to %s. Waiting for a free dungeon \
+                 generator."
                 Fill_depth.deep_cap)
            :: queue_place position)
       ]
@@ -740,7 +729,7 @@ let depth_note ~version ~seed ~depth ~job ~position ~csrf ~filling =
       [ p
           [ txt "Searched down to "
           ; strong [ txt searched_to ]
-          ; txt ", past the usual cap. The branches below are the whole of it."
+          ; txt ", past the usual cap."
           ]
       ]
   | _ ->
@@ -779,11 +768,9 @@ let seed_detail ~version ~seed ~job ~position ~csrf ~filling levels =
         ~label:"What is an exclusive draw?"
         [ p
             [ txt
-                "Crawl draws one member of each group per game, so a seed holding one \
-                 cannot hold the others anywhere, at any depth. The trailing names are \
-                 what this seed's draw rules out. A dash means no member turned up in \
-                 the extracted floors, which is not the same as the group being \
-                 excluded, since only a drawn member is evidence."
+                "Crawl draws one member of each group per game, so a seed with one \
+                 cannot have the others. A dash means we haven't seen any from that\n\
+                \                 group yet in this seed so it's still unknown."
             ]
         ]
     ]
@@ -819,7 +806,55 @@ let suggestions_id = "term-suggestions"
 (* Indicator in the form, not results: the swap replaces results' children. *)
 let busy_id = "search-busy"
 
-let search_form ?(oob = false) (search : Search.t) ~suggestions =
+module Box = struct
+  type offer =
+    { prompt : string
+    ; terms : string list
+    }
+
+  type problem =
+    { message : string
+    ; offer : offer option
+    }
+
+  type t =
+    { value : string
+    ; problem : problem option
+    }
+
+  let of_terms terms =
+    List.map terms ~f:(fun term ->
+      { value = Search.Term.to_query_string term; problem = None })
+  ;;
+end
+
+let problem_id i = sprintf "term-%d-problem" i
+
+(* An offer replaces its own box and keeps the rest as typed, so taking one
+   never costs the reader another term. *)
+let offer_href ~version ~rank ~(boxes : Box.t list) ~at offer =
+  let param key value = sprintf "%s=%s" key (Dream.to_percent_encoded value) in
+  let has =
+    List.mapi boxes ~f:(fun i (box : Box.t) ->
+      param "has" (if i = at then offer else box.value))
+  in
+  let rank =
+    if Search.Rank.equal rank Search.Rank.default
+    then []
+    else [ param "rank" (Search.Rank.to_string rank) ]
+  in
+  sprintf "%s/search?%s" (version_path version) (String.concat ~sep:"&" (has @ rank))
+;;
+
+let search_form
+      ?(oob = false)
+      ?(problems = [])
+      ~version
+      ~rank
+      ~(boxes : Box.t list)
+      ~suggestions
+      ()
+  =
   let list_attr =
     match suggestions with
     | Some _ -> [ a_list suggestions_id ]
@@ -831,12 +866,54 @@ let search_form ?(oob = false) (search : Search.t) ~suggestions =
      removeAttribute and stops, leaving a box that lost its term still showing
      it. Unkeyed and valueless, both halves bite: the new blank box soft-matches
      the old blank the reader just typed the submitted term into. *)
-  let box ?(value = "") i =
+  (* Placeheld only on an empty form, where it is the sole box. The suggestion
+     list is ~580 options the browser filters by prefix, so a reader who has
+     typed nothing sees its head (armour:...) and no properties at all -- those
+     sit past option 400 and cannot be reached without already knowing the word.
+     The placeholder is the only surface that shows before the first keystroke,
+     which is exactly when the vocabulary is unknown.
+
+     Not on the trailing blank box once a term exists: a term-shaped placeholder
+     directly under a term reads as a duplicate of it. That is why the box takes
+     this rather than deciding from its own index. *)
+  let box ?(value = "") ?(placeheld = false) ?(invalid = false) i =
+    let placeholder =
+      if placeheld
+      then [ a_placeholder "potion:haste, artefact, staff props:Conj" ]
+      else []
+    in
+    let invalid =
+      if invalid
+      then [ a_aria "invalid" [ "true" ]; a_aria "describedby" [ problem_id i ] ]
+      else []
+    in
     input
       ~a:
         ([ a_input_type `Text; a_id (sprintf "term-%d" i); a_name "has"; a_value value ]
+         @ placeholder
+         @ invalid
          @ list_attr)
       ()
+  in
+  let problem_note i (problem : Box.problem) =
+    let offer =
+      match problem.offer with
+      | None -> []
+      | Some { prompt; terms } ->
+        [ p [ txt prompt ]
+        ; ul
+            ~a:[ a_class [ "offers" ] ]
+            (List.map terms ~f:(fun term ->
+               li
+                 [ a
+                     ~a:[ a_href (offer_href ~version ~rank ~boxes ~at:i term) ]
+                     [ code [ txt term ] ]
+                 ]))
+        ]
+    in
+    div
+      ~a:[ a_id (problem_id i); a_class [ "term-problem" ] ]
+      (p [ txt problem.message ] :: offer)
   in
   (* Remove is a submit button, not a link: a link would carry only what the
      last search held and discard whatever is typed in the other boxes. It names
@@ -844,36 +921,69 @@ let search_form ?(oob = false) (search : Search.t) ~suggestions =
      -- not the box's position. See Params.without_dropped. *)
   let seen = String.Table.create () in
   let existing =
-    List.mapi search.terms ~f:(fun i term ->
-      let value = Search.Term.to_query_string term in
+    List.mapi boxes ~f:(fun i { Box.value; problem } ->
       let nth = Hashtbl.find_or_add seen value ~default:(fun () -> ref 0) in
       let this = !nth in
       incr nth;
       li
         ~a:[ a_id (sprintf "term-row-%d" i) ]
-        [ box i ~value
-        ; button
-            ~a:
-              [ a_button_type `Submit
-              ; a_name "drop"
-              ; a_text_value (sprintf "%d:%s" this value)
-              ; a_class [ "drop-term" ]
-              ; a_title (sprintf "Remove %s" value)
-              ; a_aria "label" [ sprintf "Remove %s" value ]
-              ]
-            [ txt "×" ]
-        ])
+        ([ box i ~value ~invalid:(Option.is_some problem)
+         ; button
+             ~a:
+               [ a_button_type `Submit
+               ; a_name "drop"
+               ; a_text_value (sprintf "%d:%s" this value)
+               ; a_class [ "drop-term" ]
+               ; a_title (sprintf "Remove %s" value)
+               ; a_aria "label" [ sprintf "Remove %s" value ]
+               ]
+             [ txt "×" ]
+         ]
+         @ Option.value_map problem ~default:[] ~f:(fun problem ->
+           [ problem_note i problem ])))
   in
-  let last = List.length search.terms in
-  let blank = li ~a:[ a_id (sprintf "term-row-%d" last) ] [ box last ] in
-  let action = version_path search.version ^ "/search" in
+  let last = List.length boxes in
+  let blank =
+    li
+      ~a:[ a_id (sprintf "term-row-%d" last) ]
+      [ box last ~placeheld:(List.is_empty boxes) ]
+  in
+  (* The GOV.UK error-summary shape: announced once, each entry a link to the
+     box it is about, whose own note is tied to it by aria-describedby. *)
+  let summary =
+    let about_boxes =
+      List.filter_mapi boxes ~f:(fun i { Box.problem; _ } ->
+        Option.map problem ~f:(fun (problem : Box.problem) ->
+          li [ a ~a:[ a_href (sprintf "#term-%d" i) ] [ txt problem.message ] ]))
+    in
+    match List.map problems ~f:(fun message -> li [ txt message ]) @ about_boxes with
+    | [] -> []
+    | entries ->
+      [ div
+          ~a:[ a_class [ "search-problems" ]; a_role [ "alert" ] ]
+          [ p [ txt "This search could not run:" ]; ul entries ]
+      ]
+  in
+  let action = version_path version ^ "/search" in
+  (* A datalist filters by prefix, so a reader who has not typed the word
+     "props" never sees a property: they sit past option 400 of ~580 behind the
+     item pairs. Labelling them says what the entry is at the moment it is
+     finally visible, which is the only help a datalist can give -- the ordering
+     is the browser's, not ours. *)
+  let suggestion_option v =
+    let label =
+      match String.chop_prefix v ~prefix:"props:" with
+      | Some prop -> [ a_label (sprintf "%s — artefact property" prop) ]
+      | None -> []
+    in
+    option ~a:(a_value v :: label) (txt "")
+  in
   let suggestion_list =
     match suggestions with
     | Some options ->
       [ datalist
           ~a:[ a_id suggestions_id ]
-          ~children:
-            (`Options (List.map options ~f:(fun v -> option ~a:[ a_value v ] (txt ""))))
+          ~children:(`Options (List.map options ~f:suggestion_option))
           ()
       ]
     | None -> []
@@ -906,14 +1016,34 @@ let search_form ?(oob = false) (search : Search.t) ~suggestions =
           ]
         []
       :: suggestion_list)
+     @ summary
      @ [ ul ~a:[ a_class [ "terms" ] ] (existing @ [ blank ])
+         (* Grouped by what each form asks rather than run together as one list.
+            Seven comma-separated examples read as undifferentiated grey and put
+            the newest form last, where it looks like an afterthought; naming the
+            three kinds makes properties a peer of items rather than a footnote.
+            Ligatures are off here -- see the note on name~. *)
        ; p
            ~a:[ a_id "search-help"; a_class [ "subtitle" ] ]
-           [ txt
-               "One term per box: potion:haste, 3x potion:haste, floor potion:haste, \
-                shop wand:digging, artefact, name~Throatcutter. "
+           [ txt "One term per box, floor loot only unless the term says "
+           ; code [ txt "shop " ]
+           ; txt ". Items: "
+           ; code [ txt "potion:haste" ]
+           ; txt ", "
+           ; code [ txt "3x potion:haste" ]
+           ; txt ", "
+           ; code [ txt "shop potion:haste" ]
+           ; txt ". Artefact properties: "
+           ; code [ txt "props:Conj" ]
+           ; txt ", "
+           ; code [ txt "staff props:Conj,Alch" ]
+           ; txt ". Also "
+           ; code [ txt "artefact" ]
+           ; txt " and "
+           ; code [ txt "name~Throatcutter" ]
+           ; txt ". "
            ; a
-               ~a:[ a_href (search_help_path search.version) ]
+               ~a:[ a_href (search_help_path version) ]
                [ txt "Full syntax, with examples" ]
            ]
        ; div
@@ -1040,26 +1170,69 @@ let search_results ~(search : Search.t) ~rank ~more matches =
 (* Placeholder when search is disabled. No form, no query parsing. *)
 let search_unavailable =
   [ h1 [ txt "Search" ]
-  ; p ~a:[ a_class [ "subtitle" ] ] [ txt "Search is coming soon." ]
+  ; p
+      ~a:[ a_class [ "subtitle" ] ]
+      [ txt "Search is unavailable just now. The rest of the site is unaffected." ]
   ]
 ;;
 
 (* htmx swaps 4xx responses and takes the title from them; a rejected query
    leaves "Bad request" in the tab. Title travels with every search response. *)
-let search_title = "which seeds have…"
+let search_title = "search within seeds"
 let search_title_element = Unsafe.node "title" [ txt search_title ]
 
-let search_page ~(search : Search.t) ~suggestions ~rank ~more matches =
-  [ search_form search ~suggestions
-  ; div ~a:[ a_id results_id ] (search_results ~search ~rank ~more matches)
+let resolution_note resolved =
+  List.map resolved ~f:(fun (typed, term) ->
+    p
+      ~a:[ a_class [ "subtitle"; "resolved" ] ]
+      [ txt (sprintf "%S was read as " typed)
+      ; code [ txt (Search.Term.to_query_string term) ]
+      ; txt "."
+      ])
+;;
+
+let search_page ?(resolved = []) ~(search : Search.t) ~suggestions ~rank ~more matches =
+  [ search_form
+      ~version:search.version
+      ~rank
+      ~boxes:(Box.of_terms search.terms)
+      ~suggestions
+      ()
+  ; div
+      ~a:[ a_id results_id ]
+      (resolution_note resolved @ search_results ~search ~rank ~more matches)
   ]
 ;;
 
 (* Swap targets results; form travels out of band so scripted readers get new
    term boxes. *)
-let search_fragment ~(search : Search.t) ~suggestions ~rank ~more matches =
-  search_results ~search ~rank ~more matches
-  @ [ search_form ~oob:true search ~suggestions; search_title_element ]
+let search_fragment ?(resolved = []) ~(search : Search.t) ~suggestions ~rank ~more matches
+  =
+  resolution_note resolved
+  @ search_results ~search ~rank ~more matches
+  @ [ search_form
+        ~oob:true
+        ~version:search.version
+        ~rank
+        ~boxes:(Box.of_terms search.terms)
+        ~suggestions
+        ()
+    ; search_title_element
+    ]
+;;
+
+(* The results are emptied rather than left standing: under a query that did
+   not run, the last one's results read as its answer. *)
+let search_rejected ~version ~rank ~boxes ~problems ~suggestions =
+  [ search_form ~version ~rank ~boxes ~problems ~suggestions ()
+  ; div ~a:[ a_id results_id ] []
+  ]
+;;
+
+let search_rejected_fragment ~version ~rank ~boxes ~problems ~suggestions =
+  [ search_form ~oob:true ~version ~rank ~boxes ~problems ~suggestions ()
+  ; search_title_element
+  ]
 ;;
 
 (* Examples are live links, not inert syntax. Version-scoped: a parchment
@@ -1101,83 +1274,92 @@ let search_help ~version =
       ~a:[ a_class [ "subtitle" ] ]
       [ txt
           "Every box is one term, and a seed must satisfy all of them. Each example \
-           below is a link. Follow it to see what it returns on this build."
+           below is a link. Follow it to see what it returns on this version."
       ]
   ; h2 [ txt "Items" ]
   ; p
       [ txt "An item is named by its type, not by how it reads on the floor: "
       ; code [ txt "potion:haste" ]
-      ; txt
-          ", where the first half is the base type and the second is the bare sub type. \
-           Type is the stable half: a display name carries enchantment, brand and \
-           artefact epithet, so searching it finds one seed rather than the thousands \
-           that hold the same item."
+      ; txt ", where the first half is the base type and the second is the sub type."
       ]
   ; examples
-      [ [ "potion:haste" ], "a potion of haste, anywhere on the extracted floors"
+      [ [ "potion:haste" ], "a potion of haste"
       ; [ "wand:digging" ], "a wand of digging"
       ; [ "scroll:acquirement" ], "a scroll of acquirement"
       ; ( [ "weapon:executioner's axe" ]
         , "an executioner's axe. A sub type can contain spaces and apostrophes" )
       ]
-  ; h2 [ txt "Floor or shop" ]
+  ; h2 [ txt "Floor and shop" ]
   ; p
       [ txt
           "A price is the only thing separating shop stock from loot lying on the \
-           ground. An unqualified item term matches either; "
-      ; code [ txt "floor " ]
-      ; txt " and "
+           ground, and a term reads the floor unless it says otherwise. "
       ; code [ txt "shop " ]
-      ; txt
-          " ask for one side of that split. Prefer the floor form when the point is that \
-           you can pick the thing up: a shop item costs gold a character on D:2 does not \
-           have."
+      ; txt " in front asks for the priced half instead, one term at a time. "
+      ; code [ txt "floor " ]
+      ; txt " is accepted and asks for exactly what the bare term already asked for."
       ]
   ; examples
-      [ [ "potion:haste" ], "a potion of haste on the floor or behind a counter"
-      ; [ "floor potion:haste" ], "one lying on the ground, not for sale"
-      ; [ "shop wand:digging" ], "a wand of digging in a shop's stock"
+      [ [ "potion:haste" ], "on the floor, shop stock left out"
+      ; [ "shop potion:haste" ], "for sale, and only for sale"
+      ; [ "floor potion:haste" ], "the same search as the bare term"
+      ; [ "shop staff props:Conj" ], "a Conjurations-enhancing staff, for sale"
       ]
-  ; help_note
-      ~label:"Why a floor search can return fewer seeds than you expect"
-      [ p
-          [ txt
-              "The split applies to counts as well. A seed with two potions on the \
-               ground and a third in a shop satisfies "
-          ; code [ txt "3x potion:haste" ]
-          ; txt " but not "
-          ; code [ txt "3x floor potion:haste" ]
-          ; txt
-              ", which wants three you can walk over. So a floor search is not the same \
-               as running the plain search and ignoring the shop hits. It can match \
-               strictly fewer seeds, and that is the question it is asking."
-          ]
+  ; p
+      [ txt "The position leads the whole term, ahead of a base type ("
+      ; code [ txt "shop staff props:Conj" ]
+      ; txt "), and a term takes one position, never both."
+      ]
+  ; p
+      [ txt
+          "Floor and shop divide every item between them, which is what makes this more \
+           than a filter on the results. A floor search is not a both-ways search with \
+           the priced hits crossed off, and it can return strictly fewer seeds: two \
+           potions of haste on the floor and a third behind a counter satisfy neither "
+      ; code [ txt "3x potion:haste" ]
+      ; txt " nor "
+      ; code [ txt "3x shop potion:haste" ]
+      ; txt
+          ". There is no term for \"either one\" — that question has no spelling here at \
+           all."
+      ]
+  ; p
+      [ txt "Two terms sit outside this. "
+      ; code [ txt "name~" ]
+      ; txt
+          " has no shop form, because gold is what binds the early game: an unrand you \
+           can afford in a shop is one you could have afforded off the floor, so the \
+           question is not worth asking and the term always reads the floor. "
+      ; code [ txt "artefact" ]
+      ; txt
+          " goes the other way and still covers both, because \"any artefact at all\" is \
+           a weak enough question that cutting it by price is not the interesting cut. \
+           That second one is worth knowing about rather than discovering: 42.7% of \
+           artefacts sit in a shop against 14.4% of items with a stored name, so "
+      ; code [ txt "artefact" ]
+      ; txt " is the one term that brings shop stock back in quantity."
       ]
   ; h2 [ txt "How many" ]
   ; p
       [ txt "An affix qualifies any term. "
       ; code [ txt "3x " ]
-      ; txt
-          " in front sets a minimum count, and it counts items rather than piles: a \
-           single stack of three satisfies it."
+      ; txt " in front sets a minimum count, across the whole known seed."
       ]
   ; examples
-      [ [ "3x potion:haste" ], "at least three potions of haste"
-      ; [ "3x floor potion:haste" ], "three potions of haste on the ground, not for sale"
+      [ [ "3x potion:haste" ], "at least three potions of haste, all of them on the floor"
+      ; [ "3x shop potion:haste" ], "at least three of them for sale"
       ]
   ; h2 [ txt "Artefacts and names" ]
   ; p
       [ txt "An unrand's display name carries a varying enchantment prefix, so "
       ; code [ txt "name~" ]
       ; txt
-          " matches a substring of it (at least three characters). It reaches only the \
-           names the corpus stores whole (artefacts, unrands and monsters), because an \
-           ordinary item's name is rebuilt from its type rather than kept. For anything \
-           with a type, the type is both faster and more accurate."
+          " matches a substring of it (at least three characters). For anything with a \
+           type, the type is both faster and more accurate."
       ]
   ; examples
-      [ [ "artefact" ], "any artefact, randart or unrand"
-      ; [ "name~Throatcutter" ], "the unrand, at whatever enchantment it rolled"
+      [ [ "artefact" ], "any artefact, randart or unrand, floor or shop alike"
+      ; [ "name~Throatcutter" ], "the unrand, lying on the floor"
       ]
   ; help_note
       ~label:"Why a result sometimes names one item and counts another number"
@@ -1187,8 +1369,8 @@ let search_help ~version =
                and states the total beside it, as in "
           ; code [ txt "+8 storm bow {elec, penet} on D:3 · 16 artefacts" ]
           ; txt
-              ". The bow is one of the sixteen, not sixteen bows. A term matching a \
-               single item quantifies it directly instead ("
+              ". The bow is one of sixteen artefacts, not sixteen bows. A term matching \
+               a single item quantifies it directly instead ("
           ; code [ txt "2 potions of haste ×2" ]
           ; txt ")."
           ]
@@ -1207,43 +1389,89 @@ let search_help ~version =
           ; code [ txt "name~potion of haste" ]
           ; txt " matches nothing, and "
           ; code [ txt "potion:haste" ]
+          ; txt " is the term for that question."
+          ]
+      ]
+  ; h2 [ txt "Artefact properties" ]
+  ; p
+      [ txt "An artefact's properties are searchable by name with "
+      ; code [ txt "props:" ]
+      ; txt ", separated by commas. Every property named must sit on the "
+      ; em [ txt "same" ]
+      ; txt " artefact."
+      ]
+  ; p
+      [ txt "Put a base type in front to say what the artefact has to be. "
+      ; code [ txt "staff props:Conj,Alch" ]
+      ; txt "."
+      ]
+  ; p [ txt "Naming a base type is optional." ]
+  ; examples
+      [ [ "props:Alch" ], "any artefact enhancing Alchemy — staff, ring, robe, anything"
+      ; [ "props:rF,rC" ], "one artefact carrying fire and cold resistance together"
+      ; ( [ "props:rF,rC,rN" ]
+        , "one artefact covering all three of fire, cold and negative energy" )
+      ; [ "staff props:Alch" ], "an Alchemy-enhancing staff"
+      ; [ "staff props:Conj,Alch" ], "a staff enhancing both Conjurations and Alchemy"
+      ; [ "staff props:Conj,Alch,rC" ], "that staff, and it resists cold as well. Rare"
+      ; [ "weapon props:rF" ], "a weapon with"
+      ; [ "weapon props:rF,rC" ], "a weapon with both resistances"
+      ; [ "weapon props:rF,rC,Will" ], "a weapon carrying both plus willpower"
+      ]
+  ; help_note
+      ~label:"Why some combinations return nothing"
+      [ p
+          [ txt "Properties do not roll evenly across item types. School enhancers ("
+          ; code [ txt "Conj" ]
+          ; txt ", "
+          ; code [ txt "Alch" ]
+          ; txt ", "
+          ; code [ txt "Fire" ]
+          ; txt ") never appear on weapons at all, and "
+          ; code [ txt "Slay" ]
           ; txt
-              " is the term for that question, being a lookup on the type itself rather \
-               than a search through every name."
+              " never on staves — so those searches are empty for a reason that has \
+               nothing to do with your seed."
+          ]
+      ]
+  ; help_note
+      ~label:"Why a property has no strength, and why drawbacks are missing"
+      [ p
+          [ txt "A property term matches any positive strength. "
+          ; code [ txt "props:rF" ]
+          ; txt " finds "
+          ; code [ txt "rF+" ]
+          ; txt " and "
+          ; code [ txt "rF++" ]
+          ; txt " alike, and never "
+          ; code [ txt "rF-" ]
+          ; txt "."
+          ]
+      ; p
+          [ txt "Drawbacks are not searchable at all."
+          ; code [ txt "*Rage" ]
+          ; txt " is the exception and can be searched, because it's hilarious."
           ]
       ]
   ; h2 [ txt "Combining terms" ]
   ; p
       [ txt
-          "Every box is another condition the seed must meet. There is no \"or\": two \
-           alternatives are two searches whose results you can compare, which keeps each \
-           one a set intersection an index can answer quickly."
+          "Every box is another condition the seed must meet. There is no OR, you just \
+           have to search twice and compare."
       ]
   ; examples
       [ ( [ "3x scroll:acquirement"; "armour:crystal plate armour" ]
         , "three scrolls of acquirement and a crystal plate armour, on one seed" )
       ; ( [ "shop wand:digging"; "artefact" ]
-        , "a wand of digging for sale, and an artefact somewhere in the extracted floors"
-        )
+        , "a wand of digging for sale, and an artefact anywhere in the extracted floors \
+           — the second term covers shop stock too" )
       ]
   ; h2 [ txt "What a search cannot tell you" ]
   ; p
       [ txt
           "A seed is only searched as deep as it has been extracted, and most are \
-           extracted to D:8. \"No Wyrmbane here\" and \"not searched deep enough to \
-           know\" are different answers, and a term matching nothing may be either. Each \
-           seed's page says how deep it went, and offers to go deeper."
-      ]
-  ; p
-      [ txt
-          "Search covers items. Altars, shops, portals and the other features, and \
-           the            uniques standing on a level, are not terms you can search on \
-           -- but every            seed's page lists all of them, level by level. \
-           Uniques are missing for a            reason worth naming: the useful question \
-           about an early unique is usually            the negative one, and a search \
-           that can only ask for a seed "
-      ; em [ txt "with" ]
-      ; txt " Sigmund answers the opposite of what you wanted."
+           extracted to D:8. \"No Wyrmbane at all\" and \"didn't find it at the depth we \
+           read\" are both possible and a term matching nothing may be either."
       ]
   ; p [ a ~a:[ a_href (version_path version ^ "/search") ] [ txt "← Back to search" ] ]
   ]
@@ -1267,9 +1495,9 @@ let about ~version =
   ; h2 [ txt "What this is" ]
   ; p
       [ txt
-          "Start a seeded game and the dungeon is fixed before you take a step: the same \
-           seed on the same build always lays out the same floors, with the same items \
-           on them. This site reads the first several floors of many seeds ahead of time \
+          "The dungeon is generated before you select your character. The same seed on \
+           the same version always lays out the same floors, with the same items on \
+           them. This site reads the first several floors of many seeds ahead of time \
            and writes down what it found."
       ]
   ; h2 [ txt "The build is part of the seed" ]
@@ -1310,6 +1538,11 @@ let about ~version =
           ~href:"https://github.com/jonesmelton/dcss_seeds"
           "github.com/jonesmelton/dcss_seeds"
       ; txt ". Bug reports, feature requests and PRs welcome."
+      ]
+  ; p
+      [ txt "Developed and maintained by "
+      ; outbound ~href:"https://jonesmelton.com" "Jones Melton"
+      ; txt "."
       ]
   ; p [ a ~a:[ a_href (version_path version ^ "/") ] [ txt "← Back to the seeds" ] ]
   ]

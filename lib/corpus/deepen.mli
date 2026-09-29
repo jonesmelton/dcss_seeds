@@ -27,6 +27,36 @@ module Build : sig
   val of_version : root:string -> version:Query.Version.t -> t
 end
 
+(** Consecutive failed passes. The loop's sleep is a fixed poll interval, so
+    wall-clock between failures says little; the count is what separates the
+    first failure from one that has survived several passes and is not
+    clearing on its own. Any pass that returns without raising resets it. *)
+module Failure_streak : sig
+  type t
+
+  val zero : t
+  val failed : t -> t
+  val passed : t -> t
+  val count : t -> int
+end
+
+(** What the generator was doing when a pass raised: the build being worked
+    and, once a job was claimed, its seed. A failure caught above [one_pass]
+    has lost both, so the loop carries this down to the log. *)
+module Context : sig
+  type t =
+    { version : Query.Version.t
+    ; seed : string option
+    }
+  [@@deriving sexp_of]
+end
+
+(** The generator's failure log line, assembled from the state the loop holds:
+    the consecutive-failure count, the build and seed in flight when known,
+    and the exception's message -- which carries the extended result code and
+    the failing statement. *)
+val failure_message : consecutive:int -> Context.t option -> string -> string
+
 (** The shell pipeline that extracts one seed, identical to what
     [tools/corpus-fill] runs with a chunk of one, so there is one extraction
     path rather than two.
@@ -111,7 +141,11 @@ end
     Returns whether the pass did work, so a failed pass sleeps rather than
     spinning. Nothing here retries: the claim stays claimed and stops being
     refreshed, so reclaim gives it back after [Job.reclaim_after] at no cost in
-    attempts. *)
+    attempts.
+
+    The message is passed through verbatim. A caller that holds the build and
+    seed in flight formats the line through {!failure_message}; [guard] cannot,
+    since one pass folds over every served build. *)
 val guard : on_error:(string -> unit) -> (unit -> bool) -> bool
 
 (** Where the fill lock for [db_path] lives.

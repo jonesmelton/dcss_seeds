@@ -32,6 +32,13 @@ https://github.com/crawl/tiles (`ARTISTS.md`).
 
 Files are flattened into these directories, keeping their upstream basenames.
 
+`gateways/enter_zot_open.png` is additionally the source of the site favicon:
+`static/favicon.ico` (16 and 32px frames), `static/favicon-16.png`,
+`static/favicon-32.png` and `static/apple-touch-icon.png` are nearest-neighbour
+resamples of it, under the same terms as the tile. The touch icon is flattened
+onto the dark theme's `--paper` because iOS composites transparency onto black,
+which would erase the gate's own black interior.
+
 Nothing else from `rltiles/` is vendored: no walls, floors, ordinary monsters,
 player dolls, or UI chrome. This project renders no map, so those tiles have no
 use here.

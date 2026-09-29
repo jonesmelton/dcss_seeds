@@ -1150,14 +1150,14 @@ h1 .copy-seed {
   min-width: 0;
 }
 
-.search .terms li {
+.search .terms > li {
   display: flex;
   align-items: stretch;
   gap: 0.35rem;
   max-width: 28rem;
 }
 
-.search .terms li + li {
+.search .terms > li + li {
   margin-top: 0.35rem;
 }
 
@@ -1175,8 +1175,72 @@ h1 .copy-seed {
   white-space: nowrap;
 }
 
+/* A box's problem note takes the row's second line, so the box and its remove
+   button keep their widths whether or not a note sits under them. */
+.search .terms > li {
+  flex-wrap: wrap;
+}
+
+.search .terms li > input[type="text"] {
+  flex: 1 1 0;
+}
+
+.term-problem {
+  flex-basis: 100%;
+  color: var(--ink-2);
+}
+
+.term-problem p {
+  margin: 0.25rem 0 0;
+}
+
+.term-problem .offers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.9rem;
+  list-style: none;
+  margin: 0.15rem 0 0.5rem;
+  padding: 0;
+  line-height: 1.4;
+}
+
+.term-problem .offers li {
+  margin: 0;
+}
+
+.resolved {
+  margin: 0 0 0.35em;
+}
+
+/* Red is for failed input (docs/style.md), and it only reinforces: the box's
+   note says what failed in words. A wider border than the resting 0.5px so the
+   change does not rest on hue alone. */
+.search input[type="text"][aria-invalid="true"] {
+  border: 1.5px solid var(--danger);
+}
+
+.search-problems {
+  border-left: 3px solid var(--danger);
+  padding-left: 1rem;
+  margin: 0 0 1rem;
+}
+
+.search-problems > p {
+  margin: 0;
+  color: var(--danger);
+}
+
+.search-problems ul {
+  margin: 0.25rem 0 0;
+  padding-left: 1.1rem;
+}
+
 /* Same reason as the term boxes: this line spells out the syntax, `name~...`
-   included, and the serif face ligates `~` with the letter after it. */
+   included, and the serif face ligates `~` with the letter after it. The
+   problem notes and the resolution echo quote terms back the same way. */
+.term-problem,
+.search-problems,
+.resolved,
 #search-help {
   font-variant-ligatures: none;
   font-feature-settings: "liga" 0, "clig" 0;

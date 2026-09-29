@@ -37,3 +37,30 @@
  (libraries seed_corpus core core_unix.command_unix)
  (preprocess
   (pps ppx_jane)))
+
+(executable
+ (name index)
+ (public_name corpus-index)
+ (package seed_corpus)
+ (modules index)
+ (libraries seed_corpus core core_unix.command_unix)
+ (preprocess
+  (pps ppx_jane)))
+
+(executable
+ (name search_equiv)
+ (public_name corpus-search-equiv)
+ (package seed_corpus)
+ (modules search_equiv)
+ (libraries seed_corpus seed_corpus.web core core_unix.command_unix)
+ (preprocess
+  (pps ppx_jane)))
+
+(executable
+ (name search_bench)
+ (public_name corpus-search-bench)
+ (package seed_corpus)
+ (modules search_bench)
+ (libraries seed_corpus seed_corpus.web core core_unix.command_unix)
+ (preprocess
+  (pps ppx_jane)))

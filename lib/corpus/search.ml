@@ -17,15 +17,164 @@ module Item_type = struct
   ;;
 end
 
+module Prop = struct
+  (* Drawbacks are not searchable, and the reason is about the game rather than
+     about this code. Nobody chooses a seed for a drawback: you find out about
+     *Slow when you pick the item up, and it changes whether you keep it, not
+     which seed you play. The forward question has no audience -- unlike the
+     uniques dropped 2026-09-10, where the wanted question was the negative one
+     and search has no negation. There is nothing here waiting on an operator.
+
+     The sigils are how the list is derived, not why. Crawl prefixes a drawback
+     that fires at random with '*', one that fires on a trigger with '^', and a
+     capability it removes with '-'; [Bane] carries no sigil and is one anyway.
+     A new drawback will arrive sigilled and belongs here, but a sigil is
+     evidence, not the rule -- see [Rage].
+
+     [nupgr] is excluded for a third reason: ARTP_NO_UPGRADE is an engine flag
+     telling the game not to re-roll an artefact that manages its own
+     properties, and every carrier in the corpus is such an unrand (Wyrmbane,
+     the Octopus King set, Cigotuvi's embrace). It is never shown to a player
+     and is not a property in any sense a reader would mean. *)
+  let excluded =
+    [ "*Corrode"
+    ; "*Noise"
+    ; "*Silence"
+    ; "*Slow"
+    ; "^Contam"
+    ; "^Drain"
+    ; "^Fragile"
+    ; "-Cast"
+    ; "-Tele"
+    ; "Bane"
+    ; "nupgr"
+    ]
+  ;;
+
+  (* Sigilled and kept: berserk on hit is a build to commit to rather than a
+     drawback to live with, which is what the rest of [excluded] are. Niche, and
+     someone looking for it is looking for exactly it. *)
+  let searchable prop = not (List.mem excluded prop ~equal:String.equal)
+
+  (* Why a property was refused, in the reader's terms. [nupgr] is not a
+     drawback and saying so would be wrong twice over -- it tells the reader
+     their item is worse than it is, and it invites them to look for the
+     "good" version of a flag that has none. *)
+  let why_excluded prop =
+    if String.equal prop "nupgr"
+    then
+      Some
+        "an internal flag on artefacts that upgrade themselves, not a property the game \
+         ever shows you"
+    else if not (searchable prop)
+    then Some "a drawback, and nobody picks a seed for one"
+    else None
+  ;;
+
+  (* Crawl's artefact property vocabulary, which is closed: [entry_props] holds
+     one row per property per item and the whole set is 55 names on a 10k
+     corpus. Listed rather than read from the corpus because the parse boundary
+     is synchronous and cannot wait on a query, and because an unknown name has
+     to be *rejected* -- a property search that runs and matches nothing tells
+     the reader this build holds no such artefact, which is a false statement
+     about the corpus rather than an answer.
+
+     The concrete case: [Dream.queries] decodes a raw '+' to a space, so a
+     hand-typed "props:Conj+Alch" arrives as one property named "Conj Alch".
+     Without this it searched, found nothing, and said so.
+
+     A crawl release adding a property would be silent in the same direction --
+     present in the corpus, on real artefacts, unsearchable with no error --
+     so [tools/corpus-check] diffs this list against the corpus and warns. *)
+  let known =
+    [ "*Corrode"
+    ; "*Noise"
+    ; "*Rage"
+    ; "*Silence"
+    ; "*Slow"
+    ; "+Blink"
+    ; "+Inv"
+    ; "-Cast"
+    ; "-Tele"
+    ; "AC"
+    ; "Air"
+    ; "Alch"
+    ; "Archmagi"
+    ; "BAcc"
+    ; "BDam"
+    ; "Bane"
+    ; "Clar"
+    ; "Conj"
+    ; "Delay"
+    ; "Dex"
+    ; "EV"
+    ; "Earth"
+    ; "Fire"
+    ; "Fly"
+    ; "Forge"
+    ; "HP"
+    ; "Harm"
+    ; "Hexes"
+    ; "Ice"
+    ; "Int"
+    ; "MP"
+    ; "Necro"
+    ; "RMsl"
+    ; "Rampage"
+    ; "Regen"
+    ; "RegenMP"
+    ; "SH"
+    ; "SInv"
+    ; "Slay"
+    ; "Stlth"
+    ; "Str"
+    ; "Summ"
+    ; "Tloc"
+    ; "Will"
+    ; "^Contam"
+    ; "^Drain"
+    ; "^Fragile"
+    ; "nupgr"
+    ; "rC"
+    ; "rCorr"
+    ; "rElec"
+    ; "rF"
+    ; "rMut"
+    ; "rN"
+    ; "rPois"
+    ]
+  ;;
+
+  let is_known prop = List.mem known prop ~equal:String.equal
+
+  (* Case-insensitive, so "conj" and "rf" resolve. Crawl's spellings mix case
+     within a name ([rF], [SInv], [BAcc]) and no reader should have to reproduce
+     that from memory. Returns the canonical spelling, which is what gets stored
+     and echoed back. *)
+  let canonical prop = List.find known ~f:(fun known -> String.Caseless.equal known prop)
+
+  (* Grants ('+Blink', '+Inv') keep their sigil and stay: a granted capability
+     is a reason to pick a seed. *)
+  let min_value = 1
+end
+
 module Criterion = struct
+  type position =
+    | Floor
+    | Shop
+  [@@deriving compare, equal, sexp_of]
+
   type t =
-    | Item of Item_type.t
-    | Shop_item of Item_type.t
-    | Floor_item of Item_type.t
-    | Name_like of string
+    | Item of Item_type.t * position
+    | Name_like of string * position
     | Feature of string
     | Artefact
     | Unique of string
+    | Props of
+        { base_type : string option
+        ; props : string list
+        ; position : position
+        }
   [@@deriving compare, sexp_of]
 
   (* [feat] is crawl's machine vocabulary ("altar_trog"): stable enough to index
@@ -47,14 +196,44 @@ module Criterion = struct
     | _ -> humanise feat
   ;;
 
+  (* "a staff with Conj and Alch", not "a staff, and something with Conj": the
+     properties are all on one item, so the prose has to join them to the noun
+     rather than list them beside it. *)
+  let props_to_string ~base_type ~props =
+    let noun = Option.value base_type ~default:"an artefact" in
+    match props with
+    | [] -> noun
+    | [ one ] -> sprintf "%s with %s" noun one
+    | props ->
+      let last = List.last_exn props in
+      let rest = List.drop_last_exn props in
+      sprintf "%s with %s and %s" noun (String.concat rest ~sep:", ") last
+  ;;
+
+  (* Only [Shop] is qualified. Prose echoes the query back and the query leaves
+     the floor default unspoken, so spelling it per term turns a three-term
+     search into "potion of haste on the floor, wand of digging on the floor, an
+     artefact". The default is stated once per page instead. *)
+  let position_to_string = function
+    | Floor -> ""
+    | Shop -> " in a shop"
+  ;;
+
+  (* [Floor] is never spelled back, so the round-trip is lossy in spelling and
+     exact in meaning: [floor potion:haste] returns as [potion:haste]. *)
+  let position_to_query_string = function
+    | Floor -> ""
+    | Shop -> "shop "
+  ;;
+
   let to_string = function
-    | Item item -> Item_type.to_string item
-    | Shop_item item -> sprintf "%s in a shop" (Item_type.to_string item)
-    | Floor_item item -> sprintf "%s on the floor" (Item_type.to_string item)
-    | Name_like s -> sprintf "named like %S" s
+    | Item (item, position) -> Item_type.to_string item ^ position_to_string position
+    | Name_like (s, position) -> sprintf "named like %S%s" s (position_to_string position)
     | Feature feat -> feature_to_string feat
     | Artefact -> "an artefact"
     | Unique name -> name
+    | Props { base_type; props; position } ->
+      props_to_string ~base_type ~props ^ position_to_string position
   ;;
 
   (* The noun for counting several of what this criterion matches. [Artefact] is
@@ -62,7 +241,10 @@ module Criterion = struct
      stack name crawl rendered, and a name fragment names no category at all. *)
   let plural_noun = function
     | Artefact -> Some "artefacts"
-    | Item _ | Shop_item _ | Floor_item _ | Name_like _ | Feature _ | Unique _ -> None
+    (* Every match is an artefact, whatever base type it sits on: only an
+       artefact carries properties. *)
+    | Props _ -> Some "artefacts"
+    | Item _ | Name_like _ | Feature _ | Unique _ -> None
   ;;
 
   (* Constantly true since interning: a substring match runs over the string
@@ -70,8 +252,7 @@ module Criterion = struct
      lookup there rather than a scan. Kept, with [partition_terms], because a
      future criterion no index serves would need exactly this. *)
   let is_indexed = function
-    | Name_like _ | Item _ | Shop_item _ | Floor_item _ | Feature _ | Artefact | Unique _
-      -> true
+    | Name_like _ | Item _ | Feature _ | Artefact | Unique _ | Props _ -> true
   ;;
 
   (* Three characters is a hard precondition, not a tuning knob: the substring
@@ -82,14 +263,30 @@ module Criterion = struct
      ["wyr"]). *)
   let min_name_like_length = 3
 
-  (* [Name_like] is the sole survivor, and the trigram index did not change
-     that. It made selective fragments fast (7.02s -> 0.21s) but a common one
-     slower: [name~dragon] matches 33,523 names and costs 9.9s at 1.3M, because
-     the cost is the candidate set the dictionary hands on, not the lookup.
-     Every other criterion is a single covering seek. *)
+  (* No [Name_like] is cheap. The trigram index made selective fragments fast
+     (7.02s -> 0.21s) but the cost is the candidate set the dictionary hands on,
+     not the lookup, so fragment length does not bound it: [name~the] is three
+     characters and 14.2s. Nor does the search store cover the gap: it resolves
+     a fragment to seeds before merging, which is that same candidate set, and
+     declines a broad one to the SQL fallback.
+
+     Inline, that fallback blocks the scheduler thread rather than awaiting on
+     it, so [Lwt.pick]'s timer is armed against an already-resolved promise and
+     the search timeout cannot fire at all. Ten concurrent fragments took index
+     p99 from 0.29s to 48.2s with no 503 (prod, 1.3M, 0.34.1, 2026-09-21). A
+     selective fragment being fast today is a property of the corpus, not of the
+     query. Every other criterion is a single covering seek. *)
   let is_cheap = function
-    | Name_like s -> String.length s >= min_name_like_length
-    | Item _ | Shop_item _ | Floor_item _ | Feature _ | Artefact | Unique _ -> true
+    | Name_like _ -> false
+    (* With a base type the driver is that seek and the properties are filters
+       on what it returns. Without one there is nothing to seek: the query
+       drives [entries_seed] and the [limit] does not end it early, because a
+       rare property pair matches a handful of seeds and the scan runs to the
+       end of the build looking for more. Linear in corpus size regardless of
+       page size (measured: full scan of the version at 10k, plan unchanged
+       under the keyset shape), so it belongs off the scheduler thread. *)
+    | Props { base_type; props = _; position = _ } -> Option.is_some base_type
+    | Item _ | Feature _ | Artefact | Unique _ -> true
   ;;
 end
 
@@ -109,15 +306,27 @@ module Term = struct
   let to_query_string { criterion; min_count } =
     let criterion =
       match criterion with
-      | Criterion.Item { base_type; sub_type } -> sprintf "%s:%s" base_type sub_type
-      | Criterion.Shop_item { base_type; sub_type } ->
-        sprintf "shop %s:%s" base_type sub_type
-      | Criterion.Floor_item { base_type; sub_type } ->
-        sprintf "floor %s:%s" base_type sub_type
-      | Criterion.Name_like fragment -> sprintf "name~%s" fragment
+      | Criterion.Item ({ base_type; sub_type }, position) ->
+        sprintf "%s%s:%s" (Criterion.position_to_query_string position) base_type sub_type
+      (* There is no [shop name~] spelling for [Params] to parse back, so a
+         [Shop] position here has nowhere to go: the position is dropped rather
+         than emitted unparseable. *)
+      | Criterion.Name_like (fragment, _) -> sprintf "name~%s" fragment
       | Criterion.Feature feat -> feat
       | Criterion.Artefact -> "artefact"
       | Criterion.Unique name -> sprintf "unique:%s" name
+      (* Comma, not '+': '+Blink' and '+Inv' are property names, so a '+'
+         separator spells a set holding one as "Conj++Blink". A comma cannot
+         collide -- no property name contains one. It also sidesteps an encoding
+         trap, since [Dream.queries] decodes a raw '+' to a space and only
+         "%2B" survives; emitted links percent-encode either way, but readers
+         hand-edit these URLs. *)
+      | Criterion.Props { base_type; props; position } ->
+        let props = String.concat props ~sep:"," in
+        let position = Criterion.position_to_query_string position in
+        (match base_type with
+         | None -> sprintf "%sprops:%s" position props
+         | Some base_type -> sprintf "%s%s props:%s" position base_type props)
     in
     if min_count > 1 then sprintf "%dx %s" min_count criterion else criterion
   ;;

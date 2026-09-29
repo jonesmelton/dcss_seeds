@@ -19,6 +19,23 @@ let%expect_test "a whole document renders to its closing tag" =
   [%expect {| closes: true |}]
 ;;
 
+(* The .ico stays first as the fallback for browsers that ignore rel=icon PNGs;
+   the rest pick by sizes, which must serialise as WxH or they are skipped. *)
+let%expect_test "the head offers every icon the static tree ships" =
+  let html =
+    Seed_web.render_html (Seed_web.Index.render ~title:"t" [ Tyxml.Html.txt "x" ])
+  in
+  let re = Re.Pcre.re "<link[^>]*icon[^>]*>" |> Re.compile in
+  Re.all re html |> List.iter ~f:(fun g -> print_endline (Re.Group.get g 0));
+  [%expect
+    {|
+    <link rel="icon" href="/favicon.ico" type="image/x-icon"/>
+    <link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32"/>
+    <link rel="icon" href="/static/favicon-16.png" type="image/png" sizes="16x16"/>
+    <link rel="apple-touch-icon" href="/static/apple-touch-icon.png"/>
+    |}]
+;;
+
 module Job = Seed_corpus.Job
 module Query = Seed_corpus.Query
 
@@ -72,7 +89,7 @@ let%expect_test "a deep seed states its depth and offers nothing" =
   let html = note ~depth:deep ~job:None ~csrf:None () in
   print_endline html;
   [%expect
-    {| <div id="depth" class="depth-note"><p>Searched down to <strong>D:14</strong>, past the usual cap. The branches below are the whole of it.</p></div> |}]
+    {| <div id="depth" class="depth-note"><p>Searched down to <strong>D:14</strong>, past the usual cap.</p></div> |}]
 ;;
 
 (* No progress bar in either waiting state: crawl emits nothing incremental.
@@ -143,10 +160,10 @@ let%expect_test "a queued job says where it is in the line" =
       sentence);
   [%expect
     {|
-    none   Queued for a deeper search, down to Swamp:4. Waiting for a free generator.
-    0      Queued for a deeper search, down to Swamp:4. Waiting for a free generator. It is next in line for this build.
-    1      Queued for a deeper search, down to Swamp:4. Waiting for a free generator. One request is ahead of it on this build.
-    7      Queued for a deeper search, down to Swamp:4. Waiting for a free generator. 7 requests are ahead of it on this build.
+    none   Queued for a deeper search, down to Swamp:4. Waiting for a free dungeon generator.
+    0      Queued for a deeper search, down to Swamp:4. Waiting for a free dungeon generator. It is next in line for this build.
+    1      Queued for a deeper search, down to Swamp:4. Waiting for a free dungeon generator. One request is ahead of it on this build.
+    7      Queued for a deeper search, down to Swamp:4. Waiting for a free dungeon generator. 7 requests are ahead of it on this build.
     |}]
 ;;
 
@@ -740,5 +757,66 @@ let%expect_test "a heterogeneous hit states its total apart from its exemplar" =
     {|
     <ul class="hits"><li>+8 storm bow {elec, penet} on <span class="sc">D:3</span><span class="hit-total">16 artefacts</span></li>
     <ul class="hits"><li>2 potions of haste ×2 on <span class="sc">D:3</span></li>
+    |}]
+;;
+
+(* The datalist is ~580 options the browser filters by prefix, so nothing about
+   properties is reachable until the reader has typed "props". The placeholder
+   is the only surface visible before the first keystroke, and it names a
+   property form for that reason. It appears on an empty form only: under an
+   existing term a term-shaped placeholder reads as a duplicate of it. *)
+let%expect_test "the empty form is placeheld; a form with terms is not" =
+  let render search =
+    Seed_web.Views.search_page
+      ~search
+      ~suggestions:None
+      ~rank:Search.Rank.default
+      ~more:`End
+      []
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  let empty = render (Search.create ~version:v ()) in
+  printf
+    "empty form placeheld:  %b\n"
+    (String.is_substring empty ~substring:"placeholder");
+  printf "names a prop form:     %b\n" (String.is_substring empty ~substring:"props:Conj");
+  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
+  let filled = render (Search.create ~version:v ~terms:[ term "potion:haste" ] ()) in
+  printf
+    "blank under a term:    %b\n"
+    (not (String.is_substring filled ~substring:"placeholder"));
+  [%expect
+    {|
+    empty form placeheld:  true
+    names a prop form:     true
+    blank under a term:    true
+    |}]
+;;
+
+(* Property suggestions are labelled, since a bare "props:Conj" in a list of
+   item pairs does not say what kind of thing it is. Item pairs are not: they
+   are the datalist's bulk and a label on every row is noise. *)
+let%expect_test "property suggestions carry a label, item pairs do not" =
+  let html =
+    Seed_web.Views.search_page
+      ~search:(Search.create ~version:v ())
+      ~suggestions:(Some [ "potion:haste"; "props:Conj" ])
+      ~rank:Search.Rank.default
+      ~more:`End
+      []
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  printf
+    "prop labelled:    %b\n"
+    (String.is_substring html ~substring:"Conj — artefact property");
+  printf
+    "pair unlabelled:  %b\n"
+    (not (String.is_substring html ~substring:"potion:haste\" label"));
+  [%expect
+    {|
+    prop labelled:    true
+    pair unlabelled:  true
     |}]
 ;;

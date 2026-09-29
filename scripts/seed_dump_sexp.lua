@@ -144,7 +144,23 @@ local version = crawl.version()
 explorer.reset_to_defaults()
 explorer.quiet = true
 
-local item_notable = explorer.item_notable
+-- item_ignore_boring judges gear by plus and brand alone, and an unrand is
+-- gear: the 11 unrands that are +0 or lower and unbranded (fencer's gloves,
+-- the skull of Zonguldrok, every ego-less orb) could never reach the corpus,
+-- along with ~9% of randart armour, which rolls +0 far more often than a
+-- reader expects. An artefact is notable because it is an artefact.
+--
+-- The same filter also drops anything useless to the scanning character, which
+-- is a fact about this script's wizard and not about the seed. Bardings are the
+-- case that costs a reader something real: they are rare, they decide a naga or
+-- armataur game, and every one of them was being discarded.
+local function item_notable_default(item)
+    return item.artefact
+        or item.sub_type == "barding"
+        or explorer.item_ignore_boring(item)
+end
+
+local item_notable = item_notable_default
 if args["-all-items"] ~= nil then item_notable = function (_) return true end end
 if args["-artefacts"] ~= nil then item_notable = explorer.arts_only end
 local all_monsters = args["-mon-items"] ~= nil
@@ -230,7 +246,7 @@ end
 -- neither a position nor a size a reader asks for. The accumulator therefore
 -- sits outside the item_notable filter -- the piles must be counted and must
 -- never become rows.
-local function scan_position(p, cats, totals)
+local function scan_position(p, cats, totals, prices)
     local stack = dgn.items_at(p.x, p.y)
     if stack then
         for _, item in ipairs(stack) do
@@ -245,9 +261,10 @@ local function scan_position(p, cats, totals)
 
     local shop = dgn.shop_inventory_at(p.x, p.y)
     if shop then
-        for _, entry in ipairs(shop) do
+        local costs = assert(prices[p.x .. "," .. p.y])
+        for i, entry in ipairs(shop) do
             if item_notable(entry[1]) then
-                table.insert(cats.items, item_record(entry[1], p, entry[2], nil))
+                table.insert(cats.items, item_record(entry[1], p, costs[i], nil))
             end
         end
     end
@@ -296,7 +313,27 @@ local function scan_position(p, cats, totals)
     end
 end
 
+-- The price charged, read before wiz.identify_all_items(): antique shops leave
+-- their stock unidentified, and item_value prices an identified item by brand
+-- and plus instead of by its glowing/runed appearance. Identification does not
+-- reorder stock, so position plus stock index finds the same item again.
+local function shop_prices()
+    local prices = { }
+    local gxm, gym = dgn.max_bounds()
+    for p in iter.rect_iterator(dgn.point(1, 1), dgn.point(gxm - 2, gym - 2)) do
+        local shop = dgn.shop_inventory_at(p.x, p.y)
+        if shop then
+            local costs = { }
+            for i, entry in ipairs(shop) do costs[i] = entry[2] end
+            prices[p.x .. "," .. p.y] = costs
+        end
+    end
+    return prices
+end
+
 local function scan_level()
+    local prices = shop_prices()
+
     -- must run per level: item.pluses() returns false, not a number, for
     -- unidentified items, and identification does not persist across levels.
     wiz.identify_all_items()
@@ -314,7 +351,7 @@ local function scan_level()
 
     local gxm, gym = dgn.max_bounds()
     for p in iter.rect_iterator(dgn.point(1, 1), dgn.point(gxm - 2, gym - 2)) do
-        scan_position(p, cats, totals)
+        scan_position(p, cats, totals, prices)
     end
 
     return cats, totals

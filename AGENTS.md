@@ -37,8 +37,22 @@ make report IN=out/trunk-batch.jsonl       # re-render an existing dump
 
 Task runner is [`just`](https://github.com/casey/just); local opam switch in `_opam/` on OCaml 5.5.0.
 
+**The toolchain is pinned, and the expect tests depend on it.** OCaml packages
+come from `seed_corpus.opam.locked` (`just deps` installs `--locked`; run
+`just lock` after changing `depends` in `dune-project`). SQLite is 3.53.4,
+built from the release tarball into `builds/sqlite/` by
+`tools/provision-sqlite` and linked statically, on the laptop and the host
+alike --- never the system library, which differs per machine: macOS ships a
+patched pre-release, Ubuntu an older release, and query-plan wording and
+float-to-text rendering differ between them. The bindings record the
+`builds/sqlite` path at install time, so wiping `builds/` silently relinks the
+system library on the next build; `test/test_toolchain.ml` asserts the version
+so that surfaces as one clear failure instead of scattered expect diffs.
+Bumping SQLite: change `tools/provision-sqlite` and that expect together, then
+`just sqlite-relink`.
+
 ```sh
-just deps          # opam install . --deps-only --with-test --with-dev-setup
+just deps          # build the pinned sqlite, then opam install --locked
 just build         # dune build --profile dev (warnings-as-errors)
 just test          # dune runtest
 just promote       # accept changed expect-test output
@@ -47,12 +61,13 @@ just ci            # fmt-check + build + test — the merge gate
 just db corpus.db  # create a database from schema.sql
 just run           # dune exec bin/main.exe — the web server (port 8430)
 just dev           # rebuild + restart on save; tees to /tmp/seed-explorer-dev.log
+just index corpus.db  # build the seed-granular search store (bin/index.ml, corpus-index)
 ```
 
 `SEED_PORT`, `SEED_INTERFACE`, and `SEED_DB` override the defaults (8430,
 localhost, `corpus.db`). The server exits if the corpus file is missing.
 
-`SEED_ORIGIN` (default `https://dcss.jonesmelton.com`) is the absolute origin
+`SEED_ORIGIN` (default `https://dcss.garden`) is the absolute origin
 `/sitemap.xml` and the `Sitemap:` line in `/robots.txt` are built from --- the
 only place the app names its own host, since every other link it emits is
 relative. A trailing slash is stripped. Set it on any deployment that is not
@@ -65,11 +80,11 @@ SEED_POOL_SIZE)`) --- the two must agree, since a pool bigger than the thread
 cap sits behind a scheduler that never sends it enough concurrent work to use
 it. See `lib/corpus/pool.mli`.
 
-`SEED_SEARCH_TIMEOUT` (default 30, seconds) bounds how long a search request
+`SEED_SEARCH_TIMEOUT` (default 60, seconds) bounds how long a search request
 waits before the handler abandons it and answers the styled 503. Generous by
 design: it sheds pathology, not slow-but-working searches. Two limits are worth
 knowing, both recorded in `Params.search_timeout`. It does not cancel the query
---- sqlite3-ocaml 5.4.1 binds neither `sqlite3_interrupt` nor a progress
+--- sqlite3-ocaml 5.4.2 binds neither `sqlite3_interrupt` nor a progress
 handler, so an abandoned search runs to completion still holding its pool
 connection --- and it covers only the detached path, since a search
 `search_is_cheap` calls cheap runs inline on the scheduler thread where no Lwt
@@ -81,8 +96,19 @@ pool and is no longer load-bearing for the reason it was added --- a
 leading-wildcard `like`, `floor <item>` and `altar_xom` all
 used to stall the app's one shared reader connection, and now run detached
 against `Pool` instead --- but it stays available as a blunt escape hatch.
-Off in prod since the pool and the Floor_item covering index landed and were
+Off in prod since the pool and the `cost is null` covering index landed and were
 measured live (fossil ticket 093f82b4a9, 2026-09-03).
+
+`SEED_DISABLE_DEEPEN=1` withdraws the deepen offer and refuses the POST, using
+the same copy a live fill uses ("this build is busy building out the corpus").
+It is required rather than redundant with the fill lock: `Deepen.fill_lock_path`
+derives the lock's path from the database path, so a second process reading a
+frozen *copy* of the corpus watches a lock file the live fill never touches,
+sees no lock, and would enqueue happily. It also makes `/health` stop treating
+generator liveness as a health signal — no generator will ever heartbeat on a
+read-only instance, so that would 503 forever — and answer 200 naming the
+served builds the corpus actually holds seeds for instead, or 503 `no seeds`
+when it holds none (fossil ticket 0c6422bfc2, 2026-09-15).
 
 Tests are inline expect tests in a `test_seed_corpus` library; `dune runtest` is the whole suite. To re-run when nothing changed: `just test-force`.
 
@@ -98,9 +124,11 @@ Filling the corpus:
 ```sh
 tools/corpus-fill 0.34.1 -n 100000            # the batch driver; see docs/extraction.md
 tools/corpus-fill 0.34.1 -n 5000 --skip-done  # resume an interrupted fill
-tools/corpus-check 0.34.1 --range 1-100000    # verify it landed completely
+tools/corpus-check 0.34.1 --range 1-100000    # verify it landed completely; also warns on artefact properties the code does not know
 tools/corpus-reindex --db corpus.db           # add tables/indexes schema.sql gained since
 tools/corpus-fts-rebuild --db corpus.db       # rebuild the name~ substring index; REQUIRED after a fill
+just index corpus.db                          # rebuild the seed-granular search store; safe to defer
+just equiv corpus.db 0.34.1                   # store vs SQL path: whole sets, ranked depths, paging
 tools/fill-rate corpus-fill-progress.tsv      # the rate curve of a fill, binned
 ```
 
@@ -123,6 +151,37 @@ index; this only repopulates it, and says so if it is missing:
 ```sh
 tools/corpus-fts-rebuild --db corpus.db
 ```
+
+A fill also stales a second, separate structure: the seed-granular search
+store (`seed_ordinals`, `search_criteria`, `search_postings`,
+`search_index_state`; `bin/index.ml` → `corpus-index`, run as `just index`;
+see `lib/corpus/search_index.mli`). It is one posting list per criterion,
+keyed by a dense per-version seed ordinal, and answers "which seeds contain
+X" without scanning `entries` — the derived, seed-granular counterpart to
+`corpus-fts-rebuild`'s dictionary index, built and staled the same way. The
+failure mode is the opposite of `name~`'s, though: **a stale search store is
+not refused.** Search falls back to the SQL predicate path, which is the same
+semantics implemented twice, just slower — so unlike `corpus-fts-rebuild`,
+running this is safe to defer. The currency mark is a per-version *seed count*
+(`search_index_state.built_seeds` against `seed_fills`), so a fill or a
+`corpus-drop-seeds` stales that version's store and **a deepen does not**:
+deepening changes no seed count, and the seeds it did change — every seed
+deeper than the `seed_ordinals.built_depth` the build recorded — are subtracted from the posting stream and re-derived
+from SQL per search (`Search_index.page`'s overlay; sound because deepening is
+a strict prefix extension, see `fill_depth.mli`). Deepening therefore needs no
+rebuild and `bin/deepen.ml` has no index step. Past 5,000 deep seeds the store
+declines and search takes the SQL path whole, which a rebuild clears: it
+records every seed's depth, emptying the cohort. A fill still needs one — there is no incremental
+catch-up for new seeds:
+
+```sh
+just index corpus.db
+```
+
+`corpus-index` reports, per version, the seed/criterion/posting/block counts
+and store bytes it landed, and whether the store is now current. Measured
+(10,000 seeds, 0.34.1, `D:8`, local, 2026-09-15): 1,294 criteria, 711,224
+postings in 2,319 blocks, 2,150,361 bytes, 1.1s wall.
 
 After a fill lands (and after `corpus-check` / `corpus-reindex` above):
 
@@ -174,6 +233,7 @@ util/fake_pty ./crawl -script seed_dump_sexp.lua -seed 5000 -count 500 -depth D:
 - `docs/corpus-scaling.md` — what bounds corpus size: disk does not bind, compute and DCSS's release cadence do. Read before planning a fill larger than the current one, or before assuming a version's corpus is permanent.
 - `docs/single-writer.md` — **thinking, not decided.** Why corpus write contention (`BUSY`) happens, the single-writer-process idea it prompted, and what would have to be true before building it. Read before proposing anything about the write path or the fill lock.
 - `docs/heat.md` — the seed heat model: the tier axis, weight vs. surprise, the bands, and what heat deliberately is not.
+- `docs/slow-queries.md` — searches that were slow or rejected in production, in the words of the question the reader was asking. Read alongside the search-cost note below when picking what to fix first: it says which expensive shapes people actually type.
 - `README.md` — the extraction pipeline, output format, and measured depth-cost curve.
 
 Interface files carry the rest. `.mli` files are where the domain facts are written down — `record.mli`, `db.mli`, `heat.mli`, `weight.mli`, `job.mli`, `deepen.mli` in particular.
@@ -240,7 +300,9 @@ These are in the schema and the readme, and they are the ones that produce plaus
 - **There is no `text` or `kind` column, and `name` is stored only where it cannot be derived.** `text` was a byte-for-byte duplicate of `name` on all 15,336,469 rows. Its one job is standing in for a feature's missing `name` — features carry `feat` + `text` and no `name` at all — and that substitution happens in `Reader` before storage, so the wire format still carries it. `kind` was `cat` minus the plural, 1:1 on every row; it is still *required* on the wire (it validates a record's shape at the parse boundary) and still not stored. `name` went the same way for the rows whose spelling the other columns already fix: `entries.name_id` is **null exactly where `Display_name.of_entry` answers `Derived`**, and set only for the irreducible tail — artefacts, monsters, unrecognised feats. Measured 92% of rows store no name (400 seeds, 0.34.1, D:8, 2026-08-28).
 - **Every index on `entries` leads with `version_id`.** Three that did not — `entries_name`, `entries_feat`, `entries_artefact` — were dropped: the `entries_search_*` indexes are strictly better prefixes and the planner never chose them. Measured 669 MB, 16% of the database, with no change to results or timings. Don't add a non-version-leading index back without a query that needs one.
 - **A query's column list is one value, and every offset resolves through it by name.** `Db.Columns` holds the list; `seed_levels_columns` generates `seed_levels_sql`'s select list and resolves `entry_of_row`'s reads, `insert_entry_columns` generates `insert_entry_sql` and numbers `bind_entry`'s binds (SQLite numbers parameters from one, the list from zero). A reorder therefore moves the SQL and the reader together, and an unknown name raises rather than reading a neighbour. `Columns.check_header` verifies the prepared statement's own header on first use, so a column list edited apart from the skeleton around it errors instead of returning a shifted row. What the mechanism cannot catch is a field wired to the wrong *name* on one side, or the read and write lists disagreeing with each other — so a column-list change still ends with the round-trip expect test in `test_db.ml`, which exists for exactly that.
-- **A search criterion is a type, not a name.** A name is a display string carrying enchantment and brand (`+3 greatsling "Punk" {acid, rCorr}`) — ~18x the cardinality of `(base_type, sub_type)`, and nearly every artefact name is unique, so exact-name search finds one seed or none. `sub_type` is the bare type (`haste`, not `potion of haste`); `base_type` disambiguates it. `Name_like` is the substring escape hatch for unrands. It is no longer unindexed — the `like` runs over the `strings` dictionary, served by the `strings_fts` trigram index, and the ids it yields are covering seeks on `entries_search_name` — and it no longer matches a *derivable* name, since those are not stored: `name~potion of haste` matched 274 seeds before interning and none after (400 seeds, 0.34.1, D:8, 2026-08-28). `Item` is the criterion for a type-nameable item and always was the right one.
+- **A search criterion is a type, not a name.** A name is a display string carrying enchantment and brand (`+3 greatsling "Punk" {acid, rCorr}`) — ~18x the cardinality of `(base_type, sub_type)`, and nearly every artefact name is unique, so exact-name search finds one seed or none. `sub_type` is the bare type (`haste`, not `potion of haste`); `base_type` disambiguates it. `Name_like` is the substring escape hatch for unrands. It is no longer unindexed — the `like` runs over the `strings` dictionary, served by the `strings_fts` trigram index, and the ids it yields are covering seeks on `entries_search_name` — and it no longer matches a *derivable* name, since those are not stored: `name~potion of haste` matched 274 seeds before interning and none after (400 seeds, 0.34.1, D:8, 2026-08-28). `Item` is the criterion for a type-nameable item and always was the right one. **Where an item sits is a field on the criterion, and the floor is the default** (2026-09-15): `Criterion.position` is `Floor` or `Shop`, it hangs off `Item`, `Name_like` and `Props`, and `potion:haste` means floor-only — `shop ` is a per-term opt-in and `floor ` is accepted, redundant and never emitted. `Shop_item`/`Floor_item` are gone; a constructor per combination grows multiplicatively and `Props` was the third criterion to want one. The two positions *partition* the union rather than filtering it, which is what reaches `min_count`: two potions on the floor and a third behind a counter satisfy neither `3x potion:haste` nor `3x shop potion:haste` (2,435 → 2,142 seeds, 12% of matches lost, 10k local, 0.34.1, 2026-09-10). So the union is no longer expressible at all — a real loss, taken deliberately, and there is no `anywhere ` prefix to restore it. Two exceptions, both stated in the help text rather than left to be discovered: `name~` has no shop form (gold binds the early game, so an unrand you can buy is one you could have afforded off the floor), and `artefact` still spans both, which matters because artefacts are where shop stock concentrates — 42.7% of artefact entries sit in a shop against 14.4% of named entries (1.3M, 0.34.1, prod, 2026-09-10).
+
+- **Artefact properties are one criterion carrying a set, and the set shares an item.** `props:Conj,Alch` means one artefact with both, not a seed holding each somewhere: every `exists` correlates on the same `entries.id`. Seed-scoped would be wrong in a way the evidence cannot show — `hit_line` renders name, count and level, so a Conj ring on D:3 beside an Alch staff on D:5 is two indistinguishable lines. The base type folds in for the same reason (`staff props:Conj,Alch`), and it is not a rare leak: school enhancers roll off-staff ~45% of the time (staff 223, armour 170, jewellery 15, 10k local, 0.34.1). **No count and no strength** — two of a property is not a more interesting seed than one, and a bare property means ≥ 1, which is also what makes `props:rF` cover `rF++` while never matching `rF-` (`entry_props.value` runs negative on ~1 row in 5 of `Str`, `rF`, `Slay`). **Drawbacks are excluded on domain grounds**: nobody picks a seed for a `*Noise` weapon — you decide that holding it — so unlike the dropped uniques there is no missing operator and nothing waiting on one. `*Rage` stays (a build to commit to); `nupgr` is excluded as an engine flag (`ARTP_NO_UPGRADE`, never player-visible). Sigils derive the list, they are not the reason. The 55-name vocabulary is **listed in `Search.Prop`, not read from the corpus**: the parse boundary is synchronous, and an unknown property must be rejected rather than searched — a run that matches nothing reports the build holds no such artefact, which is false and indistinguishable from true. That is the `props:Conj+Alch` case, since `Dream.queries` decodes a raw `+` to a space; the separator is a comma because `+Blink` and `+Inv` are property names.
 
 - **A stale `name~` index refuses the search; it does not fall back to the scan.** `strings_fts` is fts5 over the `strings` dictionary (external content, trigram), and an external-content table gets no triggers unless someone writes them — none were — so a fill leaves it not knowing about the names it added. That staleness is silent in the worst direction: an unindexed name is simply absent, so a search returns "no seeds" rather than an error. The rebuild therefore records the dictionary id it reached in `strings_fts_state`, and `search_seeds` compares it against `max(id) from strings` per search, refusing `Name_like` with `Search.stale_index_tag` (a 503 with `Retry-After` at the web layer, not a 400 — the reader's query is fine). Falling back to the dictionary scan would be *correct*, and was the first design, but the scan reads all 129 MB per request on a public endpoint with no account behind it: an amplification factor reachable from a query parameter. A refusal costs readers one criterion for as long as a rebuild takes; a fallback costs everyone the box. The scoping matters — only searches carrying a `Name_like` term are refused, and `fts_is_current` is not even queried otherwise. **The rebuild belongs to fills, not to deploys:** the index is derived from `strings`, so a code-only update cannot make it stale. Run `tools/corpus-fts-rebuild` after every fill, and once before the index first serves. A fill is not the only writer that adds rows, though: **deepening interns names too** — a deepened seed reaches levels the fill never saw, so it mints names the dictionary lacks, and one of them withdraws `name~` for the whole corpus. The generator therefore calls `Db.catch_up_fts` after every job (`bin/deepen.ml`), indexing just the rows above the mark and advancing it in one transaction. That keeps the reader-driven trickle self-healing without putting per-row index work on the fill's hot path, where interning runs at 182k writes/sec. It is release-blocking only for a change that alters the dictionary or the index itself. Sound only because `strings` is append-only (dropping seeds orphans dictionary rows rather than pruning them); pruning it would break the high-water mark in its one fatal direction.
 - **A level's entries are ordered in the domain, not in SQL.** Storage has nothing left to sort on: `cat` is an integer enum and the display name is behind a string id numbered in *insertion order*, so `order by level_id, name_id` sorts by neither depth nor spelling. `seed_levels_sql` orders by `(e.level_id, e.cat, e.id)` purely for deterministic grouping, and `Level.of_rows` re-sorts each level's decoded entries by category then rendered name — reproducing the order the old `order by e.level, e.cat, e.name` produced. Don't reach for a SQL ordering over an interned column; it will look sorted on a small corpus and be arbitrary on a real one.
@@ -251,7 +313,7 @@ These are in the schema and the readme, and they are the ones that produce plaus
 - **Depth is reach order, not generation order.** Crawl generates Temple before D:1 but a player reaches it around D:5, so ranking by `explorer.generation_order` calls Temple the shallowest thing in every seed. `Depth` uses `branch-data.h` `mindepth`. A portal's own name carries no depth, so ranking one means knowing the level its entrance sat on: format 2 records that as `seed_levels.parent_level`, and a portal ranks at its parent's depth. A level ingested before format 2 has no parent, stays unrankable and sorts last — the corpus cannot prove where it sits.
 - **Search cost is linear in a term's matched rows, not in the page size — the `distinct` is nested under a sort.** `select distinct seed from entries where ...` sits in a subquery that the outer `order by seed limit 51` reads, so SQLite materialises *every* distinct seed through a temp b-tree before the limit applies (`SCAN (subquery-4)` + `USE TEMP B-TREE FOR ORDER BY`). A term matching a million seeds sorts a million rows to return 51. Measured warm on prod (1.3M, 0.34.1, `D:8`, 2026-09-05, end to end over HTTP): `wand:digging` 0.11s, `potion:haste` 1.74s, `artefact` 2.48s, three-term 3.70s, `name~Throatcutter` 7.02s — and `limit=1` costs the same as `limit=200`. The same query without `distinct` returns in 1ms against 1.40s with it. It scales with the corpus: `potion:haste` is 25ms at 10k and 1.40s at 1.3M. The `distinct` is load-bearing and must not simply be dropped (it is what keeps a seed with three matching entries from appearing three times and shrinking the keyset page); the fix is to stop nesting it under a sort. **`Seed_web.search_is_cheap` is still wrong in the direction that hurts**, though less so since 2026-09-10. It asks whether every term is indexed and whether *at most one* carries `min_count > 1`; it does not ask how many rows a term matches, which is what actually costs. `artefact` and a long `Name_like` are both still called cheap and both still run inline on the Lwt scheduler, where they stall every concurrent request and the search timeout cannot fire. The `min_count` half was the acute case — two counted terms measured 23.2s inline (see below) — and is fixed; the general case is not. Until the query shape is fixed, the honest move is to detach every search. See `docs/architecture.md`.
 
-- **Full-corpus vocabulary queries are minutes, not seconds, and are cached only per process.** `Db.distinct_criteria` (the search form's datalist) is 71.5s for `item_pairs_sql` at 1.3M (0.34.1, `D:8`, prod, 2026-09-07, warm, zfs 16K/lz4); `version_levels` is 9.5s. Superseded: ~~126s plus 13.5s for `feat_names_sql`~~ at 64K/zstd, where most of the difference was record amplification. `feat_names_sql` is gone entirely as of 2026-09-10 — features are no longer searchable, so suggesting one suggested a term that errors. `Seed_web.criteria_for` caches the result per version for the life of the process, but **no reader waits for it**: a miss returns `None`, renders without the datalist, and fills in the background under a single-flight guard, so a restart costs suggestions rather than a ~70s stall. The output is 10.5 KB. Precompute it at fill time rather than asking the corpus a question whose answer was known when the rows were written. `Db.seed_count` is cached the same way and for the same reason: still a covering seek, but counting 1.3M index entries is 43ms rather than the 11ms it cost at 100k, so `served_builds` reads each served build once and holds it for the life of the process instead of paying ~45ms per render. It under-reports a build being filled alongside the server until the next restart, which is acceptable only while fills stay manual.
+- **Full-corpus vocabulary queries are minutes, not seconds, and are cached only per process.** `Db.distinct_criteria` (the search form's datalist) is 71.5s for `item_pairs_sql` at 1.3M (0.34.1, `D:8`, prod, 2026-09-07, warm, zfs 16K/lz4); `version_levels` is 9.5s. Superseded: ~~126s plus 13.5s for `feat_names_sql`~~ at 64K/zstd, where most of the difference was record amplification. `feat_names_sql` is gone entirely as of 2026-09-10 — features are no longer searchable, so suggesting one suggested a term that errors. `Seed_web.criteria_for` caches the result per version for the life of the process, but **no reader waits for it**: a miss returns `None`, renders without the datalist, and fills in the background under a single-flight guard, so a restart costs suggestions rather than a ~70s stall. The output is 10.5 KB. When the search store is current the item pairs come from its catalog instead (`Search_index.item_pairs`, 1ms against 340ms at 10k, local, 2026-09-16), so the minutes-long scan only runs against a stale store. `Db.seed_count` is not: it reads `seed_fill_counts`, a trigger-kept counter, in microseconds. Counting `seed_fills` was 43ms at 1.3M and linear in the corpus (see `docs/architecture.md`).
 
 - **Search covers items, and nothing else.** Altar features went first (2026-09-03); the remaining features and `unique:` followed 2026-09-10, rejected at the parse boundary in `Params.criterion` with a message naming what happened. Two reasons, and only the first is about speed: the unselective features were what made a multi-term intersection slow (`enter_temple` stands on every seed, `enter_shop` on 2.1x as many rows as there are seeds), and one kind of thing to search for is a simpler interface than three. Uniques are the interesting case — the real question about an early unique is *negative* ("a seed without Sigmund", so you can avoid it), and search has no negation, so the forward form answered the opposite of what anyone wanted. Removing it is not a judgement that the data is uninteresting; it is that the operator to ask the question well does not exist yet. **The criteria still exist in `lib/corpus`** (`Criterion.Feature`, `Criterion.Unique`) and still drive the seed page, which lists every feature and unique level by level. This is a parse-boundary product decision, not a corpus one, and adding negation later means re-enabling a parser branch rather than restoring dropped data. The `entries_search_feat`, `entries_search_unique` and `entries_search_shop_type` indexes are consequently unused by search; leave them until the next schema rebuild rather than paying a schema change to drop them.
 
@@ -264,7 +326,7 @@ These are in the schema and the readme, and they are the ones that produce plaus
 - **A fill of current stable is on loan.** Corollary of the above: a point release discards everything filled against the line it lands on, while a finished line can never be invalidated. That argues for putting depth on the finished lines, and against them — people play current stable, and a corpus is worth having in proportion to how many readers it answers for. **No sizing policy follows, and none is committed to**; it is settled per fill. What does follow: two versions' corpora may be different sizes, so nothing may compare their counts without accounting for that.
 - **Storage is not the constraint on corpus size; scoring memory is.** 6,488 bytes/seed on disk, 12,328 logical, at zfs `recordsize=16K compression=lz4` measuring 1.90x (1.3M, 0.34.1, D:8, prod, 2026-09-07). These figures are a property of the dataset's ZFS settings, not the schema: the same file read 4,197 bytes/seed at 2.84x under the previous `recordsize=64K compression=zstd`, which was changed because 64K records cost 16x read amplification on the scattered reads search actually issues. Superseded: ~~4,608 bytes/seed, 2.62x at 30k~~ (2026-09-02) and ~~2.51x on a 500-seed sample~~ — small samples read pessimistic because fixed schema and index overhead dominate and the string vocabulary has not saturated, and that prediction held across a 44x growth. That puts 100M seeds at ~649 GB, which is an ordinary amount of disk to buy. Fill rate does not bound it either: 611 seeds/min wall over the 27.3-hour fill from 300k to 1.3M, 8-way, so 100M is ~114 days. **Fill cost is independent of corpus size**: −0.8% first slice to last across twelve equal slices of that fill, one version, one continuous run, 4,000 chunks, zero chunk failures (prod, 0.34.1, D:8, 2026-09-04/05) — the strongest form of the measurement, superseding the ~1.5% drift seen at 100k and the ~~4% per 10k decay~~ read off three fills of three *different versions*. What actually binds is **rescore memory**, though less than it did: at 1.3M the pass used to OOM at 29.0 GiB on a 31 GB box, because the `score_rows_sql` fold materialised all 96,524,762 rows at once. `Db.rescore` now takes `?shards` and splits that scan into N seed ranges, which brought the same pass to **9.10 GiB and 30m29s, exit 0** (`-shards 16`, 1.3M, 0.34.1, prod, 2026-09-05) with byte-identical scores — sharding bounds residency, not work. The remaining 9.10 GiB is `recompute_surprise`, which is still whole-cohort and is now the ceiling; it and `early_spell_counts` are the next things to shard. So a corpus past ~1.3M can now be both filled and scored, and the scoring phase no longer scales with corpus size at all. A large fill still logs its rate periodically rather than deriving one average from `min`/`max` at the end: an average cannot tell an asymptote from a decline. See `docs/corpus-scaling.md`.
 
-Uniques carry artefacts roughly 19x as often as ordinary monsters, which is why unique-carried items are collected by default and ordinary monsters are skipped. The default item filter is crawl's own `item_ignore_boring`.
+Uniques carry artefacts roughly 19x as often as ordinary monsters, which is why unique-carried items are collected by default and ordinary monsters are skipped. The default item filter is crawl's own `item_ignore_boring`, wrapped so that an **artefact or a barding is always kept**. `item_ignore_boring` is a display filter for a playing character, and both of its tests fail on things a corpus reader wants: it judges weapons and armour by plus and brand, so an unbranded +0 or negative artefact is "plain gear" — that silently excluded 11 unrands outright (the skull of Zonguldrok, the hat of the Alchemist, fencer's gloves, every ego-less orb) and 8.7% of all artefact rows, overwhelmingly +0 randart armour (1,200 seeds, 0.34.1, D:8, 2026-09-15) — and it drops anything `is_useless` for the scanning *wizard*, which is not a fact about the seed and which discarded every barding. The wrapper is in `scripts/seed_dump_sexp.lua`; the rest of `is_useless` is still honoured, so scrolls of identify (useless because the scan identifies the level first), potions of moonshine, large rocks and corpses remain unrecorded and uncorpusable. **None of this is backfillable** — it is a fill-time filter, so a corpus filled before 2026-09-15 is missing those rows permanently.
 
 ## SQLite pragma contract (set per-connection)
 

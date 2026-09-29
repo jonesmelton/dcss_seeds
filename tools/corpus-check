@@ -153,6 +153,23 @@ if [ "$unfilled" -gt 0 ]; then
     status=1
 fi
 
+# The search store's currency check reads this counter instead of counting, so
+# a drift reads as a fill that never happened, or hides one that did.
+if [ "$(q "select count(*) from sqlite_master where type = 'trigger' and name in ('seed_fills_counted', 'seed_fills_uncounted');")" -ne 2 ]; then
+    echo "WARN: seed_fill_counts triggers missing -- run: tools/corpus-reindex --db $db"
+    status=1
+else
+    counted=$(q "select coalesce((select c.seeds from seed_fill_counts c join versions v on v.id = c.version_id where v.version = '$version'), 0);")
+    actual=$(q "select count(*) from seed_fills f join versions v on v.id = f.version_id where v.version = '$version';")
+    if [ "$counted" -ne "$actual" ]; then
+        echo "FAIL: seed_fill_counts says $counted, seed_fills holds $actual"
+        echo "      recount with: tools/corpus-reindex --db $db"
+        status=1
+    else
+        echo "  ok: seed counter matches seed_fills ($actual)"
+    fi
+fi
+
 # Gaps only mean something over a range the caller says should be contiguous.
 if [ -n "$range" ]; then
     start="${range%%-*}"
@@ -177,6 +194,25 @@ if [ "$missing" -gt 0 ]; then
     status=1
 else
     echo "  ok: search indexes present"
+fi
+
+# The searchable property vocabulary is listed in lib/corpus/search.ml rather
+# than read from the corpus, because the parse boundary is synchronous and an
+# unknown property has to be rejected there. A crawl release adding one is
+# therefore silent in the worst direction: the property is in the corpus, on
+# real artefacts, and unsearchable with no error anywhere. Compare the two.
+code_props="$(sed -n '/^  let known =/,/^  ;;/p' "$root/lib/corpus/search.ml" \
+    | grep -oE '"[^"]+"' | tr -d '"' | sort -u)"
+db_props="$(q "select distinct s.val from entry_props p join strings s on s.id = p.prop_id join versions v on v.id = p.version_id where v.version = '$version';" | sort -u)"
+unknown="$(comm -13 <(echo "$code_props") <(echo "$db_props"))"
+if [ -n "$unknown" ]; then
+    echo "WARN: $(echo "$unknown" | wc -l | tr -d ' ') artefact propert(y|ies) in the corpus are not in Search.Prop.known:"
+    echo "$unknown" | sed 's/^/        /'
+    echo "      they cannot be searched for. Add them to lib/corpus/search.ml,"
+    echo "      and to Prop.excluded if they are drawbacks."
+    status=1
+else
+    echo "  ok: property vocabulary matches the corpus"
 fi
 
 exit $status

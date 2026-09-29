@@ -21,38 +21,129 @@ module Item_type : sig
   val to_string : t -> string
 end
 
+module Prop : sig
+  (** Which artefact properties a reader may search for.
+
+      Drawbacks are excluded on domain grounds: nobody picks a seed for one.
+      Whether an item's [*Slow] is worth living with is decided after you have
+      it, and the answer changes what you carry rather than what you play. This
+      is not a limitation waiting on a missing operator -- there is no negative
+      form we are unable to offer, because the positive form is already the
+      question nobody asks.
+
+      [nupgr] is excluded on different grounds again: it is an engine flag, not
+      a property, and is never shown to a player. *)
+  val excluded : string list
+
+  (** [false] for everything in {!excluded}. Applied to the search vocabulary
+      and to the parse boundary alike, so a rejected property is rejected
+      wherever it is typed. *)
+  val searchable : string -> bool
+
+  (** Why a property is not searchable, phrased for a reader, or [None] if it
+      is. The two reasons are not interchangeable: calling [nupgr] a drawback
+      would tell the reader their artefact is worse than it is. *)
+  val why_excluded : string -> string option
+
+  (** Crawl's whole artefact property vocabulary, including the excluded ones.
+
+      Closed and small, so it is listed rather than queried: the parse boundary
+      is synchronous, and an unknown property must be rejected there. A property
+      search that runs and matches nothing would report that the build holds no
+      such artefact -- a false statement about the corpus, indistinguishable
+      from a true one. *)
+  val known : string list
+
+  val is_known : string -> bool
+
+  (** The canonical spelling of a property named case-insensitively, or [None]
+      if no such property exists. Crawl mixes case within a name ([rF], [SInv]),
+      which no reader should have to reproduce from memory. *)
+  val canonical : string -> string option
+
+  (** The floor a bare property must meet.
+
+      [entry_props.value] is crawl's raw integer and runs negative on every
+      property that can be a penalty -- [Str] spans -5..10, [rF] -2..3, [Slay]
+      -6..6, and about one row in five of those is below zero. Matching
+      [rF-] for a reader who asked for [rF] would be a true-looking answer to a
+      question they did not ask.
+
+      It is also what makes [rF] mean "[rF+] or better" without a grouping
+      mechanism: every positive value of a resistance is a stronger form of the
+      same property, so a floor is the grouping. *)
+  val min_value : int
+end
+
 module Criterion : sig
+  (** Where an item sits. [cost] being present is the only thing telling shop
+      stock from floor loot, and the two values partition that union totally --
+      every entry is one or the other, never both and never neither. *)
+  type position =
+    | Floor
+    | Shop
+  [@@deriving compare, equal, sexp_of]
+
   (** One atomic containment question. No partial credit, which is what lets
       conjunction be a set intersection rather than a scoring pass.
 
-      [Item], [Shop_item] and [Floor_item] differ only in where the item sits;
-      [cost] being present is the only thing telling shop stock from floor loot.
-      [Item] is the union and the weaker question. The other two partition it
-      totally.
+      [Floor] is the default: [potion:haste] means [Item (_, Floor)], and shop
+      stock is reached only by a term that asks for it. Since [Floor] and [Shop]
+      partition the union, the union itself is no longer expressible -- a real
+      loss taken deliberately, because "is it there" and "can I afford it" are
+      different questions and the second is the rarer one.
 
-      The partition applies to [min_count], which is the subtlety: an
-      unqualified [Item] with [min_count = 3] is satisfied by two potions on the
-      floor and a third behind a counter, where [Floor_item] demands three on
-      the floor. A floor search is therefore not the shop hits struck off an
-      [Item] result -- it can match strictly fewer seeds.
+      That partition is what [min_count] reaches, and it is the visible break: a
+      seed with two potions of haste on the floor and a third behind a counter
+      satisfies neither [3x potion:haste] nor [3x shop potion:haste]. A floor
+      search is not a union search with the shop hits struck off -- it can match
+      strictly fewer seeds.
+
+      [Artefact] is the one criterion still holding the union, and it is where
+      that inconsistency shows most: 42.7% of artefact entries sit in a shop
+      against 14.4% of named entries (prod 1.3M, 2026-09-10). Kept anyway --
+      generic artefact search is a weak question and qualifying it would need
+      parse syntax it does not have -- so the help text states the asymmetry
+      rather than leaving it to be discovered.
 
       [Name_like] is the escape hatch for what the type vocabulary cannot name:
       an unrand is identified by a substring of its display name, its
       enchantment prefix varying. Since interning it matches only the
       irreducible tail -- artefacts, unrands, monsters -- and no longer reaches
       a name the columns imply. [Name_like "potion of haste"] finds nothing;
-      [Item {base_type = "potion"; sub_type = "haste"}] is that question. *)
+      [Item ({base_type = "potion"; sub_type = "haste"}, Floor)] is that
+      question. It carries a [position] for uniformity but [Params] builds only
+      [Floor]: gold binds the early game, so an unrand you could buy is one you
+      could have afforded off the floor, and the shop form answers nothing.
+
+      [Props] asks for properties carried by *one* item, which is what makes it
+      a criterion of its own rather than a conjunction of simpler ones. "A staff
+      with Conj and Alch" is not "a Conj item somewhere and an Alch item
+      somewhere": the latter is satisfied by a Conj ring on D:3 and an Alch
+      staff on D:5, and the evidence rendering cannot tell the reader that is
+      what happened -- two hit lines, two unrelated items, nothing saying so.
+
+      [base_type] folds into the criterion for the same reason. Two terms
+      ([item:staff] beside [props:Conj,Alch]) reintroduces the leak one level
+      up, and it is not a rare case: school enhancers roll off-staff about 45%
+      of the time (staff 223, armour 170, jewellery 15 across the ten school
+      properties, 10k local corpus, 0.34.1). [None] means any artefact. *)
   type t =
-    | Item of Item_type.t
-    | Shop_item of Item_type.t
-    | Floor_item of Item_type.t
-    | Name_like of string
+    | Item of Item_type.t * position
+    | Name_like of string * position
     | Feature of string
     | Artefact
     | Unique of string
+    | Props of
+        { base_type : string option
+        ; props : string list
+        ; position : position
+        }
   [@@deriving compare, sexp_of]
 
-  (** A short human-readable rendering, for echoing a query back. *)
+  (** A short human-readable rendering, for echoing a query back. [Shop] is
+      qualified, [Floor] is not: prose mirrors the query, where the floor
+      default also goes unspoken. *)
   val to_string : t -> string
 
   (** The noun for counting several matches, where one reads naturally. [None]
@@ -70,15 +161,17 @@ module Criterion : sig
 
   (** Whether this criterion is cheap enough to run on the Lwt scheduler thread.
 
-      Every criterion is a single covering-index seek except [Name_like] below
-      {!min_name_like_length}, which cannot use the trigram index at all and
-      falls back to scanning the whole string dictionary -- seconds at corpus
-      scale, on the scheduler thread.
+      Two are not. No [Name_like] is, at any fragment length: cost scales with
+      how much of the dictionary the fragment matches rather than with the
+      lookup, and the search store declines every one of them, so they are the
+      terms that still reach the SQL fallback. A selective fragment is
+      milliseconds today; that is a property of the corpus, not of the query.
 
-      At or above the threshold [Name_like] is a trigram lookup and usually
-      milliseconds, but it stays "not cheap": cost scales with how much of the
-      dictionary the fragment matches, so a common one is still far too slow to
-      run inline. *)
+      [Props] is cheap only with a [base_type]. That seek drives the query and
+      the properties filter its output; without one the query drives the whole
+      build and the page limit does not stop it early, since a rare property
+      pair matches too few seeds to fill a page. Everything else is a single
+      covering-index seek. *)
   val is_cheap : t -> bool
 
   (** Minimum fragment length accepted for [Name_like]. Enforced at the parse
@@ -108,7 +201,11 @@ module Term : sig
   val to_string : t -> string
 
   (** The inverse of the web layer's [has=] syntax, so a term round-trips through
-      a link. [to_string] is prose and does not. *)
+      a link. [to_string] is prose and does not.
+
+      Lossy in spelling, exact in meaning: a [Floor] criterion comes back
+      unprefixed whether or not the reader typed [floor ], and a [Shop] one
+      re-parses to itself. *)
   val to_query_string : t -> string
 end
 

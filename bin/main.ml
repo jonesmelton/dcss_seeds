@@ -35,6 +35,11 @@ let () =
   (match Sys.getenv_opt "SEED_DISABLE_SEARCH" with
    | Some ("1" | "true" | "yes") -> Seed_web.Params.search_disabled := true
    | _ -> ());
+  (* For a read-only instance serving a frozen corpus copy; see fossil ticket
+     0c6422bfc2. *)
+  (match Sys.getenv_opt "SEED_DISABLE_DEEPEN" with
+   | Some ("1" | "true" | "yes") -> Seed_web.Params.deepen_disabled := true
+   | _ -> ());
   if not (Sys.file_exists db_path)
   then (
     Printf.eprintf

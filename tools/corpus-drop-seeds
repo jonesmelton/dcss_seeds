@@ -73,14 +73,21 @@ if [ "$assume_yes" -ne 1 ]; then
     esac
 fi
 
+# The search store's currency mark is a seed count, and a drop followed by a
+# refill of the same size restores it while the store still holds postings for
+# the seeds that went and none for the ones that arrived. Arithmetic cannot see
+# that, so the state row goes instead: the store is derived, and `just index`
+# rebuilds it.
 sqlite3 -init /dev/null "$db" "
 pragma foreign_keys = on;
 begin immediate;
 delete from seed_levels where version_id = $version_id and seed in ($quoted);
 delete from seed_fills  where version_id = $version_id and seed in ($quoted);
+delete from search_index_state where version_id = $version_id;
 commit;"
 
 left=$(q "select count(distinct seed) from seed_levels where version_id = $version_id and seed in ($quoted);")
 echo "==> deleted $present seed(s); $left remaining"
 echo "    refill with: tools/corpus-fill $version -s <start> -n <count> --db $db --skip-done"
 echo "    then rescore: _build/default/bin/rescore.exe -db $db -build $version"
+echo "    and reindex:  just index $db"

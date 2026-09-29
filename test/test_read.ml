@@ -382,15 +382,15 @@ let%expect_test "an unknown seed reads as empty rather than an error" =
 ;;
 
 (* Both accessors run on the Lwt scheduler thread, so both must be
-   index-backed; a plan that scans is a missing index. Only the plan text is
-   asserted -- the leading columns are bytecode addresses that shift with
-   unrelated changes. CREATE BLOOM FILTER is dropped because whether the planner
-   builds one for an IN-list subquery varies by sqlite version, and it says
-   nothing about whether the query seeks or scans. *)
+   index-backed; a plan that scans is a missing index. Only the SEARCH/SCAN
+   lines are asserted: they name the access path, which is the property. The
+   rest -- subquery labels, temp b-trees, bloom filters -- is planner narration
+   whose wording changes between sqlite versions. *)
 let show_plan db sql =
   Db.query db ("explain query plan " ^ sql)
   |> List.map ~f:(fun row -> List.last_exn (String.split row ~on:'|'))
-  |> List.filter ~f:(fun text -> not (String.equal text "CREATE BLOOM FILTER"))
+  |> List.filter ~f:(fun text ->
+    String.is_prefix text ~prefix:"SEARCH " || String.is_prefix text ~prefix:"SCAN ")
   |> List.iter ~f:print_endline
 ;;
 
@@ -413,7 +413,6 @@ let%expect_test "the read queries are index-backed" =
   [%expect
     {|
     SEARCH e USING COVERING INDEX entries_search_feat (version_id=? AND feat_id=? AND seed=?)
-    LIST SUBQUERY 1
     SEARCH strings USING COVERING INDEX sqlite_autoindex_strings_1 (val=?)
     |}];
   (* On a three-seed corpus entries_seed is genuinely the cheaper plan, so this
@@ -448,7 +447,6 @@ let%expect_test "the read queries are index-backed" =
     {|
     SEARCH e USING INDEX entries_seed (seed=? AND version_id=?)
     SEARCH s_name USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN
-    USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY
     |}];
   Db.close db
 ;;
@@ -465,17 +463,19 @@ let%expect_test "a substring name search seeks rather than scanning entries" =
   [%expect
     {|
     SEARCH entries USING COVERING INDEX entries_search_name (version_id=? AND name_id=?)
-    LIST SUBQUERY 1
     SCAN strings
-    USE TEMP B-TREE FOR DISTINCT
     |}];
   Db.close db
 ;;
 
-(* [Floor_item]'s [cost is null] test used to fall outside entries_search_type,
-   so the seek was index-driven but every matching row cost a random table
-   lookup. [cost] now trails the index, so both shapes are covering; this is
-   what would catch the column falling back out. *)
+(* The [cost is null] test used to fall outside entries_search_type, so the seek
+   was index-driven but every matching row cost a random table lookup. [cost]
+   now trails the index, so both shapes are covering; this is what would catch
+   the column falling back out.
+
+   It stopped being an edge case when floor became the default: every
+   unqualified item search now carries this predicate, and the positionless
+   shape below is only the control. *)
 let%expect_test "a floor-item search seeks a covering index, same as the bare item search"
   =
   let db = corpus () in
@@ -489,6 +489,18 @@ let%expect_test "a floor-item search seeks a covering index, same as the bare it
     db
     "select distinct seed from entries where version_id = 1 and base_type_id = 2 and \
      sub_type_id = 3";
+  [%expect
+    {| SEARCH entries USING COVERING INDEX entries_search_type (version_id=? AND base_type_id=? AND sub_type_id=?) |}];
+  (* The shop half stays covering whichever index wins, which is the property
+     worth pinning: entries_search_shop is qualified on [cost is not null] and
+     entries_search_type carries [cost] as its last column. Without statistics
+     this fixture picks the latter; prod picks the former. What must not vary is
+     the predicate itself -- dropping it let the planner return floor stock too
+     (335,174 vs 30,870 rows, wand:digging, 1.3M, 0.34.1, 2026-09-05, prod). *)
+  show_plan
+    db
+    "select distinct seed from entries where version_id = 1 and base_type_id = 2 and \
+     sub_type_id = 3 and cost is not null";
   [%expect
     {| SEARCH entries USING COVERING INDEX entries_search_type (version_id=? AND base_type_id=? AND sub_type_id=?) |}];
   Db.close db

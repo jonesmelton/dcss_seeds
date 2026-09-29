@@ -143,7 +143,7 @@ let masthead ~version ~builds ~here =
     ~a:[ a_class [ "masthead" ] ]
     (div
        ~a:[ a_class [ "masthead-bar" ] ]
-       [ a ~a:[ a_href home; a_class [ "site" ] ] [ txt "dcss seed explorer" ]
+       [ a ~a:[ a_href home; a_class [ "site" ] ] [ txt "dcss garden" ]
        ; nav_links ~version ~here
        ; theme_toggle
        ]
@@ -157,6 +157,18 @@ let render ?version ?(builds = []) ?(here = Page.Other) ~title:page_title conten
        (title (txt page_title))
        [ meta ~a:[ a_charset "utf-8" ] ()
        ; meta ~a:[ a_name "viewport"; a_content "width=device-width, initial-scale=1" ] ()
+       ; link ~rel:[ `Icon ] ~href:"/favicon.ico" ~a:[ a_mime_type "image/x-icon" ] ()
+       ; link
+           ~rel:[ `Icon ]
+           ~href:"/static/favicon-32.png"
+           ~a:[ a_mime_type "image/png"; a_sizes (Some [ 32, 32 ]) ]
+           ()
+       ; link
+           ~rel:[ `Icon ]
+           ~href:"/static/favicon-16.png"
+           ~a:[ a_mime_type "image/png"; a_sizes (Some [ 16, 16 ]) ]
+           ()
+       ; link ~rel:[ `Other "apple-touch-icon" ] ~href:"/static/apple-touch-icon.png" ()
        ; link ~rel:[ `Stylesheet ] ~href:"/static/style.css" ()
          (* Blocking, in head, before paint: a theme applied afterwards flashes. *)
        ; script ~a:[ a_src "/static/theme.js" ] (txt "")

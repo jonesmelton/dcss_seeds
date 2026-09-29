@@ -1,0 +1,48 @@
+opam-version: "2.0"
+name: "tyxml-htmx"
+version: "dev"
+synopsis: "htmx attributes for TyXML"
+description:
+  "Typed TyXML attribute wrappers for the htmx hypermedia attributes (hx-get, hx-target, hx-swap, ...). Freestanding; depends only on tyxml."
+maintainer: "Jones Melton <github@jonesmelton.com>"
+authors: "Jones Melton"
+license: "MIT"
+homepage: "https://github.com/jonesmelton/dcss_seeds"
+bug-reports: "https://github.com/jonesmelton/dcss_seeds/issues"
+depends: [
+  "base-bigarray" {= "base"}
+  "base-domains" {= "base"}
+  "base-effects" {= "base"}
+  "base-nnp" {= "base"}
+  "base-threads" {= "base"}
+  "base-unix" {= "base"}
+  "cmdliner" {= "2.1.1"}
+  "compiler-cloning" {= "disabled"}
+  "dune" {= "3.24.2"}
+  "ocaml" {= "5.5.0"}
+  "ocaml-base-compiler" {= "5.5.0"}
+  "ocaml-compiler" {= "5.5.0"}
+  "ocaml-options-vanilla" {= "1"}
+  "ocamlbuild" {= "0.16.1"}
+  "ocamlfind" {= "1.9.9~preview"}
+  "re" {= "1.14.0"}
+  "seq" {= "base"}
+  "topkg" {= "1.1.1"}
+  "tyxml" {= "4.6.0"}
+  "uutf" {= "1.0.4"}
+]
+build: [
+  ["dune" "subst"] {dev}
+  [
+    "dune"
+    "build"
+    "-p"
+    name
+    "-j"
+    jobs
+    "@install"
+    "@runtest" {with-test}
+    "@doc" {with-doc}
+  ]
+]
+dev-repo: "git+https://github.com/jonesmelton/dcss_seeds.git"

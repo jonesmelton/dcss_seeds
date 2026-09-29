@@ -19,8 +19,9 @@ val close : ?readonly:bool -> t -> unit
 val with_db : string -> f:(t -> 'a) -> 'a
 
 (** Raises [Failure] on the first failing statement, carrying the primary code,
-    the extended code, and sqlite's message -- enough to tell BUSY (5) from
-    BUSY_SNAPSHOT (517), which want different operator responses. *)
+    the extended code, sqlite's message, and the statement itself -- enough to
+    tell BUSY (5) from BUSY_SNAPSHOT (517), which want different operator
+    responses, and to say which statement took the lock. *)
 val exec_script : t -> string -> unit
 
 (** Not reentrant. *)
@@ -143,7 +144,55 @@ val fts_is_current : t -> bool
     time is the wrong shape for millions of them. *)
 val catch_up_fts : t -> unit Or_error.t
 
+(** Whether the search store covers every seed the corpus holds. False for a
+    corpus that has never had one built, for one filled since, and for one seeds
+    were dropped from; {b true} across a deepen, which changes no seed count and
+    is covered by {!Search_index.page}'s overlay instead. A false answer is not
+    an error: search falls back to the SQL predicate path.
+
+    For a tool reporting on a store. {!search_seeds} does not call it --
+    {!Search_index.page} asks it itself, once its free decline tests have
+    passed. *)
+val search_index_is_current : t -> version:Query.Version.t -> bool
+
+(** Rebuild the search store for one build; see {!Search_index.build}.
+
+    Here rather than reached through [Search_index] directly because [t] is
+    abstract outside this library, and {!Search_index} takes the raw connection
+    -- it cannot depend on this module, since [search_seeds] calls into it. *)
+val build_search_index : t -> version:Query.Version.t -> unit Or_error.t
+
+(** The item pairs in the store's catalog; see {!Search_index.catalog_item_pairs}. *)
+val catalog_item_pairs : t -> version:Query.Version.t -> string list option Or_error.t
+
+(** The deep cohort the store overlays for one build; see
+    {!Search_index.cohort}. *)
+val search_index_cohort : t -> version:Query.Version.t -> string list option Or_error.t
+
+(** What the store holds for one build. A typed accessor rather than a
+    {!query} string, because {!query} has no binds and this is a feature, not
+    an inspection. *)
+val search_index_stats : t -> version:Query.Version.t -> Search_index.Stats.t Or_error.t
+
 val search_seeds
+  :  t
+  -> Search.t
+  -> rank:Search.Rank.t
+  -> (Search.Match.t list * [ `More | `End ]) Or_error.t
+
+(** {!search_seeds} with no fallback: [None] when the store declines, including
+    when it is stale. [name_cap] overrides {!Search_index.max_name_seeds}, so a
+    fixture can reach the over-cap decline. *)
+val search_seeds_store
+  :  ?name_cap:int
+  -> t
+  -> Search.t
+  -> rank:Search.Rank.t
+  -> (Search.Match.t list * [ `More | `End ]) option Or_error.t
+
+(** {!search_seeds} with the store never consulted: the SQL predicate path, for
+    checking the store against it on a corpus where the store is current. *)
+val search_seeds_sql
   :  t
   -> Search.t
   -> rank:Search.Rank.t
@@ -153,14 +202,16 @@ val search_seeds
     depends on the depth the corpus was extracted at. *)
 val version_levels : t -> version:Query.Version.t -> string list Or_error.t
 
-(** Item type pairs (as [base:sub], the token shape a term uses), sorted, for
-    the search form's datalist. Feature names went with the criterion in
-    2026-09-10: search covers items, so suggesting a feature suggested a term
-    that errors.
+(** The search vocabulary as the tokens a term uses -- item type pairs
+    ([base:sub]) followed by artefact properties ([props:Conj]), each group
+    sorted. Feature names went with the criterion in 2026-09-10: search covers
+    items, so suggesting a feature suggested a term that errors. Properties
+    {!Search.Prop.searchable} rejects are left out for the same reason.
 
     A temp b-tree over every entry of the build: seconds, not milliseconds, so
     callers cache per process. The corpus only grows, so a stale value is a
-    missing suggestion, never a wrong one. *)
+    missing suggestion, never a wrong one. The property half is milliseconds and
+    rides along on that cache rather than earning one of its own. *)
 val distinct_criteria : t -> version:Query.Version.t -> string list Or_error.t
 
 (** {1 The deepen queue}
@@ -202,6 +253,16 @@ val queue_position : t -> version:Query.Version.t -> seed:string -> int option O
     this itself: [versions] records what was *ingested*, not what can be
     built. *)
 val servable_versions : t -> since:int -> string list Or_error.t
+
+(** The builds this corpus holds any seed for, unordered -- [versions] has no
+    comparison order and nothing may acquire one, so the caller imposes the
+    order it wants.
+
+    An existence seek per version rather than a count: [seed_fills_cohort]
+    leads with [version_id], so the [exists] stops at the first matching row.
+    That is what keeps it cheap enough to run on every [/health] request as the
+    corpus grows. *)
+val populated_versions : t -> string list Or_error.t
 
 (** Request a deep fill of one seed.
 

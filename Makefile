@@ -8,7 +8,7 @@ V          ?= trunk
 .DEFAULT_GOAL := help
 
 help:
-	@echo "DCSS seed explorer"
+	@echo "DCSS garden"
 	@echo
 	@echo "  make provision              build every version in versions.conf"
 	@echo "  make provision-<version>    build one version"

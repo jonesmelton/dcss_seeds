@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Build the pinned sqlite into builds/sqlite/: a static library the OCaml
+# bindings link against, and the matching CLI.
+#   tools/provision-sqlite
+#
+# Pinned because the system library differs per machine, and query plans and
+# float-to-text rendering differ with it. Bumping the pin: change the three
+# values below and the expect in test/test_toolchain.ml, then run
+# `just sqlite-relink`.
+set -euo pipefail
+
+version=3.53.4
+tarball=sqlite-autoconf-3530400.tar.gz
+sha3=454e45f61c6bd75b7420e7190732dea03ce6639c63ada47bbc592f67fc340338
+url="https://www.sqlite.org/2026/$tarball"
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+prefix="$root/builds/sqlite"
+jobs="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
+
+if [ "$(PKG_CONFIG_PATH="$prefix/lib/pkgconfig" pkg-config --modversion sqlite3 2>/dev/null)" = "$version" ]; then
+    echo "sqlite $version already built at $prefix"
+    exit 0
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+echo "==> sqlite $version"
+curl -fsSL -o "$work/$tarball" "$url"
+got="$(openssl dgst -sha3-256 -r "$work/$tarball" | cut -d' ' -f1)"
+if [ "$got" != "$sha3" ]; then
+    echo "error: $tarball sha3-256 is $got, expected $sha3" >&2
+    exit 1
+fi
+tar -xzf "$work/$tarball" -C "$work"
+
+rm -rf "$prefix"
+cd "$work/${tarball%.tar.gz}"
+./configure --prefix="$prefix" --disable-shared --fts5 \
+    CFLAGS="-O2 -DSQLITE_ENABLE_COLUMN_METADATA" >"$work/configure.log" 2>&1 \
+    || { cat "$work/configure.log" >&2; exit 1; }
+make -j"$jobs" >"$work/make.log" 2>&1 || { tail -50 "$work/make.log" >&2; exit 1; }
+make install >>"$work/make.log" 2>&1 || { tail -50 "$work/make.log" >&2; exit 1; }
+echo "==> $prefix"

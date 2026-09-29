@@ -29,9 +29,28 @@ let corpus =
        Nothing here is a stack, so any per-item count is 1. *)
   ; {|#SEED#((format 4)(version "0.34.1")(seed "20")(level "D:2")(cats (items (((artefact t)(base_type "jewellery")(kind "item")(name "ring of the Pariah {rC+ Str+5}")(quantity 1)(sub_type "ring")(text "ring of the Pariah"))((artefact t)(base_type "jewellery")(kind "item")(name "amulet \"Koruvve\" {Dissipate rF++ Str+4}")(quantity 1)(sub_type "amulet")(text "amulet Koruvve"))((artefact t)(base_type "weapon")(kind "item")(name "+6 whip \"Husch\" {vamp, rElec Dex+3}")(plus 6)(quantity 1)(sub_type "whip")(text "+6 whip Husch"))))))|}
   ; {|#SEED#((format 4)(version "0.34.1")(seed "20")(level "D:7")(cats (items (((artefact t)(base_type "armour")(kind "item")(name "+2 pair of gloves of Evolution {Harm Regen+ Fire}")(plus 2)(quantity 1)(sub_type "gloves")(text "+2 pair of gloves of Evolution"))))))|}
-    (* Two on the floor and a third behind a counter: three by the unqualified
-       count, two by the floor count. *)
+    (* Two on the floor and a third behind a counter. Three potions of haste by
+       a count the vocabulary can no longer spell, two by the floor term and one
+       by the shop term -- which is why this seed answers no "3x". *)
   ; {|#SEED#((format 4)(version "0.34.1")(seed "6")(level "D:4")(cats (items (((base_type "potion")(kind "item")(name "2 potions of haste")(quantity 2)(sub_type "haste")(text "2 potions of haste"))((base_type "potion")(cost 120)(kind "item")(name "potion of haste")(quantity 1)(sub_type "haste")(text "potion of haste"))))))|}
+    (* Artefact properties, the [Props] fixtures. Seed 30 carries both school
+       enhancers on one staff -- the reddit question this criterion exists for.
+       Seed 31 splits the same two across a staff and a ring, so it must not
+       match: same seed, different items. Seed 32 puts both on armour, which is
+       what makes folding the base type observable rather than theoretical. *)
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "30")(level "D:3")(cats (items (((artefact t)(artprops ((Conj 1)(Alch 1)))(base_type "staff")(kind "item")(name "staff of Olgreb {Conj Alch}")(quantity 1)(sub_type "poison")(text "staff of Olgreb"))))))|}
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "31")(level "D:4")(cats (items (((artefact t)(artprops ((Conj 1)))(base_type "staff")(kind "item")(name "staff \"Zeqog\" {Conj}")(quantity 1)(sub_type "fire")(text "staff Zeqog"))((artefact t)(artprops ((Alch 1)))(base_type "jewellery")(kind "item")(name "ring \"Weachohl\" {Alch}")(quantity 1)(sub_type "ring")(text "ring Weachohl"))))))|}
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "32")(level "D:5")(cats (items (((artefact t)(artprops ((Conj 1)(Alch 1)))(base_type "armour")(kind "item")(name "+1 robe of Vaeh {Conj Alch}")(plus 1)(quantity 1)(sub_type "robe")(text "+1 robe of Vaeh"))))))|}
+    (* The penalty rows [Prop.min_value] excludes: seed 33's rF is -2, so it is
+       not an answer to "a seed with rF". Seed 34 is rF++, which the same floor
+       must keep -- one property, two strengths, no grouping mechanism. *)
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "33")(level "D:2")(cats (items (((artefact t)(artprops ((rF -2)(Str 3)))(base_type "armour")(kind "item")(name "+0 cloak of Miasma {rF- Str+3}")(quantity 1)(sub_type "cloak")(text "+0 cloak of Miasma"))))))|}
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "34")(level "D:6")(cats (items (((artefact t)(artprops ((rF 2)))(base_type "armour")(kind "item")(name "+2 scale mail of Ember {rF++}")(plus 2)(quantity 1)(sub_type "scale mail")(text "+2 scale mail of Ember"))))))|}
+    (* An unrand behind a counter, and the only Wyrmbane in the fixture. It is
+       what makes the two position rules observable rather than asserted:
+       [artefact] is still a union and finds it, [name~] has no shop form and
+       cannot. *)
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "21")(level "D:4")(cats (items (((artefact t)(base_type "weapon")(cost 4000)(kind "item")(name "+8 Wyrmbane {holy, slay+4}")(plus 8)(quantity 1)(sub_type "demon blade")(text "+8 Wyrmbane"))))))|}
   ]
 ;;
 
@@ -49,6 +68,9 @@ let fresh_db () =
 
 let haste = { Search.Item_type.base_type = "potion"; sub_type = "haste" }
 let digging = { Search.Item_type.base_type = "wand"; sub_type = "digging" }
+let floor item = Search.Criterion.Item (item, Search.Criterion.Floor)
+let shop item = Search.Criterion.Item (item, Search.Criterion.Shop)
+let named s = Search.Criterion.Name_like (s, Search.Criterion.Floor)
 
 let run ?(rank = Search.Rank.default) db terms =
   let search = Search.create ~version ~terms () in
@@ -72,91 +94,10 @@ let run ?(rank = Search.Rank.default) db terms =
 
 let%expect_test "a single term finds every seed containing it" =
   let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Item haste) ];
+  run db [ Search.Term.create (floor haste) ];
   [%expect
     {|
     seeds on 0.34.1 with potion of haste
-      1: potion of haste x1 on D:2
-      2: 3 potions of haste x3 on D:5
-      3: 3 potions of haste x3 on D:1
-      4: potion of haste x3 on D:1
-      5: potion of haste x3 on D:2
-      6: potion of haste x3 on D:4
-      [end]
-    |}];
-  Db.close db
-;;
-
-(* min_count sums quantity rather than counting rows, so one stack of three
-   satisfies "3+". *)
-let%expect_test "min_count sums quantity, not rows" =
-  let db = fresh_db () in
-  run db [ Search.Term.create ~min_count:3 (Search.Criterion.Item haste) ];
-  [%expect
-    {|
-    seeds on 0.34.1 with 3+ potion of haste
-      2: 3 potions of haste x3 on D:5
-      3: 3 potions of haste x3 on D:1
-      4: potion of haste x3 on D:1
-      5: potion of haste x3 on D:2
-      6: potion of haste x3 on D:4
-      [end]
-    |}];
-  Db.close db
-;;
-
-let%expect_test "terms are conjunctive" =
-  let db = fresh_db () in
-  run
-    db
-    [ Search.Term.create (Search.Criterion.Feature "enter_shop")
-    ; Search.Term.create ~min_count:3 (Search.Criterion.Item haste)
-    ];
-  [%expect
-    {|
-    seeds on 0.34.1 with a shop, 3+ potion of haste
-      2: a General Store x1 on D:5; 3 potions of haste x3 on D:5
-      [end]
-    |}];
-  Db.close db
-;;
-
-(* cost being present is the only thing telling a shop item from a floor item,
-   so Shop_item is a distinct criterion rather than a modifier. *)
-let%expect_test "shop items are distinguished by cost being present" =
-  let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Shop_item digging) ];
-  [%expect
-    {|
-    seeds on 0.34.1 with wand of digging in a shop
-      2: wand of digging (0) x1 on D:5
-      [end]
-    |}];
-  run db [ Search.Term.create (Search.Criterion.Item digging) ];
-  [%expect
-    {|
-    seeds on 0.34.1 with wand of digging
-      2: wand of digging (0) x1 on D:5
-      [end]
-    |}];
-  Db.close db
-;;
-
-(* The floor half of the same partition. Seed 2's only wand of digging is shop
-   stock, so a floor term must find nothing there while the unqualified term
-   still finds it -- which keeps this from passing vacuously. *)
-let%expect_test "floor items exclude shop stock" =
-  let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Floor_item digging) ];
-  [%expect
-    {|
-    seeds on 0.34.1 with wand of digging on the floor
-      [end]
-    |}];
-  run db [ Search.Term.create (Search.Criterion.Floor_item haste) ];
-  [%expect
-    {|
-    seeds on 0.34.1 with potion of haste on the floor
       1: potion of haste x1 on D:2
       2: 3 potions of haste x3 on D:5
       3: 3 potions of haste x3 on D:1
@@ -168,15 +109,14 @@ let%expect_test "floor items exclude shop stock" =
   Db.close db
 ;;
 
-(* min_count counts across the floor/shop boundary unless the term says
-   otherwise, so the floor form can match strictly fewer seeds than filtering an
-   unqualified result set would suggest. *)
-let%expect_test "a floor term counts only floor stock" =
+(* min_count sums quantity rather than counting rows, so one stack of three
+   satisfies "3+". *)
+let%expect_test "min_count sums quantity, not rows" =
   let db = fresh_db () in
-  run db [ Search.Term.create ~min_count:3 (Search.Criterion.Floor_item haste) ];
+  run db [ Search.Term.create ~min_count:3 (floor haste) ];
   [%expect
     {|
-    seeds on 0.34.1 with 3+ potion of haste on the floor
+    seeds on 0.34.1 with 3+ potion of haste
       2: 3 potions of haste x3 on D:5
       3: 3 potions of haste x3 on D:1
       4: potion of haste x3 on D:1
@@ -186,11 +126,169 @@ let%expect_test "a floor term counts only floor stock" =
   Db.close db
 ;;
 
+let%expect_test "terms are conjunctive" =
+  let db = fresh_db () in
+  run
+    db
+    [ Search.Term.create (Search.Criterion.Feature "enter_shop")
+    ; Search.Term.create ~min_count:3 (floor haste)
+    ];
+  [%expect
+    {|
+    seeds on 0.34.1 with a shop, 3+ potion of haste
+      2: a General Store x1 on D:5; 3 potions of haste x3 on D:5
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* Seed 2's only wand of digging is shop stock, so an unqualified term must not
+   find it. That a bare term reaches a shop at all is the regression this pins:
+   it was the behaviour before this change, and it answers a different question
+   than the reader asked. *)
+let%expect_test "a bare item term returns no shop stock" =
+  let db = fresh_db () in
+  run db [ Search.Term.create (floor digging) ];
+  [%expect
+    {|
+    seeds on 0.34.1 with wand of digging
+      [end]
+    |}];
+  run db [ Search.Term.create (shop digging) ];
+  [%expect
+    {|
+    seeds on 0.34.1 with wand of digging in a shop
+      2: wand of digging (0) x1 on D:5
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* Seed 6 holds haste on both sides, so it tells the two terms apart by evidence
+   rather than by presence: the bare term totals two, the shop term one. *)
+let%expect_test "the shop term returns only shop stock" =
+  let db = fresh_db () in
+  run db [ Search.Term.create (floor haste) ];
+  [%expect
+    {|
+    seeds on 0.34.1 with potion of haste
+      1: potion of haste x1 on D:2
+      2: 3 potions of haste x3 on D:5
+      3: 3 potions of haste x3 on D:1
+      4: potion of haste x3 on D:1
+      5: potion of haste x3 on D:2
+      6: 2 potions of haste x2 on D:4
+      [end]
+    |}];
+  run db [ Search.Term.create (shop haste) ];
+  [%expect
+    {|
+    seeds on 0.34.1 with potion of haste in a shop
+      6: potion of haste x1 on D:4
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* The two positions partition the rows, so together they cover exactly what an
+   unqualified term used to return. Checked against counts SQLite computes off
+   the same corpus rather than against literals, which would only restate the
+   fixture by hand. The seed sets overlap where the row sets cannot -- seed 6 is
+   in both -- and that gap between the two levels is precisely what breaks
+   [min_count]. *)
+let%expect_test "floor and shop partition the union a bare term used to return" =
+  let db = fresh_db () in
+  let scalar sql = List.hd_exn (Db.query db sql) in
+  let haste_rows extra =
+    scalar
+      (sprintf
+         "select count(*) from entries where version_id = (select id from versions where \
+          version = '0.34.1') and base_type_id = (select id from strings where val = \
+          'potion') and sub_type_id = (select id from strings where val = 'haste') and \
+          %s"
+         extra)
+  in
+  let union_seeds =
+    scalar
+      "select count(distinct seed) from entries where version_id = (select id from \
+       versions where version = '0.34.1') and base_type_id = (select id from strings \
+       where val = 'potion') and sub_type_id = (select id from strings where val = \
+       'haste')"
+  in
+  let seeds_of criterion =
+    let search =
+      Search.create
+        ~version
+        ~terms:[ Search.Term.create criterion ]
+        ~page:(Query.Page.create ~limit:1000 ())
+        ()
+    in
+    let matches, _ = Or_error.ok_exn (Db.search_seeds db search ~rank:Search.Rank.Seed) in
+    String.Set.of_list (List.map matches ~f:(fun (m : Search.Match.t) -> m.seed))
+  in
+  let floor_seeds = seeds_of (floor haste) in
+  let shop_seeds = seeds_of (shop haste) in
+  printf
+    "rows: any=%s floor=%s shop=%s\n"
+    (haste_rows "1 = 1")
+    (haste_rows "cost is null")
+    (haste_rows "cost is not null");
+  printf
+    "seeds: any=%s floor|shop=%d overlap=%s\n"
+    union_seeds
+    (Set.length (Set.union floor_seeds shop_seeds))
+    (String.Set.sexp_of_t (Set.inter floor_seeds shop_seeds) |> Sexp.to_string_hum);
+  [%expect
+    {|
+    rows: any=10 floor=9 shop=1
+    seeds: any=6 floor|shop=6 overlap=(6)
+    |}];
+  Db.close db
+;;
+
+(* The partition's visible break, and why the help text has to name it. Seed 6
+   holds two potions of haste on the floor and a third behind a counter: three
+   by the union the vocabulary no longer spells, and therefore an answer to
+   neither counted term. *)
+let%expect_test "two on the floor and one in a shop satisfy neither 3x form" =
+  let db = fresh_db () in
+  run db [ Search.Term.create ~min_count:3 (floor haste) ];
+  [%expect
+    {|
+    seeds on 0.34.1 with 3+ potion of haste
+      2: 3 potions of haste x3 on D:5
+      3: 3 potions of haste x3 on D:1
+      4: potion of haste x3 on D:1
+      5: potion of haste x3 on D:2
+      [end]
+    |}];
+  run db [ Search.Term.create ~min_count:3 (shop haste) ];
+  [%expect
+    {|
+    seeds on 0.34.1 with 3+ potion of haste in a shop
+      [end]
+    |}];
+  (* Two it does satisfy, so the seed is absent above for its count rather than
+     for being outside the term. *)
+  run db [ Search.Term.create ~min_count:2 (floor haste) ];
+  [%expect
+    {|
+    seeds on 0.34.1 with 2+ potion of haste
+      2: 3 potions of haste x3 on D:5
+      3: 3 potions of haste x3 on D:1
+      4: potion of haste x3 on D:1
+      5: potion of haste x3 on D:2
+      6: 2 potions of haste x2 on D:4
+      [end]
+    |}];
+  Db.close db
+;;
+
 (* An unrand's display name carries a varying enchantment prefix, so it is
    findable only by substring. *)
 let%expect_test "name_like finds an unrand through its enchantment prefix" =
   let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Name_like "Throatcutter") ];
+  run db [ Search.Term.create (named "Throatcutter") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "Throatcutter"
@@ -200,6 +298,38 @@ let%expect_test "name_like finds an unrand through its enchantment prefix" =
   Db.close db
 ;;
 
+(* [name~] has no shop form, so it cannot reach seed 21's Wyrmbane -- the only
+   one in the fixture. An empty result would otherwise be indistinguishable from
+   a corpus that holds no such name, so the shop-qualified criterion is run
+   straight after to show the row is there. *)
+let%expect_test "name_like does not reach shop stock, and has no form that would" =
+  let db = fresh_db () in
+  run db [ Search.Term.create (named "Wyrmbane") ];
+  [%expect
+    {|
+    seeds on 0.34.1 with named like "Wyrmbane"
+      [end]
+    |}];
+  (* Constructed directly, since [Params] refuses to build it. Storage would
+     serve a shop name search; the decision not to offer one is at the parse
+     boundary, and this is what says so. *)
+  run
+    db
+    [ Search.Term.create (Search.Criterion.Name_like ("Wyrmbane", Search.Criterion.Shop))
+    ];
+  [%expect
+    {|
+    seeds on 0.34.1 with named like "Wyrmbane" in a shop
+      21: +8 Wyrmbane {holy, slay+4} x1 on D:4
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* [Artefact] is the one criterion still spanning both sides, and seed 21's
+   shop-stocked Wyrmbane is what makes that observable. Deliberate: artefacts
+   are where shop stock concentrates, and "artefact" carries no colon for a
+   position prefix to lead. *)
 let%expect_test "artefact is its own criterion" =
   let db = fresh_db () in
   run db [ Search.Term.create Search.Criterion.Artefact ];
@@ -207,7 +337,13 @@ let%expect_test "artefact is its own criterion" =
     {|
     seeds on 0.34.1 with an artefact
       20: ring of the Pariah {rC+ Str+5} x4 on D:2
+      21: +8 Wyrmbane {holy, slay+4} x1 on D:4
       3: +7 Throatcutter {drain, coup de grace} x1 on D:1
+      30: staff of Olgreb {Conj Alch} x1 on D:3
+      31: staff "Zeqog" {Conj} x2 on D:4
+      32: +1 robe of Vaeh {Conj Alch} x1 on D:5
+      33: +0 cloak of Miasma {rF- Str+3} x1 on D:2
+      34: +2 scale mail of Ember {rF++} x1 on D:6
       7: +2 Blade of 100%_pure {holy} x1 on D:2
       [end]
     |}];
@@ -233,7 +369,13 @@ let%expect_test "a heterogeneous term separates its exemplar from its total" =
   [%expect
     {|
     20: ring of the Pariah {rC+ Str+5} | count 4 | distinct 4 | D:2
+    21: +8 Wyrmbane {holy, slay+4} | count 1 | distinct 1 | D:4
     3: +7 Throatcutter {drain, coup de grace} | count 1 | distinct 1 | D:1
+    30: staff of Olgreb {Conj Alch} | count 1 | distinct 1 | D:3
+    31: staff "Zeqog" {Conj} | count 2 | distinct 2 | D:4
+    32: +1 robe of Vaeh {Conj Alch} | count 1 | distinct 1 | D:5
+    33: +0 cloak of Miasma {rF- Str+3} | count 1 | distinct 1 | D:2
+    34: +2 scale mail of Ember {rF++} | count 1 | distinct 1 | D:6
     7: +2 Blade of 100%_pure {holy} | count 1 | distinct 1 | D:2
     |}];
   Db.close db
@@ -248,7 +390,13 @@ let%expect_test "an empty search lists every seed of the version" =
       1:
       2:
       20:
+      21:
       3:
+      30:
+      31:
+      32:
+      33:
+      34:
       4:
       5:
       6:
@@ -262,7 +410,7 @@ let%expect_test "an empty search lists every seed of the version" =
    beginning with "100". *)
 let%expect_test "like wildcards in a fragment are escaped" =
   let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Name_like "%") ];
+  run db [ Search.Term.create (named "%") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "%"
@@ -278,7 +426,7 @@ let%expect_test "like wildcards in a fragment are escaped" =
    and this test matches seed 7. *)
 let%expect_test "a wildcard in a fragment matches only itself, literally" =
   let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Name_like "100%pure") ];
+  run db [ Search.Term.create (named "100%pure") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "100%pure"
@@ -289,7 +437,7 @@ let%expect_test "a wildcard in a fragment matches only itself, literally" =
 
 let%expect_test "a literal wildcard is found by its own escaped fragment" =
   let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Name_like "100%_pure") ];
+  run db [ Search.Term.create (named "100%_pure") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "100%_pure"
@@ -303,7 +451,7 @@ let%expect_test "a literal wildcard is found by its own escaped fragment" =
    by "100%Xpure"-shaped fragments through the index. *)
 let%expect_test "an underscore in a fragment is literal too" =
   let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Name_like "0%_pu") ];
+  run db [ Search.Term.create (named "0%_pu") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "0%_pu"
@@ -325,20 +473,20 @@ let%expect_test "an underscore in a fragment is literal too" =
    while every fallback-path test above keeps passing. *)
 let%expect_test "trigram path agrees with the scan on a literal wildcard" =
   let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Name_like "100%pure") ];
+  run db [ Search.Term.create (named "100%pure") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "100%pure"
       [end]
     |}];
-  run db [ Search.Term.create (Search.Criterion.Name_like "100%_pure") ];
+  run db [ Search.Term.create (named "100%_pure") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "100%_pure"
       7: +2 Blade of 100%_pure {holy} x1 on D:2
       [end]
     |}];
-  run db [ Search.Term.create (Search.Criterion.Name_like "0%_pu") ];
+  run db [ Search.Term.create (named "0%_pu") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "0%_pu"
@@ -350,7 +498,7 @@ let%expect_test "trigram path agrees with the scan on a literal wildcard" =
 
 let%expect_test "trigram path finds an unrand through its enchantment prefix" =
   let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Name_like "Throatcutter") ];
+  run db [ Search.Term.create (named "Throatcutter") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "Throatcutter"
@@ -364,7 +512,7 @@ let%expect_test "trigram path finds an unrand through its enchantment prefix" =
    ASCII-case-insensitive, so the two stages agree on folding. *)
 let%expect_test "trigram substring match folds case like the scan" =
   let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Name_like "THROATCUTTER") ];
+  run db [ Search.Term.create (named "THROATCUTTER") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "THROATCUTTER"
@@ -374,24 +522,61 @@ let%expect_test "trigram substring match folds case like the scan" =
   Db.close db
 ;;
 
-(* A name added after the rebuild is refused, not silently missed. *)
+(* A name added after the rebuild is refused, not silently missed.
+
+   Both positions refuse. What a rebuild staled is the dictionary lookup turning
+   a fragment into name ids, which runs before [cost] is consulted at all, so a
+   shop-qualified name search is no better placed to answer than a floor one.
+   Answering [false] for one of them would return "no seeds" for a name the
+   corpus holds -- the silent direction this whole mechanism exists to close. *)
 let%expect_test "a fill after the rebuild refuses rather than losing rows" =
   let db = fresh_db () in
   let line =
     {|#SEED#((format 4)(version "0.34.1")(seed "8")(level "D:1")(cats (items (((artefact t)(base_type "weapon")(kind "item")(name "+3 Gnarlfang {venom}")(plus 3)(quantity 1)(sub_type "whip")(text "+3 Gnarlfang"))))))|}
   in
   ignore (Db.write_batch db [ Or_error.ok_exn (Reader.parse_line line) ] : Db.Counts.t);
-  run db [ Search.Term.create (Search.Criterion.Name_like "Gnarlfang") ];
+  printf "fts_is_current=%b\n" (Db.fts_is_current db);
+  run db [ Search.Term.create (named "Gnarlfang") ];
+  run
+    db
+    [ Search.Term.create (Search.Criterion.Name_like ("Gnarlfang", Search.Criterion.Shop))
+    ];
   [%expect
-    {| search-index-rebuilding: the name substring index is being rebuilt; searching by name is unavailable until it finishes |}];
+    {|
+    fts_is_current=false
+    search-index-rebuilding: the name substring index is being rebuilt; searching by name is unavailable until it finishes
+    search-index-rebuilding: the name substring index is being rebuilt; searching by name is unavailable until it finishes
+    |}];
   (* Served once the index covers the new name. *)
   Or_error.ok_exn (Db.rebuild_fts db);
-  run db [ Search.Term.create (Search.Criterion.Name_like "Gnarlfang") ];
+  run db [ Search.Term.create (named "Gnarlfang") ];
   [%expect
     {|
     seeds on 0.34.1 with named like "Gnarlfang"
       8: +3 Gnarlfang {venom} x1 on D:1
       [end]
+    |}];
+  Db.close db
+;;
+
+(* The mark itself, not a fill that moves it: [strings_fts_state] is ordinary
+   SQL, so a test can stale the index without writing a row the index would then
+   legitimately lack. That separates the refusal from the write path -- a corpus
+   predating the index has no row here at all, and must also refuse. *)
+let%expect_test "the refusal reads the mark, not the dictionary" =
+  let db = fresh_db () in
+  Db.exec_script db "update strings_fts_state set built_through = 0";
+  printf "fts_is_current=%b\n" (Db.fts_is_current db);
+  run db [ Search.Term.create (named "Throatcutter") ];
+  Db.exec_script db "delete from strings_fts_state";
+  printf "no row: fts_is_current=%b\n" (Db.fts_is_current db);
+  run db [ Search.Term.create (named "Throatcutter") ];
+  [%expect
+    {|
+    fts_is_current=false
+    search-index-rebuilding: the name substring index is being rebuilt; searching by name is unavailable until it finishes
+    no row: fts_is_current=false
+    search-index-rebuilding: the name substring index is being rebuilt; searching by name is unavailable until it finishes
     |}];
   Db.close db
 ;;
@@ -402,7 +587,7 @@ let%expect_test "a stale index does not refuse searches that do not use it" =
     {|#SEED#((format 4)(version "0.34.1")(seed "9")(level "D:1")(cats (items (((artefact t)(base_type "weapon")(kind "item")(name "+1 Sniggerfoil {pain}")(plus 1)(quantity 1)(sub_type "dagger")(text "+1 Sniggerfoil"))))))|}
   in
   ignore (Db.write_batch db [ Or_error.ok_exn (Reader.parse_line line) ] : Db.Counts.t);
-  run db [ Search.Term.create (Search.Criterion.Item haste) ];
+  run db [ Search.Term.create (floor haste) ];
   [%expect
     {|
     seeds on 0.34.1 with potion of haste
@@ -411,7 +596,7 @@ let%expect_test "a stale index does not refuse searches that do not use it" =
       3: 3 potions of haste x3 on D:1
       4: potion of haste x3 on D:1
       5: potion of haste x3 on D:2
-      6: potion of haste x3 on D:4
+      6: 2 potions of haste x2 on D:4
       [end]
     |}];
   Db.close db
@@ -426,10 +611,7 @@ let%expect_test "a stale-index refusal is recognisable to the caller" =
   in
   ignore (Db.write_batch db records : Db.Counts.t);
   let search =
-    Search.create
-      ~version
-      ~terms:[ Search.Term.create (Search.Criterion.Name_like "Throatcutter") ]
-      ()
+    Search.create ~version ~terms:[ Search.Term.create (named "Throatcutter") ] ()
   in
   (match Db.search_seeds db search ~rank:Search.Rank.default with
    | Ok _ -> print_endline "served"
@@ -487,7 +669,7 @@ let%expect_test "a portal with a parent ranks at its parent's depth" =
 ;;
 
 let%expect_test "min_count below one is clamped, so a term cannot match everything" =
-  let term = Search.Term.create ~min_count:0 (Search.Criterion.Item haste) in
+  let term = Search.Term.create ~min_count:0 (floor haste) in
   print_s [%sexp (term.min_count : int)];
   [%expect {| 1 |}]
 ;;
@@ -501,9 +683,7 @@ let%expect_test "partition_terms leaves nothing unindexed" =
     Search.create
       ~version
       ~terms:
-        [ Search.Term.create (Search.Criterion.Name_like "Throatcutter")
-        ; Search.Term.create (Search.Criterion.Item haste)
-        ]
+        [ Search.Term.create (named "Throatcutter"); Search.Term.create (floor haste) ]
       ()
   in
   let indexed, unindexed = Search.partition_terms search in
@@ -519,7 +699,7 @@ let%expect_test "partition_terms leaves nothing unindexed" =
    keyset. *)
 let%expect_test "shallowest ranking orders by the earliest evidence" =
   let db = fresh_db () in
-  let terms = [ Search.Term.create (Search.Criterion.Item haste) ] in
+  let terms = [ Search.Term.create (floor haste) ] in
   let show rank =
     let search = Search.create ~version ~terms () in
     let matches, _ = Or_error.ok_exn (Db.search_seeds db search ~rank) in
@@ -546,7 +726,7 @@ let%expect_test "shallowest ranking orders by the earliest evidence" =
    share, or the reader cannot see why it matched. *)
 let%expect_test "evidence totals a count that accumulates across levels" =
   let db = fresh_db () in
-  run db [ Search.Term.create ~min_count:3 (Search.Criterion.Item haste) ];
+  run db [ Search.Term.create ~min_count:3 (floor haste) ];
   [%expect
     {|
     seeds on 0.34.1 with 3+ potion of haste
@@ -554,7 +734,6 @@ let%expect_test "evidence totals a count that accumulates across levels" =
       3: 3 potions of haste x3 on D:1
       4: potion of haste x3 on D:1
       5: potion of haste x3 on D:2
-      6: potion of haste x3 on D:4
       [end]
     |}];
   Db.close db
@@ -564,7 +743,7 @@ let%expect_test "evidence totals a count that accumulates across levels" =
    the seed and silently shrinks the keyset page. *)
 let%expect_test "a seed matching a term several times appears once" =
   let db = fresh_db () in
-  run db [ Search.Term.create (Search.Criterion.Item haste) ];
+  run db [ Search.Term.create (floor haste) ];
   [%expect
     {|
     seeds on 0.34.1 with potion of haste
@@ -573,7 +752,7 @@ let%expect_test "a seed matching a term several times appears once" =
       3: 3 potions of haste x3 on D:1
       4: potion of haste x3 on D:1
       5: potion of haste x3 on D:2
-      6: potion of haste x3 on D:4
+      6: 2 potions of haste x2 on D:4
       [end]
     |}];
   Db.close db
@@ -584,7 +763,7 @@ let%expect_test "a seed matching a term several times appears once" =
    evidence in two. *)
 let%expect_test "evidence totals across crawl's pluralised stack names" =
   let db = fresh_db () in
-  run db [ Search.Term.create ~min_count:3 (Search.Criterion.Item haste) ];
+  run db [ Search.Term.create ~min_count:3 (floor haste) ];
   [%expect
     {|
     seeds on 0.34.1 with 3+ potion of haste
@@ -592,7 +771,6 @@ let%expect_test "evidence totals across crawl's pluralised stack names" =
       3: 3 potions of haste x3 on D:1
       4: potion of haste x3 on D:1
       5: potion of haste x3 on D:2
-      6: potion of haste x3 on D:4
       [end]
     |}];
   Db.close db
@@ -603,7 +781,7 @@ let%expect_test "evidence totals across crawl's pluralised stack names" =
    rather than restart it at a seed value. *)
 let%expect_test "shallowest ranking pages by offset and stays ordered" =
   let db = fresh_db () in
-  let terms = [ Search.Term.create (Search.Criterion.Item haste) ] in
+  let terms = [ Search.Term.create (floor haste) ] in
   let show after =
     let search =
       Search.create ~version ~terms ~page:(Query.Page.create ?after ~limit:2 ()) ()
@@ -643,9 +821,7 @@ let%expect_test "shallowest ranking pages by offset and stays ordered" =
    arithmetic rather than by ingesting thousands of seeds. *)
 let%expect_test "ranking refuses a match set larger than the sort limit" =
   let db = fresh_db () in
-  let search =
-    Search.create ~version ~terms:[ Search.Term.create (Search.Criterion.Item haste) ] ()
-  in
+  let search = Search.create ~version ~terms:[ Search.Term.create (floor haste) ] () in
   let matches, _ =
     Or_error.ok_exn (Db.search_seeds db search ~rank:Search.Rank.Shallowest)
   in
@@ -658,11 +834,12 @@ let%expect_test "ranking refuses a match set larger than the sort limit" =
   Db.close db
 ;;
 
-(* A short Name_like fragment is indexed but not cheap: the leading-wildcard
-   like scans the whole dictionary. The minimum length is enforced at the parse
-   boundary; this tests the predicate that keeps such queries off the scheduler
+(* No Name_like is cheap: the store declines every fragment, so all of them take
+   the SQL fallback, whose cost is the candidate set rather than the lookup. The
+   minimum length is still enforced at the parse boundary, for a different
+   reason. This tests the predicate that keeps such queries off the scheduler
    thread. *)
-let%expect_test "is_cheap rejects short name_like fragments" =
+let%expect_test "is_cheap rejects every name_like fragment" =
   let show criterion =
     printf
       "%-30s -> cheap=%b\n"
@@ -671,21 +848,131 @@ let%expect_test "is_cheap rejects short name_like fragments" =
   in
   List.iter
     ~f:show
-    [ Search.Criterion.Name_like "ab"
-    ; Search.Criterion.Name_like "abc"
-    ; Search.Criterion.Name_like "Throatcutter"
-    ; Search.Criterion.Item haste
+    [ named "ab"
+    ; named "abc"
+    ; named "Throatcutter"
+    ; floor haste
     ; Search.Criterion.Artefact
     ; Search.Criterion.Unique "Sigmund"
     ];
   [%expect
     {|
     named like "ab"                -> cheap=false
-    named like "abc"               -> cheap=true
-    named like "Throatcutter"      -> cheap=true
+    named like "abc"               -> cheap=false
+    named like "Throatcutter"      -> cheap=false
     potion of haste                -> cheap=true
     an artefact                    -> cheap=true
     Sigmund                        -> cheap=true
+    |}]
+;;
+
+let props ?base_type ?(position = Search.Criterion.Floor) props =
+  Search.Criterion.Props { base_type; props; position }
+;;
+
+(* The question the criterion exists for: both properties on *one* item. Seed 31
+   holds a Conj staff and an Alch ring and must not match -- seed-scoped
+   conjunction would return it, and the evidence rendering could not say why it
+   was wrong. *)
+let%expect_test "Props demands every property on the same item" =
+  let db = fresh_db () in
+  run db [ Search.Term.create (props [ "Conj"; "Alch" ]) ];
+  [%expect
+    {|
+    seeds on 0.34.1 with an artefact with Conj and Alch
+      30: staff of Olgreb {Conj Alch} x1 on D:3
+      32: +1 robe of Vaeh {Conj Alch} x1 on D:5
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* Folding the base type in is what separates the staff from the robe. Two terms
+   ([item:staff] beside the properties) would match seed 32 as well, since its
+   robe carries the pair and nothing says the staff and the properties are the
+   same object. *)
+let%expect_test "Props scopes to a base type when given one" =
+  let db = fresh_db () in
+  run db [ Search.Term.create (props ~base_type:"staff" [ "Conj"; "Alch" ]) ];
+  [%expect
+    {|
+    seeds on 0.34.1 with staff with Conj and Alch
+      30: staff of Olgreb {Conj Alch} x1 on D:3
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* [Prop.min_value] excludes the penalty rows. Seed 33's cloak is rF-2 and is
+   not an answer to "a seed with rF"; seed 34's rF++ is the same property at a
+   greater strength and is. That is the whole grouping mechanism. *)
+let%expect_test "Props excludes negative values and keeps stronger ones" =
+  let db = fresh_db () in
+  run db [ Search.Term.create (props [ "rF" ]) ];
+  [%expect
+    {|
+    seeds on 0.34.1 with an artefact with rF
+      34: +2 scale mail of Ember {rF++} x1 on D:6
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* Evidence is the item row itself, so a property search names the artefact that
+   carried the properties rather than an exemplar standing in for it. *)
+let%expect_test "Props beside another term intersects by seed" =
+  let db = fresh_db () in
+  run
+    db
+    [ Search.Term.create (props ~base_type:"armour" [ "Conj" ])
+    ; Search.Term.create Search.Criterion.Artefact
+    ];
+  [%expect
+    {|
+    seeds on 0.34.1 with armour with Conj, an artefact
+      32: +1 robe of Vaeh {Conj Alch} x1 on D:5; +1 robe of Vaeh {Conj Alch} x1 on D:5
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* Bare properties drive the whole build; with a base type the seek drives and
+   the properties filter. The split is what keeps the expensive form off the
+   scheduler thread. *)
+let%expect_test "Props is cheap only when it carries a base type" =
+  let show criterion =
+    printf
+      "%-40s -> cheap=%b\n"
+      (Search.Criterion.to_string criterion)
+      (Search.Criterion.is_cheap criterion)
+  in
+  List.iter
+    ~f:show
+    [ props [ "Conj"; "Alch" ]; props ~base_type:"staff" [ "Conj"; "Alch" ] ];
+  [%expect
+    {|
+    an artefact with Conj and Alch           -> cheap=false
+    staff with Conj and Alch                 -> cheap=true
+    |}]
+;;
+
+(* A term round-trips through a link: the form and the result links must produce
+   the search already on screen. Comma separates, because '+Blink' is a property
+   name and '+' would spell a set holding it as "Conj++Blink". *)
+let%expect_test "Props round-trips through the query string" =
+  List.iter
+    ~f:(fun c -> print_endline (Search.Term.to_query_string (Search.Term.create c)))
+    [ props [ "Conj" ]
+    ; props [ "Conj"; "Alch" ]
+    ; props ~base_type:"staff" [ "Conj"; "Alch" ]
+    ; props [ "+Blink"; "Conj" ]
+    ];
+  [%expect
+    {|
+    props:Conj
+    props:Conj,Alch
+    staff props:Conj,Alch
+    props:+Blink,Conj
     |}]
 ;;
 
@@ -705,8 +992,8 @@ let%expect_test "is_cheap rejects short name_like fragments" =
 module Synth = struct
   type t =
     { seed : int
-    ; haste_floor_qty : int (* 0 means "no floor haste stack" *)
-    ; haste_shop_qty : int (* 0 means "no shop haste stack" *)
+    ; haste_floor_qty : int (* total floor potions, 0 for none *)
+    ; haste_shop_qty : int (* total shop potions, 0 for none *)
     ; digging : bool (* one floor wand of digging *)
     ; has_shop_feature : bool (* an unrelated feature term can drive/probe on *)
     ; artefact : bool
@@ -730,7 +1017,11 @@ module Synth = struct
   ;;
 end
 
-let synth_line (s : Synth.t) =
+(* A floor total of two or more splits across two levels, leaving the sum
+   unchanged. The shop stack used to be a seed's second matching row; now that no
+   bare term reaches it, the split is what keeps [distinct] and
+   [min_count]-across-levels from passing vacuously here. *)
+let synth_lines (s : Synth.t) =
   let feature =
     if s.Synth.has_shop_feature
     then
@@ -771,26 +1062,41 @@ let synth_line (s : Synth.t) =
         s.Synth.seed
     else ""
   in
-  let items =
-    String.concat
-      [ potion ~qty:s.Synth.haste_floor_qty ~cost:None
-      ; potion ~qty:s.Synth.haste_shop_qty ~cost:(Some 100)
-      ; digging
-      ; artefact
-      ]
+  let split = s.Synth.haste_floor_qty >= 2 in
+  let level ~name ~feature ~items =
+    sprintf
+      {|#SEED#((format 4)(version "0.34.1")(seed "%d")(level "%s")(cats (features (%s))(items (%s))))|}
+      s.Synth.seed
+      name
+      feature
+      items
   in
-  sprintf
-    {|#SEED#((format 4)(version "0.34.1")(seed "%d")(level "D:3")(cats (features (%s))(items (%s))))|}
-    s.Synth.seed
-    feature
-    items
+  [ level
+      ~name:"D:3"
+      ~feature
+      ~items:
+        (String.concat
+           [ potion
+               ~qty:
+                 (if split then s.Synth.haste_floor_qty - 1 else s.Synth.haste_floor_qty)
+               ~cost:None
+           ; potion ~qty:s.Synth.haste_shop_qty ~cost:(Some 100)
+           ; digging
+           ; artefact
+           ])
+  ]
+  @
+  if split
+  then [ level ~name:"D:5" ~feature:"" ~items:(potion ~qty:1 ~cost:None) ]
+  else []
 ;;
 
 let synth_db () =
   let db = Db.open_ ":memory:" in
   Db.exec_script db (In_channel.read_all "../schema.sql");
   let records =
-    List.map Synth.all ~f:(fun s -> Or_error.ok_exn (Reader.parse_line (synth_line s)))
+    List.concat_map Synth.all ~f:(fun s ->
+      List.map (synth_lines s) ~f:(fun line -> Or_error.ok_exn (Reader.parse_line line)))
   in
   ignore (Db.write_batch db records : Db.Counts.t);
   db
@@ -837,15 +1143,13 @@ let expect_same ~label expected actual =
 (* A single indexed term, no min_count: the simplest driver-only shape. *)
 let%expect_test "single term matches the naive reference" =
   let db = synth_db () in
-  let expected =
-    seeds_where Synth.all ~f:(fun s -> s.haste_floor_qty + s.haste_shop_qty > 0)
-  in
+  let expected = seeds_where Synth.all ~f:(fun s -> s.haste_floor_qty > 0) in
   expect_same
     ~label:"potion:haste"
     expected
-    (matched_set db [ Search.Term.create (Search.Criterion.Item haste) ]);
+    (matched_set db [ Search.Term.create (floor haste) ]);
   Db.close db;
-  [%expect {| potion:haste: match (36 seeds) |}]
+  [%expect {| potion:haste: match (30 seeds) |}]
 ;;
 
 (* Two-term intersection: the shape the rewrite turns from [intersect] into a
@@ -853,15 +1157,14 @@ let%expect_test "single term matches the naive reference" =
 let%expect_test "two-term intersection matches the naive reference" =
   let db = synth_db () in
   let expected =
-    seeds_where Synth.all ~f:(fun s ->
-      s.haste_floor_qty + s.haste_shop_qty > 0 && s.has_shop_feature)
+    seeds_where Synth.all ~f:(fun s -> s.haste_floor_qty > 0 && s.has_shop_feature)
   in
   expect_same
     ~label:"potion:haste & enter_shop"
     expected
     (matched_set
        db
-       [ Search.Term.create (Search.Criterion.Item haste)
+       [ Search.Term.create (floor haste)
        ; Search.Term.create (Search.Criterion.Feature "enter_shop")
        ]);
   Db.close db;
@@ -874,17 +1177,16 @@ let%expect_test "two-term intersection matches the naive reference" =
 let%expect_test "three-term intersection matches the naive reference" =
   let db = synth_db () in
   let expected =
-    seeds_where Synth.all ~f:(fun s ->
-      s.digging && s.artefact && s.haste_floor_qty + s.haste_shop_qty > 0)
+    seeds_where Synth.all ~f:(fun s -> s.digging && s.artefact && s.haste_floor_qty > 0)
   in
   expect_same
     ~label:"digging & artefact & potion:haste"
     expected
     (matched_set
        db
-       [ Search.Term.create (Search.Criterion.Item digging)
+       [ Search.Term.create (floor digging)
        ; Search.Term.create Search.Criterion.Artefact
-       ; Search.Term.create (Search.Criterion.Item haste)
+       ; Search.Term.create (floor haste)
        ]);
   Db.close db;
   [%expect {| digging & artefact & potion:haste: match (1 seeds) |}]
@@ -893,25 +1195,23 @@ let%expect_test "three-term intersection matches the naive reference" =
 (* min_count as the sole term, so it is necessarily the driver. *)
 let%expect_test "min_count as driver matches the naive reference" =
   let db = synth_db () in
-  let expected_item =
-    seeds_where Synth.all ~f:(fun s -> s.haste_floor_qty + s.haste_shop_qty >= 3)
-  in
   let expected_floor = seeds_where Synth.all ~f:(fun s -> s.haste_floor_qty >= 3) in
+  let expected_shop = seeds_where Synth.all ~f:(fun s -> s.haste_shop_qty >= 2) in
   expect_same
     ~label:"3x potion:haste"
-    expected_item
-    (matched_set db [ Search.Term.create ~min_count:3 (Search.Criterion.Item haste) ]);
-  expect_same
-    ~label:"3x floor potion:haste"
     expected_floor
-    (matched_set
-       db
-       [ Search.Term.create ~min_count:3 (Search.Criterion.Floor_item haste) ]);
+    (matched_set db [ Search.Term.create ~min_count:3 (floor haste) ]);
+  (* The same driver shape on the other side of the partition: the group-by
+     must total shop rows only, not fall back to every row of the seed. *)
+  expect_same
+    ~label:"2x shop potion:haste"
+    expected_shop
+    (matched_set db [ Search.Term.create ~min_count:2 (shop haste) ]);
   Db.close db;
   [%expect
     {|
-    3x potion:haste: match (19 seeds)
-    3x floor potion:haste: match (10 seeds)
+    3x potion:haste: match (10 seeds)
+    2x shop potion:haste: match (12 seeds)
     |}]
 ;;
 
@@ -921,19 +1221,18 @@ let%expect_test "min_count as driver matches the naive reference" =
 let%expect_test "min_count as non-driver matches the naive reference" =
   let db = synth_db () in
   let expected =
-    seeds_where Synth.all ~f:(fun s ->
-      s.digging && s.haste_floor_qty + s.haste_shop_qty >= 3)
+    seeds_where Synth.all ~f:(fun s -> s.digging && s.haste_floor_qty >= 3)
   in
   expect_same
     ~label:"digging & 3x potion:haste"
     expected
     (matched_set
        db
-       [ Search.Term.create (Search.Criterion.Item digging)
-       ; Search.Term.create ~min_count:3 (Search.Criterion.Item haste)
+       [ Search.Term.create (floor digging)
+       ; Search.Term.create ~min_count:3 (floor haste)
        ]);
   Db.close db;
-  [%expect {| digging & 3x potion:haste: match (4 seeds) |}]
+  [%expect {| digging & 3x potion:haste: match (2 seeds) |}]
 ;;
 
 (* Two [min_count > 1] terms: [driver_rank] pushes both into the back class,
@@ -946,19 +1245,18 @@ let%expect_test
   =
   let db = synth_db () in
   let expected =
-    seeds_where Synth.all ~f:(fun s ->
-      s.haste_floor_qty + s.haste_shop_qty >= 3 && s.haste_floor_qty >= 2)
+    seeds_where Synth.all ~f:(fun s -> s.haste_floor_qty >= 3 && s.haste_shop_qty >= 2)
   in
   expect_same
-    ~label:"3x potion:haste & 2x floor potion:haste"
+    ~label:"3x potion:haste & 2x shop potion:haste"
     expected
     (matched_set
        db
-       [ Search.Term.create ~min_count:3 (Search.Criterion.Item haste)
-       ; Search.Term.create ~min_count:2 (Search.Criterion.Floor_item haste)
+       [ Search.Term.create ~min_count:3 (floor haste)
+       ; Search.Term.create ~min_count:2 (shop haste)
        ]);
   Db.close db;
-  [%expect {| 3x potion:haste & 2x floor potion:haste: match (16 seeds) |}]
+  [%expect {| 3x potion:haste & 2x shop potion:haste: match (3 seeds) |}]
 ;;
 
 (* Several matching entries on one seed must still yield the seed once. The
@@ -969,7 +1267,7 @@ let%expect_test "a seed with several matching entries appears once" =
   let search =
     Search.create
       ~version
-      ~terms:[ Search.Term.create (Search.Criterion.Item haste) ]
+      ~terms:[ Search.Term.create (floor haste) ]
       ~page:(Query.Page.create ~limit:1000 ())
       ()
   in
@@ -979,8 +1277,8 @@ let%expect_test "a seed with several matching entries appears once" =
     "rows=%d distinct=%d multi_entry_seeds=%d\n"
     (List.length seeds)
     (List.length (List.dedup_and_sort seeds ~compare:String.compare))
-    (List.count Synth.all ~f:(fun s -> s.haste_floor_qty > 0 && s.haste_shop_qty > 0));
-  [%expect {| rows=36 distinct=36 multi_entry_seeds=18 |}];
+    (List.count Synth.all ~f:(fun s -> s.haste_floor_qty >= 2));
+  [%expect {| rows=30 distinct=30 multi_entry_seeds=20 |}];
   Db.close db
 ;;
 
@@ -988,14 +1286,12 @@ let%expect_test "a seed with several matching entries appears once" =
    single-page whole-set match, with no seed lost or duplicated at the join. *)
 let%expect_test "keyset paging across a boundary matches the naive reference" =
   let db = synth_db () in
-  let expected =
-    seeds_where Synth.all ~f:(fun s -> s.haste_floor_qty + s.haste_shop_qty > 0)
-  in
+  let expected = seeds_where Synth.all ~f:(fun s -> s.haste_floor_qty > 0) in
   let page ~after ~limit =
     let search =
       Search.create
         ~version
-        ~terms:[ Search.Term.create (Search.Criterion.Item haste) ]
+        ~terms:[ Search.Term.create (floor haste) ]
         ~page:(Query.Page.create ?after ~limit ())
         ()
     in
@@ -1025,7 +1321,7 @@ let%expect_test "keyset paging across a boundary matches the naive reference" =
   printf "boundary overlap: %s\n" (String.Set.sexp_of_t overlap |> Sexp.to_string_hum);
   [%expect
     {|
-    paged potion:haste: match (36 seeds)
+    paged potion:haste: match (30 seeds)
     boundary overlap: ()
     |}];
   Db.close db
@@ -1079,8 +1375,8 @@ let%expect_test "a raw Feature altar criterion no longer reads the Temple mask" 
    version and keyset bounds. Term order must not change the matched set. *)
 let%expect_test "Name_like as non-driver matches in both term orders" =
   let db = fresh_db () in
-  let name_term = Search.Term.create (Search.Criterion.Name_like "Throatcutter") in
-  let item_term = Search.Term.create (Search.Criterion.Item haste) in
+  let name_term = Search.Term.create (named "Throatcutter") in
+  let item_term = Search.Term.create (floor haste) in
   let name_first = matched_set db [ name_term; item_term ] in
   let item_first = matched_set db [ item_term; name_term ] in
   printf "name first: %s\n" (Int.Set.sexp_of_t name_first |> Sexp.to_string_hum);
@@ -1118,9 +1414,7 @@ let%expect_test "Name_like as non-driver survives keyset paging" =
   ignore (Db.write_batch db records : Db.Counts.t);
   Or_error.ok_exn (Db.rebuild_fts db);
   let terms =
-    [ Search.Term.create (Search.Criterion.Item haste)
-    ; Search.Term.create (Search.Criterion.Name_like "Throatcutter")
-    ]
+    [ Search.Term.create (floor haste); Search.Term.create (named "Throatcutter") ]
   in
   let page ~after ~limit =
     let search =

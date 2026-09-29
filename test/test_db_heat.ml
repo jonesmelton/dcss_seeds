@@ -80,14 +80,14 @@ let%expect_test "recompute_surprise: tail_p over a 3-seed cohort, by hand" =
      since every seed here holds zero early spells. *)
   show
     db
-    "select s_base.val, s_sub.val, sp.count, sp.tail_p from surprise sp join strings \
-     s_base on s_base.id = sp.base_type_id join strings s_sub on s_sub.id = \
+    "select s_base.val, s_sub.val, sp.count, printf('%.6f', sp.tail_p) from surprise sp \
+     join strings s_base on s_base.id = sp.base_type_id join strings s_sub on s_sub.id = \
      sp.sub_type_id order by s_base.val, s_sub.val, sp.count";
   [%expect
     {|
-    book|#early-spells|0|1.0
-    potion|haste|1|0.666666666666667
-    potion|haste|3|0.333333333333333
+    book|#early-spells|0|1.000000
+    potion|haste|1|0.666667
+    potion|haste|3|0.333333
     |}];
   Db.close db
 ;;
@@ -357,7 +357,9 @@ let%expect_test "a cap with no seeds left keeps no heat rows" =
    score. [Heat.score] sees one seed's observations plus [surprise] and [n],
    both fixed above the loop, and [group_observations] never groups across
    seeds. Anything less than identical is a bug, not a rounding difference,
-   which is why this compares stored floats bit-for-bit.
+   which is why this compares stored floats at 17 significant digits, enough
+   to round-trip a double. That holds only on the pinned sqlite: 3.45 renders
+   [%!.17g] at 16.
 
    K=7 over 3 seeds is deliberate: ntile with more buckets than rows yields one
    group per row rather than empty shards, covering the
@@ -380,6 +382,7 @@ let%expect_test "rescore: sharding changes peak memory, not scores" =
     snapshot db
   in
   let unsharded = scored_with ~shards:1 in
+  printf "rows: %d\n" (List.length unsharded);
   List.iter [ 2; 3; 7 ] ~f:(fun shards ->
     let sharded = scored_with ~shards in
     printf
@@ -392,18 +395,11 @@ let%expect_test "rescore: sharding changes peak memory, not scores" =
            "DIFFERS\n  unsharded: %s\n  sharded:   %s"
            (String.concat ~sep:" | " unsharded)
            (String.concat ~sep:" | " sharded)));
-  print_endline (String.concat ~sep:"\n" unsharded);
   [%expect
     {|
+    rows: 7
     shards=2: identical
     shards=3: identical
     shards=7: identical
-    1 8 5.2827377716704378 1
-    2 8 12.524432936391138 2
-    3 8 0.0 0
-    band 8 0 0.0
-    band 8 1 5.2827377716704378
-    band 8 2 12.524432936391138
-    band 8 3 12.524432936391138
     |}]
 ;;

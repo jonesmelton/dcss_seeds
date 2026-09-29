@@ -1,0 +1,78 @@
+open! Core
+
+module Kind = struct
+  type t =
+    | Floor_item
+    | Shop_item
+    | Artefact
+    | Floor_prop
+    | Shop_prop
+  [@@deriving compare, equal, enumerate, sexp_of]
+
+  let to_int = function
+    | Floor_item -> 0
+    | Shop_item -> 1
+    | Artefact -> 2
+    | Floor_prop -> 3
+    | Shop_prop -> 4
+  ;;
+
+  let of_int = function
+    | 0 -> Some Floor_item
+    | 1 -> Some Shop_item
+    | 2 -> Some Artefact
+    | 3 -> Some Floor_prop
+    | 4 -> Some Shop_prop
+    | _ -> None
+  ;;
+end
+
+type key =
+  { kind : Kind.t
+  ; a : string option
+  ; b : string option
+  }
+[@@deriving compare, equal, sexp_of]
+
+include Comparable.Make_plain (struct
+    type t = key
+
+    let compare = compare_key
+    let sexp_of_t = sexp_of_key
+  end)
+
+type t =
+  | Exact of key list
+  | Narrowing of key list
+  | Unindexed
+
+let of_criterion (criterion : Search.Criterion.t) : t =
+  match criterion with
+  | Search.Criterion.Item ({ base_type; sub_type }, position) ->
+    let kind : Kind.t =
+      match (position : Search.Criterion.position) with
+      | Search.Criterion.Floor -> Floor_item
+      | Search.Criterion.Shop -> Shop_item
+    in
+    Exact [ { kind; a = Some base_type; b = Some sub_type } ]
+  | Search.Criterion.Name_like _ -> Unindexed
+  | Search.Criterion.Feature _ -> Unindexed
+  | Search.Criterion.Artefact -> Exact [ { kind = Kind.Artefact; a = None; b = None } ]
+  | Search.Criterion.Unique _ -> Unindexed
+  | Search.Criterion.Props { base_type; props; position } ->
+    let kind : Kind.t =
+      match (position : Search.Criterion.position) with
+      | Search.Criterion.Floor -> Floor_prop
+      | Search.Criterion.Shop -> Shop_prop
+    in
+    (match List.map props ~f:(fun p -> { kind; a = base_type; b = Some p }) with
+     | [] -> Unindexed
+     | [ key ] -> Exact [ key ]
+     | keys -> Narrowing keys)
+;;
+
+let keys = function
+  | Exact keys -> keys
+  | Narrowing keys -> keys
+  | Unindexed -> []
+;;

@@ -182,17 +182,24 @@ let heartbeat db ~builds ~generator_id =
   | Error err -> eprintf "heartbeat failed: %s\n%!" (Error.to_string_hum err)
 ;;
 
-let one_pass db ~builds ~db_path ~ingest ~generator_id =
+let one_pass db ~builds ~db_path ~ingest ~generator_id ~on_context ~on_pass_start =
+  (* The caller owns [on_context]'s slot across passes, so clear it before
+     [heartbeat] can fail: otherwise a pass that dies before its first
+     [on_context] reports the previous pass's last build. *)
+  on_pass_start ();
   heartbeat db ~builds ~generator_id;
   (* At most one job per version per pass, so a busy version cannot starve the
      others. *)
   List.fold builds ~init:false ~f:(fun worked (build : Build.t) ->
+    on_context { Seed_corpus.Deepen.Context.version = build.version; seed = None };
     match Seed_corpus.Db.claim_job db ~version:build.version ~now:(now ()) with
     | Error err ->
       eprintf "claim failed: %s\n%!" (Error.to_string_hum err);
       worked
     | Ok None -> worked
     | Ok (Some job) ->
+      on_context
+        { Seed_corpus.Deepen.Context.version = build.version; seed = Some job.seed };
       printf
         "%s %s: deepening to %s\n%!"
         (Seed_corpus.Query.Version.to_string build.version)
@@ -303,7 +310,10 @@ let command =
          Exn.protect
            ~finally:(fun () -> Seed_corpus.Db.close db)
            ~f:(fun () ->
+             let context = ref None in
+             let streak = ref Seed_corpus.Deepen.Failure_streak.zero in
              let rec loop () =
+               let failed = ref false in
                let worked =
                  if fill_in_progress ~lock_path
                  then (
@@ -312,9 +322,27 @@ let command =
                    false)
                  else
                    Seed_corpus.Deepen.guard
-                     ~on_error:(fun message -> eprintf "pass failed: %s\n%!" message)
-                     (fun () -> one_pass db ~builds ~db_path ~ingest ~generator_id)
+                     ~on_error:(fun message ->
+                       failed := true;
+                       streak := Seed_corpus.Deepen.Failure_streak.failed !streak;
+                       eprintf
+                         "%s\n%!"
+                         (Seed_corpus.Deepen.failure_message
+                            ~consecutive:(Seed_corpus.Deepen.Failure_streak.count !streak)
+                            !context
+                            message))
+                     (fun () ->
+                        one_pass
+                          db
+                          ~builds
+                          ~db_path
+                          ~ingest
+                          ~generator_id
+                          ~on_context:(fun c -> context := Some c)
+                          ~on_pass_start:(fun () -> context := None))
                in
+               if not !failed
+               then streak := Seed_corpus.Deepen.Failure_streak.passed !streak;
                if once
                then ()
                else (

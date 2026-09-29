@@ -200,7 +200,7 @@ let%expect_test "the deepen form and the poll carry the version" =
       ~seed:"12345"
       ~job:None
       ~position:None
-      ~csrf:(Some "<input name=\"dream.csrf\" value=\"t\">")
+      ~csrf:(Some "t")
       ~filling:false
       levels
     |> List.map ~f:Seed_web.render_fragment
@@ -257,6 +257,7 @@ let%expect_test "about links out three times and back into the build" =
     https://crawl.develz.org/
     https://crawl.develz.org/
     https://github.com/jonesmelton/dcss_seeds
+    https://jonesmelton.com
     /0.34.1/
     |}]
 ;;

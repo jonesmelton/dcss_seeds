@@ -58,12 +58,15 @@ fi
 
 # Columns a later format added. `create table if not exists` sees the existing
 # table and does nothing, so each one needs its own add -- idempotent because
-# the add is skipped when pragma_table_info already lists it. They stay null
+# the add is skipped when pragma_table_info already lists it, and skipped for an
+# absent table, which the replay below creates whole. They stay null
 # until a re-fill on the new format, which is the whole point of the bump: the
 # facts are un-backfillable, and the column existing is only what lets an old
 # corpus load under the new reader.
 add_column() {
     if [ "$(sqlite3 -init /dev/null -noheader "$db" \
+        "select count(*) from sqlite_master where type = 'table' and name = '$1';")" -eq 1 ] \
+        && [ "$(sqlite3 -init /dev/null -noheader "$db" \
         "select count(*) from pragma_table_info('$1') where name = '$2';")" -eq 0 ]; then
         sqlite3 -init /dev/null "$db" "alter table $1 add column $2 $3;"
         echo "added $1.$2"
@@ -72,6 +75,14 @@ add_column() {
 
 add_column seed_levels gold integer
 add_column entries toll_note_id integer
+# The search store's currency mark moved from a row high-water mark to a seed
+# count. The default of -1 matches no count, so a store built by an older writer
+# reads as stale until `just index` rebuilds it -- which is the right answer:
+# nothing recorded how many seeds that build covered.
+add_column search_index_state built_seeds "integer not null default -1"
+# Null reads as deepened, so a store built before this column overlays every
+# deep seed, as it did then, until `just index` rebuilds it.
+add_column seed_ordinals built_depth integer
 
 before=$(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_master where type = 'index' and name not like 'sqlite_%';")
 before_t=$(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_master where type = 'table' and name not like 'sqlite_%';")
@@ -139,6 +150,12 @@ sed 's/--.*$//' "$root/schema.sql" \
 
 sqlite3 -init /dev/null "$db" < <(replay index)
 
+# Trigger bodies hold their own semicolons, so the one-statement-per-`;` split
+# above cannot carry them.
+perl -0777 -ne 's/--[^\n]*//g; print "$1\n" while /(create trigger .*?\bend;)/sg' "$root/schema.sql" \
+    | sed 's/create trigger /create trigger if not exists /' \
+    | sqlite3 -init /dev/null "$db"
+
 after=$(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_master where type = 'index' and name not like 'sqlite_%';")
 after_t=$(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_master where type = 'table' and name not like 'sqlite_%';")
 echo "tables:  $before_t -> $after_t"
@@ -194,6 +211,15 @@ SQL
 )
 sqlite3 -init /dev/null "$db" "$backfill;"
 echo "fill depths: $(sqlite3 -init /dev/null -noheader "$db" "select count(*) from seed_fills;") seeds"
+
+# Recounted outright rather than trusted: the triggers only count what lands
+# after they exist, and the backfill above may have run before or without them.
+sqlite3 -init /dev/null "$db" "
+begin immediate;
+delete from seed_fill_counts;
+insert into seed_fill_counts (version_id, seeds)
+select version_id, count(*) from seed_fills group by version_id;
+commit;"
 
 # A new index the planner does not know the size of is the same problem as a
 # missing one. Without sqlite_stat1 it sizes every index from built-in defaults

@@ -3,26 +3,19 @@ module S = Sqlite3_utils
 
 type t = S.t
 
-let check_rc here rc =
-  match (rc : Sqlite3.Rc.t) with
-  | Sqlite3.Rc.OK | Sqlite3.Rc.DONE -> ()
-  | rc -> failwithf "%s: %s" here (Sqlite3.Rc.to_string rc) ()
-;;
-
-(* Include extended code and sqlite's message: `BUSY` (5, retryable) and
-   BUSY_SNAPSHOT (517, never resolved by waiting) render identically through
-   [Rc.to_string]. *)
-let exec_script (t : t) sql =
-  match Sqlite3.exec t sql with
-  | Sqlite3.Rc.OK -> ()
-  | rc ->
-    failwithf
-      "exec_script failed: %s (%d): %s"
-      (Sqlite3.Rc.to_string rc)
-      (Sqlite3.extended_errcode_int t)
-      (Sqlite3.errmsg t)
-      ()
-;;
+let check_rc = Sql.check_rc
+let exec_script = Sql.exec_script
+let with_txn = Sql.with_txn
+let with_immediate_txn = Sql.with_immediate_txn
+let version_id_sql = Sql.version_id_sql
+let string_id_sql = Sql.string_id_sql
+let column_text = Sql.column_text
+let column_int = Sql.column_int
+let column_bool = Sql.column_bool
+let required = Sql.required
+let fold_rows = Sql.fold_rows
+let with_stmt = Sql.with_stmt
+let version_bind = Sql.version_bind
 
 (* WAL and mmap pragmas are reads of connection state, permitted under
    [`READONLY]. *)
@@ -62,39 +55,6 @@ let with_db path ~f =
   let t = open_ path in
   Exn.protect ~f:(fun () -> f t) ~finally:(fun () -> close t)
 ;;
-
-let with_txn (t : t) ~f =
-  exec_script t "begin";
-  match f t with
-  | result ->
-    exec_script t "commit";
-    result
-  | exception exn ->
-    (try exec_script t "rollback" with
-     | _ -> ());
-    raise exn
-;;
-
-(* Takes the write lock up front. Every read-then-write path uses this. *)
-let with_immediate_txn (t : t) ~f =
-  exec_script t "begin immediate";
-  match f t with
-  | result ->
-    exec_script t "commit";
-    result
-  | exception exn ->
-    (try exec_script t "rollback" with
-     | _ -> ());
-    raise exn
-;;
-
-(* Resolved as a scalar subquery, not a join on `versions`: the join form
-   reorders the plan and adds a temp b-tree for distinct. *)
-let version_id_sql = "(select id from versions where version = ?)"
-
-(* The dictionary lookup every interned predicate uses. Same reasoning as
-   [version_id_sql]: a scalar subquery keeps the covering seek on entries. *)
-let string_id_sql = "(select id from strings where val = ?)"
 
 let query (t : t) sql =
   let rows = ref [] in
@@ -436,60 +396,6 @@ let seed_props_sql =
 |}
     version_id_sql
 ;;
-
-let column_text row i =
-  match (row : Sqlite3.Data.t array).(i) with
-  | Sqlite3.Data.TEXT s -> Some s
-  | Sqlite3.Data.NULL -> None
-  | data -> Some (Sqlite3.Data.to_string_coerce data)
-;;
-
-let column_int row i =
-  match (row : Sqlite3.Data.t array).(i) with
-  | Sqlite3.Data.INT i -> Some (Int64.to_int_exn i)
-  | Sqlite3.Data.NULL -> None
-  | data -> Option.bind (Sqlite3.Data.to_int64 data) ~f:Int64.to_int
-;;
-
-let column_bool row i = Option.map (column_int row i) ~f:(fun i -> i <> 0)
-
-let required row i ~field =
-  match column_text row i with
-  | Some s -> Ok s
-  | None -> Or_error.errorf "%s is null" field
-;;
-
-let fold_rows stmt ~init ~f =
-  let rec loop acc =
-    match Sqlite3.step stmt with
-    | Sqlite3.Rc.ROW ->
-      (match f acc (Sqlite3.row_data stmt) with
-       | Ok acc -> loop acc
-       | Error _ as err -> err)
-    | Sqlite3.Rc.DONE -> Ok acc
-    | rc -> Or_error.errorf "step: %s" (Sqlite3.Rc.to_string rc)
-  in
-  loop init
-;;
-
-let with_stmt (t : t) sql ~bind ~f =
-  match Sqlite3.prepare t sql with
-  | exception exn -> Or_error.of_exn exn
-  | stmt ->
-    Exn.protect
-      ~finally:(fun () -> ignore (Sqlite3.finalize stmt : Sqlite3.Rc.t))
-      ~f:(fun () ->
-        match
-          List.iteri bind ~f:(fun i data ->
-            check_rc "bind" (Sqlite3.bind stmt (i + 1) data))
-        with
-        | exception exn -> Or_error.of_exn exn
-        | () -> f stmt)
-;;
-
-(* Binds the version string; [version_id_sql] resolves it to an id. Nothing
-   above storage learns that ids exist. *)
-let version_bind version = Sqlite3.Data.TEXT (Query.Version.to_string version)
 
 let page_seeds t ~version ~(page : Query.Page.t) =
   with_stmt
@@ -1453,39 +1359,57 @@ let like_contains fragment =
 
 (* One criterion becomes one predicate over an aliased [entries] row. The alias
    lets the same fragment serve as driver [where] or correlated [exists]. *)
+(* [cost is not null] looks redundant against entries_search_shop's partial
+   index qualifier, but dropping it makes SQLite choose entries_search_type
+   instead, which has no shop qualifier and returns floor stock too (335,174
+   vs 30,870 rows, wand:digging, 1.3M, 0.34.1, 2026-09-05, prod).
+
+   [cost] trails entries_search_type, so the [Floor] test stays covering
+   there. It does not trail entries_search_name, so [Name_like] pays a table
+   lookup per candidate name that the other positions do not. *)
+let position_where ~alias (position : Search.Criterion.position) =
+  match position with
+  | Search.Criterion.Floor -> sprintf "%s.cost is null" alias
+  | Search.Criterion.Shop -> sprintf "%s.cost is not null" alias
+;;
+
+(* One [exists] per property, correlated on [alias.id] -- the shape both
+   [criterion_where]'s [Props] branch and [props_seek]'s non-seeking remainder
+   need, factored out so the two stay in sync.
+
+   [value >= min_value] excludes the penalty rows: about one row in five of
+   [Str], [rF], [Slay] and their kin is negative, and a reader asking for [rF]
+   does not mean [rF-]. It is also what makes [rF] cover [rF++] without a
+   grouping mechanism. *)
+let props_exist ~alias props =
+  let where =
+    List.map props ~f:(fun _ ->
+      sprintf
+        "exists (select 1 from entry_props p where p.entry_id = %s.id and p.prop_id = %s \
+         and p.value >= ?)"
+        alias
+        string_id_sql)
+  in
+  let bind =
+    List.concat_map props ~f:(fun p ->
+      [ Sqlite3.Data.TEXT p; Sqlite3.Data.INT (Int64.of_int Search.Prop.min_value) ])
+  in
+  where, bind
+;;
+
+(* One criterion becomes one predicate over an aliased [entries] row. The alias
+   lets the same fragment serve as driver [where] or correlated [exists]. *)
 let criterion_where (criterion : Search.Criterion.t) ~alias =
   let col name = sprintf "%s.%s" alias name in
   match criterion with
-  | Search.Criterion.Item { base_type; sub_type } ->
+  | Search.Criterion.Item ({ base_type; sub_type }, position) ->
     ( sprintf
-        "%s = %s and %s = %s"
+        "%s = %s and %s = %s and %s"
         (col "base_type_id")
         string_id_sql
         (col "sub_type_id")
         string_id_sql
-    , [ Sqlite3.Data.TEXT base_type; Sqlite3.Data.TEXT sub_type ] )
-  (* [cost is not null] looks redundant against entries_search_shop's partial
-     index qualifier, but dropping it makes SQLite choose entries_search_type
-     instead, which has no shop qualifier and returns floor stock too (335,174
-     vs 30,870 rows, wand:digging, 1.3M, 0.34.1, 2026-09-05, prod). *)
-  | Search.Criterion.Shop_item { base_type; sub_type } ->
-    ( sprintf
-        "%s = %s and %s = %s and %s is not null"
-        (col "base_type_id")
-        string_id_sql
-        (col "sub_type_id")
-        string_id_sql
-        (col "cost")
-    , [ Sqlite3.Data.TEXT base_type; Sqlite3.Data.TEXT sub_type ] )
-  (* [cost] trails entries_search_type, so [cost is null] is a covering test. *)
-  | Search.Criterion.Floor_item { base_type; sub_type } ->
-    ( sprintf
-        "%s = %s and %s = %s and %s is null"
-        (col "base_type_id")
-        string_id_sql
-        (col "sub_type_id")
-        string_id_sql
-        (col "cost")
+        (position_where ~alias position)
     , [ Sqlite3.Data.TEXT base_type; Sqlite3.Data.TEXT sub_type ] )
   | Search.Criterion.Feature feat ->
     sprintf "%s = %s" (col "feat_id") string_id_sql, [ Sqlite3.Data.TEXT feat ]
@@ -1505,26 +1429,125 @@ let criterion_where (criterion : Search.Criterion.t) ~alias =
      1.056s, 3.53.2). So trigram reads `%` and `_` as live wildcards, making
      that stage a superset; the outer escaped `like` against `strings`
      re-checks survivors literally by primary key. *)
-  | Search.Criterion.Name_like fragment ->
+  | Search.Criterion.Name_like (fragment, position) ->
     ( sprintf
         "%s in (select id from strings where id in (select rowid from strings_fts where \
-         val like ?) and val like ? escape '\\')"
+         val like ?) and val like ? escape '\\') and %s"
         (col "name_id")
+        (position_where ~alias position)
     , [ Sqlite3.Data.TEXT ("%" ^ fragment ^ "%")
       ; Sqlite3.Data.TEXT (like_contains fragment)
       ] )
+  (* One [exists] per property, every one correlated on the *same* entry row, so
+     the whole set is carried by one item. That correlation is the criterion's
+     entire point; see [Search.Criterion].
+
+     Correlating on [id] rather than on [seed] is also what keeps this
+     alias-clean: the subqueries reach into the aliased row and never mention
+     [e], so the fragment works unchanged as a driver, as a correlated
+     non-driver, and inside [term_hits_sql]. [entry_props_entry (entry_id)]
+     serves the seek here; [driver_select]/[correlated_select] use [props_seek]
+     instead, which drives off [entry_props_search] rather than scanning
+     [entries] with every property carried as one of these. *)
+  | Search.Criterion.Props { base_type; props; position } ->
+    let prop_exists, prop_bind = props_exist ~alias props in
+    (* An empty set is rejected at the parse boundary and cannot arrive from a
+       URL, but the constructor is public. Read as "an artefact, unconstrained"
+       rather than as a predicate over no properties: only an artefact carries
+       properties at all, so it is the weakest true reading rather than a
+       different question. *)
+    let where, bind =
+      match base_type with
+      | None ->
+        if List.is_empty prop_exists
+        then [ sprintf "%s = 1" (col "artefact") ], []
+        else prop_exists, prop_bind
+      | Some base_type ->
+        ( sprintf "%s = %s" (col "base_type_id") string_id_sql :: prop_exists
+        , Sqlite3.Data.TEXT base_type :: prop_bind )
+    in
+    String.concat (where @ [ position_where ~alias position ]) ~sep:" and ", bind
 ;;
 
-(* Static driver preference: rare things first. [Unique] and [Shop_item] narrow
-   hardest; [Artefact] and bare [Item] are least selective. Ties keep caller's
-   order. *)
+(* [driver_select] and [correlated_select] scan the whole build for any bare
+   [Props] search -- confirmed via [explain query plan] and measured (67-69s
+   for [props:Conj] alone under a bounded [Rank.Shallowest] fetch, 1.3M,
+   0.34.1, prod clone, 2026-09-17; fossil ticket 1e34af034b) -- because
+   [criterion_where]'s [exists]es are filters on a driving row, not a seek of
+   their own. [entry_props] is two orders of magnitude smaller than [entries]
+   (AGENTS.md), so seeking any one property there and joining back beats
+   scanning every entry; which property drives does not affect the result, so
+   the first one in the list does.
+
+   Returns the extra [from] clause, the alias [entry_props] row that carries
+   the version scope, and a [where] fragment scoped to [entries_alias] --
+   everything [criterion_where] returns except the version, which the caller
+   adds itself the same way it already does for every other criterion.
+   [None] for the bare-artefact reading (no properties), which already seeks
+   [entries_search_artefact] and needs no rewrite.
+
+   Not used by [verify_terms], [cohort_depths_sql], or [term_hits_sql]: those
+   are bounded to a known seed batch already (an indexed seek on
+   [entries_seed], confirmed via [explain query plan] and flat at 16.4M rows
+   scaled locally, 2026-09-17) and stay on [criterion_where]. *)
+let props_seek ~base_type ~props ~position ~entries_alias ~props_alias =
+  match props with
+  | [] -> None
+  | first :: rest ->
+    let from_ =
+      sprintf
+        "entry_props %s join entries %s on %s.id = %s.entry_id"
+        props_alias
+        entries_alias
+        entries_alias
+        props_alias
+    in
+    let rest_where, rest_bind = props_exist ~alias:entries_alias rest in
+    let base_type_where, base_type_bind =
+      match base_type with
+      | None -> [], []
+      | Some base_type ->
+        ( [ sprintf "%s.base_type_id = %s" entries_alias string_id_sql ]
+        , [ Sqlite3.Data.TEXT base_type ] )
+    in
+    let where =
+      String.concat
+        (sprintf "%s.prop_id = %s and %s.value >= ?" props_alias string_id_sql props_alias
+         :: (base_type_where
+             @ rest_where
+             @ [ position_where ~alias:entries_alias position ]))
+        ~sep:" and "
+    in
+    let bind =
+      (Sqlite3.Data.TEXT first
+       :: Sqlite3.Data.INT (Int64.of_int Search.Prop.min_value)
+       :: base_type_bind)
+      @ rest_bind
+    in
+    Some (from_, where, bind)
+;;
+
+(* Static driver preference: rare things first. [Unique] and shop stock narrow
+   hardest -- a shop holds a fraction of what the floor does, which is why
+   [Item (_, Shop)] outranks its floor twin; [Artefact] and [Props] are least
+   selective. Ties keep caller's order. *)
 let criterion_driver_rank (criterion : Search.Criterion.t) =
   match criterion with
-  | Search.Criterion.Unique _ | Search.Criterion.Shop_item _ -> 0
-  | Search.Criterion.Floor_item _
-  | Search.Criterion.Feature _
-  | Search.Criterion.Name_like _ -> 1
-  | Search.Criterion.Artefact | Search.Criterion.Item _ -> 2
+  | Search.Criterion.Unique _ | Search.Criterion.Item (_, Search.Criterion.Shop) -> 0
+  | Search.Criterion.Item (_, Search.Criterion.Floor)
+  | Search.Criterion.Feature _ | Search.Criterion.Name_like _ -> 1
+  (* Last, and at one rank for both positions. The property [exists]es are
+     filters on a driving row rather than a seek of their own, so [Props] drives
+     only when nothing else can. With a base type that fallback is an ordinary
+     type seek; without one it is a scan of the build, which is what [is_cheap]
+     answers for.
+
+     Declining to promote [Props (_, Shop)] the way [Item (_, Shop)] is promoted
+     is the decision, not the oversight: that would be a fresh static-rank
+     judgement in a function the posting-list index deletes outright (postings
+     merge shortest-list-first, so order comes from list length), and the whole
+     cost of getting it wrong is a different result order over the same set. *)
+  | Search.Criterion.Artefact | Search.Criterion.Props _ -> 2
 ;;
 
 (* [min_count > 1] pushes a term to the back: as driver it streams a
@@ -1544,10 +1567,23 @@ let driver_rank (term : Search.Term.t) =
    [entries] table, returned as [`Group_by]. The flat group-by streams off the
    index order; a subquery form made SQLite walk all of [entries]. *)
 let driver_select (term : Search.Term.t) =
-  let where, bind = criterion_where term.criterion ~alias:"e" in
-  if term.min_count <= 1
-  then `Where (where, bind)
-  else `Group_by (where, bind, Sqlite3.Data.INT (Int64.of_int term.min_count))
+  if term.min_count > 1
+  then (
+    let where, bind = criterion_where term.criterion ~alias:"e" in
+    `Group_by (where, bind, Sqlite3.Data.INT (Int64.of_int term.min_count)))
+  else (
+    match term.criterion with
+    | Search.Criterion.Props { base_type; props; position } ->
+      (match
+         props_seek ~base_type ~props ~position ~entries_alias:"e" ~props_alias:"p0"
+       with
+       | Some (from_, where, bind) -> `Props_seek (from_, "p0", where, bind)
+       | None ->
+         let where, bind = criterion_where term.criterion ~alias:"e" in
+         `Where (where, bind))
+    | criterion ->
+      let where, bind = criterion_where criterion ~alias:"e" in
+      `Where (where, bind))
 ;;
 
 (* Non-driver terms constrain [e.seed] against a second aliased row. Correct
@@ -1566,20 +1602,35 @@ let driver_select (term : Search.Term.t) =
    [entries.seed] is not null, so [in] and [exists] agree; that is a
    precondition of the rewrite, not an incidental property. *)
 let correlated_select (term : Search.Term.t) ~alias ~version ~after =
-  let where, bind = criterion_where term.criterion ~alias in
   if term.min_count <= 1
-  then
+  then (
+    let from_, version_alias, where, bind =
+      match term.criterion with
+      | Search.Criterion.Props { base_type; props; position } ->
+        let props_alias = alias ^ "p" in
+        (match
+           props_seek ~base_type ~props ~position ~entries_alias:alias ~props_alias
+         with
+         | Some (from_, where, bind) -> from_, props_alias, where, bind
+         | None ->
+           let where, bind = criterion_where term.criterion ~alias in
+           sprintf "entries %s" alias, alias, where, bind)
+      | criterion ->
+        let where, bind = criterion_where criterion ~alias in
+        sprintf "entries %s" alias, alias, where, bind
+    in
     ( sprintf
-        "e.seed in (select %s.seed from entries %s where %s.version_id = %s and %s and \
-         %s.seed > ?)"
+        "e.seed in (select %s.seed from %s where %s.version_id = %s and %s and %s.seed > \
+         ?)"
         alias
-        alias
-        alias
+        from_
+        version_alias
         version_id_sql
         where
         alias
-    , (version_bind version :: bind) @ [ Sqlite3.Data.TEXT after ] )
-  else
+    , (version_bind version :: bind) @ [ Sqlite3.Data.TEXT after ] ))
+  else (
+    let where, bind = criterion_where term.criterion ~alias in
     ( sprintf
         "(select sum(coalesce(%s.quantity, 1)) from entries %s where %s.version_id = \
          e.version_id and %s and %s.seed = e.seed) >= ?"
@@ -1588,7 +1639,7 @@ let correlated_select (term : Search.Term.t) ~alias ~version ~after =
         alias
         where
         alias
-    , bind @ [ Sqlite3.Data.INT (Int64.of_int term.min_count) ] )
+    , bind @ [ Sqlite3.Data.INT (Int64.of_int term.min_count) ] ))
 ;;
 
 (* The matched seeds, before evidence. Terms are flattened into one query: one
@@ -1680,7 +1731,22 @@ let search_seeds_sql (search : Search.t) =
        ( sql
        , (version_bind :: after_bind :: driver_bind)
          @ List.concat rest_binds
-         @ [ min_count_bind; limit_bind ] ))
+         @ [ min_count_bind; limit_bind ] )
+     | `Props_seek (from_, props_alias, driver_where, driver_bind) ->
+       let where_clauses = driver_where :: rest_wheres in
+       let sql =
+         sprintf
+           "select distinct e.seed from %s where %s.version_id = %s and e.seed > ? and \
+            %s order by e.seed limit ?"
+           from_
+           props_alias
+           version_id_sql
+           (String.concat where_clauses ~sep:" and ")
+       in
+       ( sql
+       , (version_bind :: after_bind :: driver_bind)
+         @ List.concat rest_binds
+         @ [ limit_bind ] ))
 ;;
 
 (* Evidence for one term over matched seeds. Fetched per term, not joined: a
@@ -1861,6 +1927,128 @@ let term_hits t ~version ~(term : Search.Term.t) ~seeds =
         |> Or_error.map ~f:(fun rows -> group_term_hits (List.rev rows) ~term)))
 ;;
 
+(* [search_seeds_sql]'s driver shape restricted to a known seed list, one
+   statement per term. Empty [terms] passes every seed: the store answered all
+   of them exactly and left nothing to re-check. *)
+let verify_terms t ~version ~seeds ~terms =
+  match terms, seeds with
+  | [], _ -> Ok (String.Set.of_list seeds)
+  | _, [] -> Ok String.Set.empty
+  | terms, seeds ->
+    let placeholders = List.map seeds ~f:(fun _ -> "?") |> String.concat ~sep:", " in
+    let seed_bind = List.map seeds ~f:(fun seed -> Sqlite3.Data.TEXT seed) in
+    List.fold_result
+      terms
+      ~init:(String.Set.of_list seeds)
+      ~f:(fun acc (term : Search.Term.t) ->
+        let where, bind = criterion_where term.criterion ~alias:"e" in
+        let select, group, count_bind =
+          if term.min_count <= 1
+          then "select distinct e.seed", "", []
+          else
+            ( "select e.seed"
+            , " group by e.seed having sum(coalesce(e.quantity, 1)) >= ?"
+            , [ Sqlite3.Data.INT (Int64.of_int term.min_count) ] )
+        in
+        let sql =
+          sprintf
+            "%s from entries e where e.version_id = %s and %s and e.seed in (%s)%s"
+            select
+            version_id_sql
+            where
+            placeholders
+            group
+        in
+        let%map.Or_error matched =
+          with_stmt
+            t
+            sql
+            ~bind:((version_bind version :: bind) @ seed_bind @ count_bind)
+            ~f:seeds_of_stmt
+        in
+        Set.inter acc (String.Set.of_list matched))
+;;
+
+(* Which of [seeds] satisfy every term, and the shallowest depth each does it
+   at. Two callers, both needing the same same-item depth [verify_terms] alone
+   cannot give: the deep-cohort overlay ([Search_index.resolve_overlay]) and
+   [Search_index.ranked_page]'s narrowing-term batches, which is why this
+   returns depth where [seed_page]'s cheaper [verify_terms] does not -- that
+   path is bounded by page size and never needs one.
+
+   Depth comes from the level *name* through [Depth.of_level], which SQLite
+   cannot call -- the same reason the builder populates a temp [level_depth]
+   table rather than taking [min(level_id)]. Min over terms is min over the
+   union of their evidence, which is the fold [Search_index.candidate_depth]
+   does over postings and [Search.rank_matches] does over hits.
+
+   [min_count] is deliberately not applied here: a posting's depth is the
+   shallowest level the criterion appears on regardless of how many it takes to
+   meet the threshold, and the survivors have already been filtered on count by
+   [verify_terms].
+
+   Batched because both stages build an [in] list one placeholder per seed. At
+   ~20 deepens a day an unbatched list passes SQLITE_MAX_VARIABLE_NUMBER
+   eventually, and passes the point where the planner still likes it well before
+   that. *)
+let overlay_batch = 500
+
+let cohort_depths_sql term ~seed_count =
+  let where, bind = criterion_where term.Search.Term.criterion ~alias:"e" in
+  let placeholders = List.init seed_count ~f:(fun _ -> "?") |> String.concat ~sep:", " in
+  ( sprintf
+      {|
+  select distinct e.seed
+       , s_level.val
+    from entries e
+    join strings s_level
+      on s_level.id = e.level_id
+   where e.version_id = %s
+     and %s
+     and e.seed in (%s)
+|}
+      version_id_sql
+      where
+      placeholders
+  , bind )
+;;
+
+let verify_terms_with_depth t ~version ~seeds ~terms =
+  let open Or_error.Let_syntax in
+  List.chunks_of seeds ~length:overlay_batch
+  |> List.map ~f:(fun seeds ->
+    let%bind survived = verify_terms t ~version ~seeds ~terms in
+    match List.filter seeds ~f:(Set.mem survived) with
+    | [] -> Ok []
+    | seeds ->
+      let seed_bind = List.map seeds ~f:(fun seed -> Sqlite3.Data.TEXT seed) in
+      let%map depths =
+        List.fold_result terms ~init:String.Map.empty ~f:(fun acc term ->
+          let sql, bind = cohort_depths_sql term ~seed_count:(List.length seeds) in
+          with_stmt
+            t
+            sql
+            ~bind:((version_bind version :: bind) @ seed_bind)
+            ~f:(fun stmt ->
+              fold_rows stmt ~init:acc ~f:(fun acc row ->
+                let open Or_error.Let_syntax in
+                let%bind seed = required row 0 ~field:"seed" in
+                let%map level = required row 1 ~field:"level" in
+                let depth = Depth.of_level level in
+                Map.update acc seed ~f:(function
+                  | None -> depth
+                  | Some existing -> Int.min existing depth))))
+      in
+      List.map seeds ~f:(fun seed ->
+        seed, Option.value (Map.find depths seed) ~default:Depth.unknown))
+  |> Or_error.all
+  |> Or_error.map ~f:List.concat
+;;
+
+let cohort_matches t ~version ~seeds ~terms =
+  verify_terms_with_depth t ~version ~seeds ~terms
+;;
+
 (* A term's evidence may sit on several levels; the shallowest is the one worth
    reporting, since "how early" is the question a depth filter is asking. *)
 let shallowest_hit hits =
@@ -1899,8 +2087,8 @@ let version_levels t ~version =
    growing linearly with the corpus. Superseded: ~~126s and 13.5s~~ at zfs
    64K/zstd, where most of the difference was record amplification rather than
    this query -- the cost is now 51s user against 20s sys, so what remains is
-   the temp b-tree, not storage. The vocabulary is a build fact and should be
-   precomputed at fill time; see docs/architecture.md. *)
+   the temp b-tree, not storage. The fallback for [Search_index.item_pairs],
+   which answers from the store's catalog whenever the store is current. *)
 let item_pairs_sql =
   sprintf
     {|
@@ -1918,8 +2106,38 @@ order by 1
     version_id_sql
 ;;
 
+(* The property vocabulary, as the tokens a term uses. Cheap where
+   [item_pairs_sql] is not: [entry_props] is two orders of magnitude smaller
+   than [entries] (57,872 rows against 1,027,801 at 10k), so this is 0.11s
+   against 71.5s and adds nothing meaningful to the cold start it shares. *)
+let prop_names_sql =
+  sprintf
+    {|
+  select s.val
+    from entry_props p
+    join strings s
+      on s.id = p.prop_id
+   where p.version_id = %s
+     and p.value >= %d
+group by 1
+order by 1
+|}
+    version_id_sql
+    Search.Prop.min_value
+;;
+
 let distinct_criteria t ~version =
-  with_stmt t item_pairs_sql ~bind:[ version_bind version ] ~f:seeds_of_stmt
+  let%bind.Or_error pairs =
+    match%bind.Or_error Search_index.item_pairs t ~version with
+    | Some pairs -> Ok pairs
+    | None -> with_stmt t item_pairs_sql ~bind:[ version_bind version ] ~f:seeds_of_stmt
+  in
+  let%map.Or_error props =
+    with_stmt t prop_names_sql ~bind:[ version_bind version ] ~f:seeds_of_stmt
+  in
+  (* Filtered here rather than in SQL: the exclusion is a judgement about the
+     game, and [Search.Prop] is where that judgement lives. *)
+  pairs @ (List.filter props ~f:Search.Prop.searchable |> List.map ~f:(sprintf "props:%s"))
 ;;
 
 (* The distinct (portal, parent) pairs a version holds, which is what a depth
@@ -2048,38 +2266,36 @@ let rebuild_fts t =
      | () -> Ok ())
 ;;
 
-let search_seeds_unranked t (search : Search.t) =
-  let open Or_error.Let_syntax in
-  let%bind () =
-    (* Only a name substring needs the index; every other criterion is a seek
-       that a rebuild does not touch, so the refusal is scoped to searches that
-       actually depend on it. *)
-    if
-      List.exists search.terms ~f:(fun term ->
-        match term.criterion with
-        | Search.Criterion.Name_like _ -> true
-        | Search.Criterion.Item _
-        | Search.Criterion.Shop_item _
-        | Search.Criterion.Floor_item _
-        | Search.Criterion.Feature _
-        | Search.Criterion.Artefact
-        | Search.Criterion.Unique _ -> false)
-      && not (fts_is_current t)
-    then
-      Or_error.errorf
-        "%s: the name substring index is being rebuilt; searching by name is unavailable \
-         until it finishes"
-        Search.stale_index_tag
-    else Ok ()
-  in
-  let sql, bind = search_seeds_sql search in
-  let%bind seeds = with_stmt t sql ~bind ~f:seeds_of_stmt in
-  let seeds, more =
-    match List.split_n seeds search.page.limit with
-    | page, [] -> page, `End
-    | page, _ -> page, `More
-  in
-  let%map hits_by_term =
+(* Only a name substring needs the index; every other criterion is a seek that a
+   rebuild does not touch, so the refusal is scoped to searches that actually
+   depend on it. Both search paths share it: a [name~] term reaches the trigram
+   index through [verify_terms] too. *)
+let refuse_stale_trigram t (search : Search.t) =
+  if
+    List.exists search.terms ~f:(fun term ->
+      match term.criterion with
+      (* Both positions. What goes stale is the dictionary lookup that turns a
+         fragment into name ids; where the matching items sit is decided
+         afterwards and cannot rescue it. *)
+      | Search.Criterion.Name_like (_, _) -> true
+      (* [Props] resolves property names through [strings] by primary key, not
+         through the trigram index, so a rebuild cannot stale it. *)
+      | Search.Criterion.Props _
+      | Search.Criterion.Item _
+      | Search.Criterion.Feature _
+      | Search.Criterion.Artefact
+      | Search.Criterion.Unique _ -> false)
+    && not (fts_is_current t)
+  then
+    Or_error.errorf
+      "%s: the name substring index is being rebuilt; searching by name is unavailable \
+       until it finishes"
+      Search.stale_index_tag
+  else Ok ()
+;;
+
+let matches_of_seeds t (search : Search.t) seeds =
+  let%map.Or_error hits_by_term =
     List.map search.terms ~f:(fun term ->
       term_hits t ~version:search.version ~term ~seeds)
     |> Or_error.all
@@ -2094,12 +2310,22 @@ let search_seeds_unranked t (search : Search.t) =
       match shallowest_hit hits with
       | None -> ()
       | Some hit -> Hashtbl.add_multi by_seed ~key:seed ~data:hit));
-  let matches =
-    List.map seeds ~f:(fun seed ->
-      { Search.Match.seed
-      ; hits = Hashtbl.find by_seed seed |> Option.value ~default:[] |> List.rev
-      })
+  List.map seeds ~f:(fun seed ->
+    { Search.Match.seed
+    ; hits = Hashtbl.find by_seed seed |> Option.value ~default:[] |> List.rev
+    })
+;;
+
+let search_seeds_unranked t (search : Search.t) =
+  let open Or_error.Let_syntax in
+  let sql, bind = search_seeds_sql search in
+  let%bind seeds = with_stmt t sql ~bind ~f:seeds_of_stmt in
+  let seeds, more =
+    match List.split_n seeds search.page.limit with
+    | page, [] -> page, `End
+    | page, _ -> page, `More
   in
+  let%map matches = matches_of_seeds t search seeds in
   matches, more
 ;;
 
@@ -2134,13 +2360,110 @@ let search_seeds_ranked t (search : Search.t) ~rank =
     | page, _ -> Ok (page, `More))
 ;;
 
+let search_index_is_current t ~version = Search_index.is_current t ~version
+let build_search_index t ~version = Search_index.build t ~version
+let catalog_item_pairs t ~version = Search_index.catalog_item_pairs t ~version
+let search_index_cohort t ~version = Search_index.cohort t ~version
+
+let search_index_stats_sql =
+  sprintf
+    {|
+  select (select count(*) from seed_ordinals where version_id = %s)
+       , (select count(*) from search_criteria where version_id = %s)
+       , (select count(*)
+            from search_postings sp
+            join search_criteria sc
+              on sc.id = sp.criterion_id
+           where sc.version_id = %s)
+       , (select coalesce(sum(sp.n), 0)
+            from search_postings sp
+            join search_criteria sc
+              on sc.id = sp.criterion_id
+           where sc.version_id = %s)
+       , (select coalesce(sum(length(sp.postings)), 0)
+            from search_postings sp
+            join search_criteria sc
+              on sc.id = sp.criterion_id
+           where sc.version_id = %s)
+|}
+    version_id_sql
+    version_id_sql
+    version_id_sql
+    version_id_sql
+    version_id_sql
+;;
+
+let search_index_stats t ~version =
+  with_stmt
+    t
+    search_index_stats_sql
+    ~bind:(List.init 5 ~f:(fun _ -> version_bind version))
+    ~f:(fun stmt ->
+      fold_rows stmt ~init:Search_index.Stats.zero ~f:(fun _ row ->
+        let at i = Option.value (column_int row i) ~default:0 in
+        Ok
+          { Search_index.Stats.seeds = at 0
+          ; criteria = at 1
+          ; blocks = at 2
+          ; postings = at 3
+          ; bytes = at 4
+          }))
+;;
+
+let sql_path t (search : Search.t) ~rank =
+  if Search.Rank.equal rank Search.Rank.Seed
+  then search_seeds_unranked t search
+  else search_seeds_ranked t search ~rank
+;;
+
+let search_seeds_sql t (search : Search.t) ~rank =
+  with_txn t ~f:(fun t ->
+    let open Or_error.Let_syntax in
+    let%bind () = refuse_stale_trigram t search in
+    sql_path t search ~rank)
+;;
+
+let store_path ?name_cap t (search : Search.t) ~rank =
+  let open Or_error.Let_syntax in
+  (* A current store that errors is a fault, so that propagates; a decline is
+     [None]. *)
+  match%bind
+    Search_index.page
+      ?name_cap
+      t
+      search
+      ~rank
+      ~criterion_where
+      ~verify:(verify_terms t ~version:search.version)
+      ~verify_depth:(verify_terms_with_depth t ~version:search.version)
+      ~cohort_matches:(cohort_matches t ~version:search.version)
+  with
+  (* One page of a global order: ranking it again would sort a page against
+     itself. *)
+  | Some (seeds, more) ->
+    let%map matches = matches_of_seeds t search seeds in
+    Some (matches, more)
+  | None -> Ok None
+;;
+
+let search_seeds_store ?name_cap t (search : Search.t) ~rank =
+  with_txn t ~f:(fun t ->
+    let open Or_error.Let_syntax in
+    let%bind () = refuse_stale_trigram t search in
+    store_path ?name_cap t search ~rank)
+;;
+
 (* Multi-statement reads need a transaction: WAL snapshots are per statement,
-   so a mid-call commit is half-visible. *)
+   so a mid-call commit is half-visible. A stale store falls back where a stale
+   trigram index refuses: this fallback is the same semantics more slowly, where
+   the trigram index's is a dictionary scan. *)
 let search_seeds t (search : Search.t) ~rank =
   with_txn t ~f:(fun t ->
-    if Search.Rank.equal rank Search.Rank.Seed
-    then search_seeds_unranked t search
-    else search_seeds_ranked t search ~rank)
+    let open Or_error.Let_syntax in
+    let%bind () = refuse_stale_trigram t search in
+    match%bind store_path t search ~rank with
+    | Some page -> Ok page
+    | None -> sql_path t search ~rank)
 ;;
 
 (* Deepen queue: web process enqueues, generator claims and runs crawl. *)
@@ -2279,6 +2602,22 @@ let servable_versions t ~since =
         let%map.Or_error version = required row 0 ~field:"version" in
         version :: acc)
       |> Or_error.map ~f:List.rev)
+;;
+
+let populated_versions_sql =
+  {|
+  select v.version
+    from versions v
+   where exists (select 1 from seed_fills f where f.version_id = v.id)
+|}
+;;
+
+let populated_versions t =
+  with_stmt t populated_versions_sql ~bind:[] ~f:(fun stmt ->
+    fold_rows stmt ~init:[] ~f:(fun acc row ->
+      let%map.Or_error version = required row 0 ~field:"version" in
+      version :: acc)
+    |> Or_error.map ~f:List.rev)
 ;;
 
 let enqueue_sql =
@@ -3311,7 +3650,9 @@ let rescore ?(shards = 1) t ~version ~(cap : Depth.t) =
 ;;
 
 let seed_count_sql =
-  sprintf "select count(*) from seed_fills where version_id = %s" version_id_sql
+  sprintf
+    "select coalesce((select seeds from seed_fill_counts where version_id = %s), 0)"
+    version_id_sql
 ;;
 
 let seed_count t ~version =

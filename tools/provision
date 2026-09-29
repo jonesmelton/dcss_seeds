@@ -31,7 +31,7 @@ if [ -z "$py" ]; then
     else
         echo "==> creating python venv with pyyaml"
         python3 -m venv "$root/.venv"
-        "$root/.venv/bin/python3" -m pip install --quiet pyyaml
+        "$root/.venv/bin/python3" -m pip install --quiet pyyaml==6.0.3
         py="$root/.venv/bin/python3"
     fi
 fi

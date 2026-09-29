@@ -62,7 +62,14 @@ One line per level, `#SEED#`-prefixed, no whitespace inside:
   their own `entries` rows with `carried_by` set. Nesting deeper is not
   supported.
 - `cost` present ⇒ shop item. It is the only thing distinguishing a shop item
-  from a floor item.
+  from a floor item. Its value is the price charged, which in the three antique
+  shop types is the *unidentified* price. `scan_level` reads prices before
+  `wiz.identify_all_items()`, because identifying antique stock reprices it by
+  brand and plus. The unidentified price is not a discount: the flat
+  glowing/runed surcharge can exceed a cheap base's brand multiplier. Antique
+  `cost` values ingested before 2026-09-28 (ticket `a6e2062038`) are the
+  identified price, and only a refill of those seeds corrects them. A rescore
+  cannot, because the appearance flag is not stored.
 - `format` is checked at the parse boundary. Bump `FORMAT` in the lua script and
   `Reader.supported_format` together, or every line is rejected loudly — which
   is the intent.
@@ -269,7 +276,32 @@ scan every monster's inventory; without it, only **uniques'** inventories are
 read. That default is deliberate: uniques carry artefacts roughly 19x as often
 as ordinary monsters, and ordinary monsters account for ~70% of carried items
 but ~11% of carried artefacts. The item filter is crawl's own
-`item_ignore_boring` in both.
+`item_ignore_boring` in both, wrapped in `seed_dump_sexp.lua` by
+`item_notable_default`, which keeps an artefact or a barding unconditionally
+first.
+
+That wrapper exists because `item_ignore_boring` is a display filter written for
+a character standing on the level, and both of its tests mis-serve a corpus:
+
+- It calls weapons and armour boring when `pluses() <= 0` and unbranded. An
+  unrand is armour: the hat of the Alchemist (-2), fencer's gloves (+0), the
+  skull of Zonguldrok and every other ego-less orb never once reached the wire,
+  11 unrands in all, none of them `nogen` or `deleted`. The same test discarded
+  8.7% of every artefact seen — mostly +0 randart armour, which is far more
+  common than it sounds (56 of 645 artefacts, 228 seeds, 0.34.1, D:8,
+  2026-09-15). With the wrapper the default scan is an exact superset of
+  `-artefacts`: 3,364 artefacts each, zero missing (1,200 seeds, same build).
+- It calls anything `is_useless` boring, judged against *this script's wizard*.
+  That is a property of the scanner, not the seed, and it discarded every
+  barding in the corpus — the one case where a reader loses something rare and
+  decisive, since a barding settles a naga or armataur game. Bardings are now
+  kept whole, plain ones included, at 0.12 rows/seed (400 seeds, same build).
+
+The rest of `is_useless` is deliberately still honoured: scrolls of identify
+(useless only because `scan_level` identifies everything first), potions of
+moonshine, large rocks, amulets of magic regeneration and corpses stay out, at
+about 12% of item rows. None of these filters are backfillable — they run before
+the wire, so what a fill drops is gone until that version is filled again.
 
 Monsters themselves are recorded per `explorer.mons_ignore_boring`: uniques,
 crawl's `dangerous_monsters` list, player ghosts, and pandemonium lords. Rank

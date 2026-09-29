@@ -12,7 +12,9 @@ crawl build. `versions.conf` lists them; everything else is derived.
 
 The extraction pipeline needs a crawl clone, a C++ toolchain, python3, and
 `lua`. The corpus and web app additionally need `opam`,
-[`just`](https://github.com/casey/just), and `sqlite3`.
+[`just`](https://github.com/casey/just), `curl`, `openssl`, and `pkg-config`:
+`just deps` builds a pinned SQLite from source rather than using the system
+one.
 
     git clone https://github.com/crawl/crawl ~/code/crawl
 
@@ -77,8 +79,11 @@ a day — measured over a 27.3-hour continuous fill (0.34.1, prod, 2026-09).
   items but ~11% of carried artefacts — uniques carry artefacts roughly 19x as
   often. Pass `--mon-items` for every monster, `--no-uniques` for none. The cost
   either way is under 2%, since the scan already visits every cell.
-- The default item filter is crawl's own `item_ignore_boring`: no plain gear, no
-  missiles.
+- The default item filter is crawl's own `item_ignore_boring` — no plain gear,
+  no missiles — with two exceptions layered on top: an **artefact** is always
+  kept, and so is a **barding**. `item_ignore_boring` judges gear by plus and
+  brand, which discards a +0 unbranded unrand, and it discards anything useless
+  to the scanning character, which discards every barding.
 
 ## Corpus
 

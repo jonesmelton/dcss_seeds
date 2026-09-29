@@ -25,13 +25,13 @@ let%expect_test "the sitemap advertises only crawlable paths" =
   List.iter locs ~f:(fun loc -> printf "%-52s disallowed: %b\n" loc (disallowed loc));
   [%expect
     {|
-    https://dcss.jonesmelton.com/                        disallowed: false
-    https://dcss.jonesmelton.com/0.34.1/                 disallowed: false
-    https://dcss.jonesmelton.com/0.34.1/about            disallowed: false
-    https://dcss.jonesmelton.com/0.33.1/                 disallowed: false
-    https://dcss.jonesmelton.com/0.33.1/about            disallowed: false
-    https://dcss.jonesmelton.com/0.32.1/                 disallowed: false
-    https://dcss.jonesmelton.com/0.32.1/about            disallowed: false
+    https://dcss.garden/                                 disallowed: false
+    https://dcss.garden/0.34.1/                          disallowed: false
+    https://dcss.garden/0.34.1/about                     disallowed: false
+    https://dcss.garden/0.33.1/                          disallowed: false
+    https://dcss.garden/0.33.1/about                     disallowed: false
+    https://dcss.garden/0.32.1/                          disallowed: false
+    https://dcss.garden/0.32.1/about                     disallowed: false
     |}]
 ;;
 
@@ -48,10 +48,10 @@ let%expect_test "every served build appears in the sitemap" =
       v
       (String.is_substring
          xml
-         ~substring:(sprintf "<loc>https://dcss.jonesmelton.com/%s/</loc>" v))
+         ~substring:(sprintf "<loc>https://dcss.garden/%s/</loc>" v))
       (String.is_substring
          xml
-         ~substring:(sprintf "<loc>https://dcss.jonesmelton.com/%s/about</loc>" v)));
+         ~substring:(sprintf "<loc>https://dcss.garden/%s/about</loc>" v)));
   [%expect
     {|
     0.34.1     listing: true  about: true
@@ -87,6 +87,6 @@ let%expect_test "robots.txt advertises the sitemap" =
     Disallow: /*/jump
     Crawl-delay: 10
 
-    Sitemap: https://dcss.jonesmelton.com/sitemap.xml
+    Sitemap: https://dcss.garden/sitemap.xml
     |}]
 ;;

@@ -467,12 +467,12 @@ let%expect_test "resolving an absent column raises rather than reading a neighbo
   [%expect {| (Error (Failure "unknown column: name")) |}]
 ;;
 
-(* The message a BUSY leaves in the generator's log is the whole diagnostic
-   record: [Deepen.guard] catches this Failure and prints its string, and the
-   version, seed and failing statement are out of scope by then. `BUSY` alone
-   does not say whether the writer waited out busy_timeout or was refused a
-   stale snapshot, and those have different operator responses. *)
-let%expect_test "a failing statement reports the extended code and sqlite's message" =
+(* The generator's whole diagnostic record is one line. [Deepen.guard]
+   catches the Failure, and by then the build and seed are out of scope, so
+   the loop captures them and formats through [Deepen.failure_message]. A real
+   BUSY must name the version, the seed, the failing statement, and the
+   extended code -- which is what tells BUSY (5) from BUSY_SNAPSHOT (517). *)
+let%expect_test "a guarded BUSY names the version, seed, statement, and extended code" =
   let path = Filename_unix.temp_file "corpus" ".db" in
   Exn.protect
     ~finally:(fun () -> Sys_unix.remove path)
@@ -483,14 +483,59 @@ let%expect_test "a failing statement reports the extended code and sqlite's mess
       (* Without this the contender waits the corpus's full 30s before failing. *)
       Db.exec_script contender "pragma busy_timeout = 0";
       Db.exec_script holder "begin immediate";
-      print_s
-        [%sexp
-          (Or_error.try_with (fun () -> Db.exec_script contender "begin immediate")
-           : unit Or_error.t)];
-      [%expect {| (Error (Failure "exec_script failed: BUSY (5): database is locked")) |}];
+      let context =
+        { Seed_corpus.Deepen.Context.version =
+            Or_error.ok_exn (Seed_corpus.Query.Version.of_string "0.34.1")
+        ; seed = Some "1234567890"
+        }
+      in
+      ignore
+        (Seed_corpus.Deepen.guard
+           ~on_error:(fun message ->
+             printf
+               "%s\n%!"
+               (Seed_corpus.Deepen.failure_message ~consecutive:1 (Some context) message))
+           (fun () ->
+              Db.exec_script contender "begin immediate";
+              true)
+         : bool);
+      [%expect
+        {| pass failed: consecutive=1 version=0.34.1 seed=1234567890: exec_script failed: BUSY (5): database is locked; statement: begin immediate |}];
       Db.exec_script holder "rollback";
       Db.close contender;
       Db.close holder)
+;;
+
+(* SQLITE_BUSY_SNAPSHOT (517) is not a longer wait: a read transaction whose
+   snapshot a writer has passed cannot be upgraded, and it has to be retried
+   on a fresh read. [Rc.to_string] would print it as `BUSY`, so the rendered
+   message must carry the extended code. *)
+let%expect_test "a snapshot conflict renders as BUSY_SNAPSHOT, not BUSY" =
+  let path = Filename_unix.temp_file "corpus" ".db" in
+  Exn.protect
+    ~finally:(fun () -> Sys_unix.remove path)
+    ~f:(fun () ->
+      let reader = Db.open_ path in
+      Db.exec_script reader (In_channel.read_all "../schema.sql");
+      Db.exec_script reader "insert into versions (version) values ('0.34.1')";
+      Db.exec_script reader "begin";
+      ignore (Db.query reader "select count(*) from versions" : string list);
+      let writer = Db.open_ path in
+      Db.exec_script writer "insert into versions (version) values ('0.33.1')";
+      print_s
+        [%sexp
+          (Or_error.try_with (fun () ->
+             Db.exec_script reader "insert into versions (version) values ('0.32.1')")
+           : unit Or_error.t)];
+      [%expect
+        {|
+        (Error
+         (Failure
+          "exec_script failed: BUSY_SNAPSHOT (517): database is locked; statement: insert into versions (version) values ('0.32.1')"))
+        |}];
+      Db.exec_script reader "rollback";
+      Db.close writer;
+      Db.close reader)
 ;;
 
 (* A deepened seed reaches levels the fill never saw, so it interns names the
@@ -530,5 +575,67 @@ let%expect_test "catching the index up covers names interned after the rebuild" 
     "select s.val from strings s where s.id in (select rowid from strings_fts where \
      strings_fts match '\"kobold\"')";
   [%expect {| kobold |}];
+  Db.close db
+;;
+
+(* [driver_select]/[correlated_select]'s [Props] shape drives off
+   [entry_props_search] and joins back to [entries], rather than scanning
+   [entries] with a correlated [exists] per property -- the shape
+   [criterion_where] alone still produces, and still correctly serves, for
+   [verify_terms]/[cohort_depths_sql]/[term_hits_sql]'s bounded seed batches.
+   A bare [Props] search under the old shape was measured 67-69s under a
+   bounded fetch at 1.3M (0.34.1, prod clone, 2026-09-17, fossil ticket
+   1e34af034b); [entry_props] is two orders of magnitude smaller than
+   [entries] (AGENTS.md), so seeking it instead is the fix. *)
+let show_plan = Test_read.show_plan
+
+let%expect_test "a bare Props search, as the sole term, seeks entry_props_search" =
+  let db = Test_search.fresh_db () in
+  show_plan
+    db
+    "select distinct e.seed from entry_props p0 join entries e on e.id = p0.entry_id \
+     where p0.version_id = (select id from versions where version = '0.34.1') and e.seed \
+     > '' and p0.prop_id = (select id from strings where val = 'Conj') and p0.value >= 1 \
+     and exists (select 1 from entry_props p where p.entry_id = e.id and p.prop_id = \
+     (select id from strings where val = 'Alch') and p.value >= 1) order by e.seed limit \
+     51";
+  [%expect
+    {|
+    SEARCH p0 USING INDEX entry_props_search (version_id=? AND prop_id=? AND value>?)
+    SEARCH versions USING COVERING INDEX sqlite_autoindex_versions_1 (version=?)
+    SEARCH strings USING COVERING INDEX sqlite_autoindex_strings_1 (val=?)
+    SEARCH e USING INTEGER PRIMARY KEY (rowid=?)
+    SEARCH p EXISTS USING INDEX entry_props_entry (entry_id=?)
+    SEARCH strings USING COVERING INDEX sqlite_autoindex_strings_1 (val=?)
+    |}];
+  Db.close db
+;;
+
+(* Same shape, correlated as a non-driver term inside [correlated_select] --
+   confirms the join survives being wrapped in an uncorrelated [in (select ...)]
+   rather than sitting at the top level. *)
+let%expect_test "a Props search as a non-driver term also seeks entry_props_search" =
+  let db = Test_search.fresh_db () in
+  show_plan
+    db
+    "select distinct e.seed from entries e where e.version_id = (select id from versions \
+     where version = '0.34.1') and e.seed > '' and e.base_type_id = (select id from \
+     strings where val = 'wand') and e.sub_type_id = (select id from strings where val = \
+     'digging') and e.cost is null and e.seed in (select a0.seed from entry_props a0p \
+     join entries a0 on a0.id = a0p.entry_id where a0p.version_id = (select id from \
+     versions where version = '0.34.1') and a0p.prop_id = (select id from strings where \
+     val = 'Conj') and a0p.value >= 1 and a0.cost is null and a0.seed > '') order by \
+     e.seed limit 51";
+  [%expect
+    {|
+    SEARCH e USING COVERING INDEX entries_search_type (version_id=? AND base_type_id=? AND sub_type_id=? AND seed=?)
+    SEARCH versions USING COVERING INDEX sqlite_autoindex_versions_1 (version=?)
+    SEARCH strings USING COVERING INDEX sqlite_autoindex_strings_1 (val=?)
+    SEARCH strings USING COVERING INDEX sqlite_autoindex_strings_1 (val=?)
+    SEARCH a0p USING INDEX entry_props_search (version_id=? AND prop_id=? AND value>?)
+    SEARCH versions USING COVERING INDEX sqlite_autoindex_versions_1 (version=?)
+    SEARCH strings USING COVERING INDEX sqlite_autoindex_strings_1 (val=?)
+    SEARCH a0 USING INTEGER PRIMARY KEY (rowid=?)
+    |}];
   Db.close db
 ;;

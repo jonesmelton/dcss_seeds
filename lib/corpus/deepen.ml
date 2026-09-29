@@ -17,6 +17,42 @@ module Build = struct
   ;;
 end
 
+module Failure_streak = struct
+  type t = int
+
+  let zero = 0
+  let failed n = n + 1
+  let passed _ = 0
+  let count n = n
+end
+
+module Context = struct
+  type t =
+    { version : Query.Version.t
+    ; seed : string option
+    }
+  [@@deriving sexp_of]
+end
+
+(* The generator's whole failure record in one line: which build was in flight
+   and, once a job was claimed, which seed; how many passes this failure has
+   survived; and the exception's message, which carries the extended result
+   code and the failing statement. *)
+let failure_message ~consecutive (context : Context.t option) message =
+  let where =
+    match context with
+    | None -> ""
+    | Some context ->
+      sprintf
+        " version=%s%s"
+        (Query.Version.to_string context.version)
+        (match context.seed with
+         | Some seed -> sprintf " seed=%s" seed
+         | None -> "")
+  in
+  sprintf "pass failed: consecutive=%d%s: %s" consecutive where message
+;;
+
 let tick = Time_float.Span.of_sec 5.
 let timeout = Time_float.Span.of_sec 900.
 let kill_grace = Time_float.Span.of_sec 10.
