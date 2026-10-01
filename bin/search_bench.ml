@@ -6,15 +6,13 @@ module Search = Seed_corpus.Search
 let default_queries =
   [ "wand:digging"
   ; "potion:haste"
-  ; "artefact"
   ; "scroll:teleportation"
-  ; "potion:experience; scroll:acquirement; artefact"
+  ; "potion:experience; scroll:acquirement; scroll:teleportation"
   ; "wand:digging; shop potion:haste"
-  ; "9x artefact; 3x potion:haste"
+  ; "9x scroll:acquirement; 3x potion:haste"
   ; "props:Conj"
   ; "staff props:Conj,Alch"
   ; "armour props:rF,Str"
-  ; "artefact props:rF,Str"
   ; "name~Throatcutter"
   ; "name~Wyrmbane; potion:haste"
   ]

@@ -40,7 +40,7 @@ let corpus_pair () = fresh_pair (parse_records Test_search.corpus)
 
 (* The 40-seed synthetic fixture from test_search.ml's query-shape-equivalence
    section: deliberately covers every combination of (floor haste, shop haste,
-   digging, shop feature, artefact), which is exactly the diversity a
+   digging, shop feature, scroll), which is exactly the diversity a
    driver/non-driver comparison needs. *)
 let synth_pair () =
   let sql_db = Test_search.synth_db () in
@@ -206,16 +206,49 @@ let%expect_test "the shop position agrees, and does not recover the union" =
   Db.close idx_db
 ;;
 
-let%expect_test "artefact -- the one criterion spanning both positions -- agrees" =
+(* The store has no catalog row for the removed [artefact] kind, and a store
+   that carries a leftover one still answers everything else. A catalog row is
+   only ever read through [search_criteria_key]'s [(kind, a, b)] lookup, and
+   nothing maps onto kind 2, so the row is inert rather than a wrong answer. *)
+let%expect_test "the store builds no catalog row for the removed artefact kind" =
+  let _sql_db, idx_db = corpus_pair () in
+  let rows =
+    match Db.query idx_db "select count(*) from search_criteria where kind = 2" with
+    | [ n ] -> n
+    | _ -> failwith "count failed"
+  in
+  printf "kind=2 rows: %s\n" rows;
+  [%expect {| kind=2 rows: 0 |}];
+  Db.close _sql_db;
+  Db.close idx_db
+;;
+
+let%expect_test "a leftover artefact catalog row does not disturb the store" =
   let sql_db, idx_db = corpus_pair () in
+  let version_id =
+    match Db.query idx_db "select id from versions where version = '0.34.1'" with
+    | [ id ] -> id
+    | _ -> failwith "version not found"
+  in
+  Db.exec_script
+    idx_db
+    (sprintf
+       "insert into search_criteria (version_id, kind, a_id, b_id, card) values (%s, 2, \
+        null, null, 999999)"
+       version_id);
+  printf "store current: %b\n" (Db.search_index_is_current idx_db ~version);
   ignore
     (agree
-       ~label:"an artefact"
+       ~label:"an item, with a leftover artefact row in the store"
        sql_db
        idx_db
-       [ Search.Term.create Search.Criterion.Artefact ]
+       [ Search.Term.create (Test_search.floor Test_search.haste) ]
      : Search.Match.t list * Search.Match.t list);
-  [%expect {| an artefact: agree (9 seeds) |}];
+  [%expect
+    {|
+    store current: true
+    an item, with a leftover artefact row in the store: agree (6 seeds)
+    |}];
   Db.close sql_db;
   Db.close idx_db
 ;;
@@ -469,18 +502,18 @@ let%expect_test "two- and three-term conjunctions agree" =
      : Search.Match.t list * Search.Match.t list);
   ignore
     (agree
-       ~label:"digging & artefact & potion:haste"
+       ~label:"digging & scroll:acquirement & potion:haste"
        sql_db
        idx_db
        [ Search.Term.create (Test_search.floor Test_search.digging)
-       ; Search.Term.create Search.Criterion.Artefact
+       ; Search.Term.create (Test_search.floor Test_search.acquirement)
        ; Search.Term.create (Test_search.floor Test_search.haste)
        ]
      : Search.Match.t list * Search.Match.t list);
   [%expect
     {|
     potion:haste & enter_shop: agree (10 seeds)
-    digging & artefact & potion:haste: agree (1 seeds)
+    digging & scroll:acquirement & potion:haste: agree (1 seeds)
     |}];
   Db.close sql_db;
   Db.close idx_db
@@ -830,7 +863,6 @@ let criterion_of_row (kind : Criterion_id.Kind.t) a b : Search.Criterion.t =
     Search.Criterion.Item
       ( { Search.Item_type.base_type = Option.value_exn a; sub_type = Option.value_exn b }
       , Search.Criterion.Shop )
-  | Criterion_id.Kind.Artefact -> Search.Criterion.Artefact
   | Criterion_id.Kind.Floor_prop ->
     Search.Criterion.Props
       { base_type = a; props = [ Option.value_exn b ]; position = Search.Criterion.Floor }
@@ -907,7 +939,7 @@ let%expect_test "card, postings, and an independent SQL count agree for every ca
   else List.iter mismatches ~f:print_endline;
   [%expect
     {|
-    checked 26 catalog rows
+    checked 25 catalog rows
     0 mismatches
     |}];
   Db.close sql_db;
@@ -1043,8 +1075,9 @@ let%expect_test "a fill appends new seeds without moving existing ordinals" =
 
    The fixture deepens two of the 14 corpus seeds past [Fill_depth.shallow]:
 
-   - seed 1 gains an artefact (a criterion with a catalog row it was not in)
-     and two more potions of haste (pushing its floor-haste count from 1 to 3);
+   - seed 1 gains a floor long sword (a criterion with a catalog row it was not
+     in) and two more potions of haste (pushing its floor-haste count from 1 to
+     3);
    - seed 4 gains a floor wand of digging -- a criterion with *no* catalog row
      in this build, since the only digging in the base corpus is behind seed
      2's counter -- and another potion of haste, which must not disturb the
@@ -1054,7 +1087,7 @@ let%expect_test "a fill appends new seeds without moving existing ordinals" =
    levels add must appear. *)
 
 let deep_records =
-  [ {|#SEED#((format 4)(version "0.34.1")(seed "1")(level "Lair:3")(cats (items (((artefact t)(base_type "weapon")(kind "item")(name "+3 Fooblade {holy}")(plus 3)(quantity 1)(sub_type "war axe")(text "+3 Fooblade"))((base_type "potion")(kind "item")(name "2 potions of haste")(quantity 2)(sub_type "haste")(text "2 potions of haste"))))))|}
+  [ {|#SEED#((format 4)(version "0.34.1")(seed "1")(level "Lair:3")(cats (items (((artefact t)(base_type "weapon")(kind "item")(name "+3 Fooblade {holy}")(plus 3)(quantity 1)(sub_type "long sword")(text "+3 Fooblade"))((base_type "potion")(kind "item")(name "2 potions of haste")(quantity 2)(sub_type "haste")(text "2 potions of haste"))))))|}
   ; {|#SEED#((format 4)(version "0.34.1")(seed "4")(level "Lair:2")(cats (items (((base_type "wand")(kind "item")(name "wand of digging (3)")(quantity 1)(sub_type "digging")(text "wand of digging (3)"))((base_type "potion")(kind "item")(name "potion of haste")(quantity 1)(sub_type "haste")(text "potion of haste"))))))|}
   ]
 ;;
@@ -1201,10 +1234,13 @@ let%expect_test "a deepened seed is found through a criterion it gained deep" =
   printf "store current: %b\n" (Db.search_index_is_current idx_db ~version);
   let _, idx_matches =
     agree
-      ~label:"an artefact, after a deepen"
+      ~label:"a floor long sword, after a deepen"
       sql_db
       idx_db
-      [ Search.Term.create Search.Criterion.Artefact ]
+      [ Search.Term.create
+          (Test_search.floor
+             { Search.Item_type.base_type = "weapon"; sub_type = "long sword" })
+      ]
   in
   printf
     "deepened seed 1 present: %b\n"
@@ -1212,7 +1248,7 @@ let%expect_test "a deepened seed is found through a criterion it gained deep" =
   [%expect
     {|
     store current: true
-    an artefact, after a deepen: agree (10 seeds)
+    a floor long sword, after a deepen: agree (3 seeds)
     deepened seed 1 present: true
     |}];
   Db.close sql_db;
@@ -1372,7 +1408,12 @@ let%expect_test "every query shape agrees over a corpus with a deep cohort" =
   ignore_agree
     ~label:"shop potion:haste"
     [ Search.Term.create (Test_search.shop Test_search.haste) ];
-  ignore_agree ~label:"artefact" [ Search.Term.create Search.Criterion.Artefact ];
+  ignore_agree
+    ~label:"weapon:long sword"
+    [ Search.Term.create
+        (Test_search.floor
+           { Search.Item_type.base_type = "weapon"; sub_type = "long sword" })
+    ];
   ignore_agree
     ~label:"staff props:Conj,Alch"
     [ Search.Term.create (Test_search.props ~base_type:"staff" [ "Conj"; "Alch" ]) ];
@@ -1383,14 +1424,19 @@ let%expect_test "every query shape agrees over a corpus with a deep cohort" =
     ; Search.Term.create (Test_search.floor Test_search.haste)
     ];
   ignore_agree
-    ~label:"artefact & potion:haste"
-    [ Search.Term.create Search.Criterion.Artefact
+    ~label:"weapon:long sword & potion:haste"
+    [ Search.Term.create
+        (Test_search.floor
+           { Search.Item_type.base_type = "weapon"; sub_type = "long sword" })
     ; Search.Term.create (Test_search.floor Test_search.haste)
     ];
   ignore_agree
     ~rank:Search.Rank.Shallowest
-    ~label:"artefact ranked"
-    [ Search.Term.create Search.Criterion.Artefact ];
+    ~label:"weapon:long sword ranked"
+    [ Search.Term.create
+        (Test_search.floor
+           { Search.Item_type.base_type = "weapon"; sub_type = "long sword" })
+    ];
   ignore_agree ~label:"empty search" [];
   ignore_agree
     ~label:"scroll:teleportation"
@@ -1403,12 +1449,12 @@ let%expect_test "every query shape agrees over a corpus with a deep cohort" =
     {|
     potion:haste: agree (6 seeds)
     shop potion:haste: agree (1 seeds)
-    artefact: agree (10 seeds)
+    weapon:long sword: agree (3 seeds)
     staff props:Conj,Alch: agree (1 seeds)
     props:Conj: agree (3 seeds)
     wand:digging & potion:haste: agree (1 seeds)
-    artefact & potion:haste: agree (2 seeds)
-    artefact ranked: agree (10 seeds)
+    weapon:long sword & potion:haste: agree (2 seeds)
+    weapon:long sword ranked: agree (3 seeds)
     empty search: agree (14 seeds)
     scroll:teleportation: agree (0 seeds)
     |}];
@@ -1435,7 +1481,7 @@ let%expect_test "the datalist agrees between the catalog and the scan" =
     {|
     corpus: agree (17 options)
     synth: agree (3 options)
-    deepened: agree (18 options)
+    deepened: agree (17 options)
     |}]
 ;;
 

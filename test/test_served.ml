@@ -99,24 +99,32 @@ let%expect_test "list tags carry the tile of the thing they name, boons first" =
     |> String.concat
   in
   let tags = String.substr_index_all html ~may_overlap:false ~pattern:"class=\"tag " in
-  List.iter tags ~f:(fun i ->
-    let stop = String.index_from_exn html i '>' in
-    let close = String.substr_index_exn html ~pos:stop ~pattern:"</span>" in
-    let body = String.sub html ~pos:stop ~len:(close - stop) in
-    let tile =
-      match String.substr_index body ~pattern:"/static/tiles/" with
-      | None -> "(no tile)"
-      | Some j ->
-        let start = j + String.length "/static/tiles/" in
-        String.sub body ~pos:start ~len:(String.index_from_exn body start '"' - start)
-    in
-    let text =
-      String.filter body ~f:(fun c -> not (Char.equal c '<'))
-      |> String.split_on_chars ~on:[ '>' ]
-      |> List.last_exn
-      |> String.strip
-    in
-    printf "%-32s %s\n" tile text);
+  let ends =
+    List.map tags ~f:(fun i -> String.rindex_from_exn html i '<')
+    @ [ String.substr_index_exn html ~pos:(List.last_exn tags) ~pattern:"</td>" ]
+  in
+  List.iter
+    (List.zip_exn tags (List.tl_exn ends))
+    ~f:(fun (i, close) ->
+      let stop = String.index_from_exn html i '>' in
+      let body = String.sub html ~pos:stop ~len:(close - stop) in
+      let tile =
+        match String.substr_index body ~pattern:"/static/tiles/" with
+        | None -> "(no tile)"
+        | Some j ->
+          let start = j + String.length "/static/tiles/" in
+          String.sub body ~pos:start ~len:(String.index_from_exn body start '"' - start)
+      in
+      let text =
+        String.split_on_chars body ~on:[ '<' ]
+        |> List.map ~f:(fun s ->
+          match String.lsplit2 s ~on:'>' with
+          | Some (_, t) -> t
+          | None -> s)
+        |> String.concat
+        |> String.strip
+      in
+      printf "%-32s %s\n" tile text);
   [%expect
     {|
     items/potion_experience.png      2 xp

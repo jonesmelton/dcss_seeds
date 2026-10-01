@@ -180,6 +180,12 @@ h1 .seed,
   letter-spacing: 0.12em;
 }
 
+.level {
+  font-family: var(--sc);
+  letter-spacing: 0.04em;
+  font-variant-numeric: lining-nums;
+}
+
 /* A portal is catalogued under its own name, so the level its entrance sat on
    is the reader's only clue to how early it is reachable. */
 .from {
@@ -1241,9 +1247,15 @@ h1 .copy-seed {
 .term-problem,
 .search-problems,
 .resolved,
+.term-example,
 #search-help {
   font-variant-ligatures: none;
   font-feature-settings: "liga" 0, "clig" 0;
+}
+
+.term-example {
+  font-family: var(--sans);
+  font-variant-numeric: lining-nums;
 }
 
 /* Removal is a submit button, so it inherits the search button's small-caps

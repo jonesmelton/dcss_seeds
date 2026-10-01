@@ -4,7 +4,6 @@ module Kind = struct
   type t =
     | Floor_item
     | Shop_item
-    | Artefact
     | Floor_prop
     | Shop_prop
   [@@deriving compare, equal, enumerate, sexp_of]
@@ -12,7 +11,6 @@ module Kind = struct
   let to_int = function
     | Floor_item -> 0
     | Shop_item -> 1
-    | Artefact -> 2
     | Floor_prop -> 3
     | Shop_prop -> 4
   ;;
@@ -20,11 +18,14 @@ module Kind = struct
   let of_int = function
     | 0 -> Some Floor_item
     | 1 -> Some Shop_item
-    | 2 -> Some Artefact
     | 3 -> Some Floor_prop
     | 4 -> Some Shop_prop
     | _ -> None
   ;;
+
+  (* 2 was [Artefact], removed 2026-10. The integer is retired rather than
+     reused: [search_criteria.kind] is on-disk format. *)
+  let () = assert (Option.is_none (of_int 2))
 end
 
 type key =
@@ -57,7 +58,6 @@ let of_criterion (criterion : Search.Criterion.t) : t =
     Exact [ { kind; a = Some base_type; b = Some sub_type } ]
   | Search.Criterion.Name_like _ -> Unindexed
   | Search.Criterion.Feature _ -> Unindexed
-  | Search.Criterion.Artefact -> Exact [ { kind = Kind.Artefact; a = None; b = None } ]
   | Search.Criterion.Unique _ -> Unindexed
   | Search.Criterion.Props { base_type; props; position } ->
     let kind : Kind.t =

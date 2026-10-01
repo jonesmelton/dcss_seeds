@@ -21,6 +21,10 @@ exception Saturated
 
 val create : string -> size:int -> t
 
+(** How many connections there are. The number that has to agree with the
+    [Lwt_preemptive] thread cap, and with [Seed_web.Gate]'s size. *)
+val size : t -> int
+
 (** Callers must ensure no [with_conn] is in flight; there is no draining
     wait. *)
 val close : t -> unit
@@ -29,12 +33,14 @@ val close : t -> unit
 
     {b Saturation.} With no [timeout] this blocks the calling OS thread until a
     connection is free. [bin/main.ml] sizes the [Lwt_preemptive] thread-pool cap
-    to the same constant as the pool size, so a worker that would block here is
-    itself a resource Lwt is already queueing behind -- this path is the safety
-    net, not the mechanism, and only starts mattering if those two constants
-    drift apart. A [timeout] turns that wait into a deadline: checkout raises
-    {!Saturated} rather than blocking past it, which is what lets a saturated
-    pool answer a search with 503 instead of hanging.
+    to the same constant as the pool size, and [Seed_web.Gate] is sized from
+    {!size}, so a permit is taken before detaching and a worker that would block
+    here is already a resource Lwt is queueing behind. The deadline is
+    therefore the backstop, not the mechanism: it is unreachable while every
+    pool user takes a permit first, and it starts mattering only if a caller
+    skips the gate or the two constants drift apart. A [timeout] turns the wait
+    into a deadline anyway: checkout raises {!Saturated} rather than blocking
+    past it.
 
     {b Snapshot consistency.} Each connection has its own read snapshot, so two
     requests a moment apart can see different ones. Accepted for a read-mostly

@@ -62,12 +62,9 @@ module Prop = struct
      "good" version of a flag that has none. *)
   let why_excluded prop =
     if String.equal prop "nupgr"
-    then
-      Some
-        "an internal flag on artefacts that upgrade themselves, not a property the game \
-         ever shows you"
+    then Some "an internal flag"
     else if not (searchable prop)
-    then Some "a drawback, and nobody picks a seed for one"
+    then Some "a drawback"
     else None
   ;;
 
@@ -168,7 +165,6 @@ module Criterion = struct
     | Item of Item_type.t * position
     | Name_like of string * position
     | Feature of string
-    | Artefact
     | Unique of string
     | Props of
         { base_type : string option
@@ -230,19 +226,16 @@ module Criterion = struct
     | Item (item, position) -> Item_type.to_string item ^ position_to_string position
     | Name_like (s, position) -> sprintf "named like %S%s" s (position_to_string position)
     | Feature feat -> feature_to_string feat
-    | Artefact -> "an artefact"
     | Unique name -> name
     | Props { base_type; props; position } ->
       props_to_string ~base_type ~props ^ position_to_string position
   ;;
 
-  (* The noun for counting several of what this criterion matches. [Artefact] is
-     the only one with a plural that reads: an item type's plural depends on the
-     stack name crawl rendered, and a name fragment names no category at all. *)
+  (* The noun for counting several of what this criterion matches. An item
+     type's plural depends on the stack name crawl rendered, and a name fragment
+     names no category at all; only [Props] has a plural that reads, because
+     every match is an artefact whatever base type it sits on. *)
   let plural_noun = function
-    | Artefact -> Some "artefacts"
-    (* Every match is an artefact, whatever base type it sits on: only an
-       artefact carries properties. *)
     | Props _ -> Some "artefacts"
     | Item _ | Name_like _ | Feature _ | Unique _ -> None
   ;;
@@ -252,7 +245,7 @@ module Criterion = struct
      lookup there rather than a scan. Kept, with [partition_terms], because a
      future criterion no index serves would need exactly this. *)
   let is_indexed = function
-    | Name_like _ | Item _ | Feature _ | Artefact | Unique _ | Props _ -> true
+    | Name_like _ | Item _ | Feature _ | Unique _ | Props _ -> true
   ;;
 
   (* Three characters is a hard precondition, not a tuning knob: the substring
@@ -286,7 +279,7 @@ module Criterion = struct
        page size (measured: full scan of the version at 10k, plan unchanged
        under the keyset shape), so it belongs off the scheduler thread. *)
     | Props { base_type; props = _; position = _ } -> Option.is_some base_type
-    | Item _ | Feature _ | Artefact | Unique _ -> true
+    | Item _ | Feature _ | Unique _ -> true
   ;;
 end
 
@@ -313,7 +306,6 @@ module Term = struct
          than emitted unparseable. *)
       | Criterion.Name_like (fragment, _) -> sprintf "name~%s" fragment
       | Criterion.Feature feat -> feat
-      | Criterion.Artefact -> "artefact"
       | Criterion.Unique name -> sprintf "unique:%s" name
       (* Comma, not '+': '+Blink' and '+Inv' are property names, so a '+'
          separator spells a set holding one as "Conj++Blink". A comma cannot

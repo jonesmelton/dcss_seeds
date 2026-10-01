@@ -152,9 +152,9 @@ let%expect_test "HEAD sends no body but reports the length GET would" =
     /health              GET body 7  HEAD body 0  HEAD content-length 7
     /robots.txt          GET body 129  HEAD body 0  HEAD content-length 129
     /sitemap.xml         GET body 482  HEAD body 0  HEAD content-length 482
-    /0.34.1/             GET body 5727  HEAD body 0  HEAD content-length 5727
-    /0.34.1/about        GET body 4232  HEAD body 0  HEAD content-length 4232
-    /0.34.1/search/help  GET body 11548  HEAD body 0  HEAD content-length 11548
+    /0.34.1/             GET body 5604  HEAD body 0  HEAD content-length 5604
+    /0.34.1/about        GET body 4233  HEAD body 0  HEAD content-length 4233
+    /0.34.1/search/help  GET body 11082  HEAD body 0  HEAD content-length 11082
     |}]
 ;;
 
@@ -201,6 +201,28 @@ let%expect_test "search within its time budget answers normally" =
     let response = handle (Dream.request ~method_:`GET ~target "") in
     printf "status %d\n" (status_of response));
   [%expect {| status 200 |}]
+;;
+
+let%expect_test "the seed list serves the corpus, and ?limit= draws from the same pool" =
+  with_router ~f:(fun handle ->
+    let seeds target =
+      let body =
+        Lwt_main.run (Dream.body (handle (Dream.request ~method_:`GET ~target "")))
+      in
+      List.filter [ "100"; "200" ] ~f:(fun seed ->
+        String.is_substring body ~substring:(sprintf "class=\"seed\">%s<" seed))
+    in
+    let v = Served.to_string Served.current in
+    let show target = String.concat ~sep:" " (seeds target) in
+    printf "default: %s\n" (show (sprintf "/%s/" v));
+    printf "again: %s\n" (show (sprintf "/%s/" v));
+    printf "limit=1 count: %d\n" (List.length (seeds (sprintf "/%s/?limit=1" v))));
+  [%expect
+    {|
+    default: 100 200
+    again: 100 200
+    limit=1 count: 1
+    |}]
 ;;
 
 (* The vocabulary scan is minutes long on the real corpus, so a cold cache must

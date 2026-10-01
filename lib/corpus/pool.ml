@@ -11,7 +11,8 @@ open! Core
    so a worker that finds every connection out is already the exception -- and
    polling only starts once it happens. *)
 type t =
-  { mutex : Stdlib.Mutex.t
+  { size : int
+  ; mutex : Stdlib.Mutex.t
   ; mutable free : Db.t list
   }
 
@@ -22,8 +23,10 @@ let poll_seconds = 0.01
 let create path ~size =
   if size <= 0 then failwithf "Pool.create: size must be positive, got %d" size ();
   let free = List.init size ~f:(fun _ -> Db.open_ ~readonly:true path) in
-  { mutex = Stdlib.Mutex.create (); free }
+  { size; mutex = Stdlib.Mutex.create (); free }
 ;;
+
+let size t = t.size
 
 let close t =
   Stdlib.Mutex.lock t.mutex;

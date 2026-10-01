@@ -57,7 +57,16 @@ val build : Sqlite3.db -> version:Query.Version.t -> unit Or_error.t
     single-digit milliseconds.
 
     A [false] here is not an error: the SQL predicate path answers the same
-    question more slowly. *)
+    question more slowly.
+
+    A vocabulary change is invisible to this mark, because the mark is a seed
+    count. Removing a criterion moves no seed, so a store built before the
+    removal still reports current and the rebuild is a hygiene step rather than
+    a correctness one: the store looks criteria up by [(kind, a, b)]
+    ([search_criteria_key]), so a leftover row for a removed criterion is never
+    read, and the only visible cost is a stale catalog count and datalist. The
+    same blind spot would be a correctness bug for a change that *renames* a
+    criterion rather than removing one. *)
 val is_current : Sqlite3.db -> version:Query.Version.t -> bool
 
 (** The largest deep cohort {!page} will re-derive rather than decline over. *)

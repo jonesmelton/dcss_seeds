@@ -21,11 +21,6 @@ let%expect_test "Item in a shop is Shop_item" =
   [%expect {| (Exact (keys (((kind Shop_item) (a (wand)) (b (digging)))))) |}]
 ;;
 
-let%expect_test "Artefact has no operands" =
-  show Search.Criterion.Artefact;
-  [%expect {| (Exact (keys (((kind Artefact) (a ()) (b ()))))) |}]
-;;
-
 let%expect_test "Name_like is unindexed" =
   show (Search.Criterion.Name_like ("cer", Floor));
   [%expect {| Unindexed |}];
@@ -101,10 +96,16 @@ let%expect_test "Kind.to_int and of_int round-trip over Kind.all" =
     {|
     ((kind Floor_item) (round_trip (Floor_item)))
     ((kind Shop_item) (round_trip (Shop_item)))
-    ((kind Artefact) (round_trip (Artefact)))
     ((kind Floor_prop) (round_trip (Floor_prop)))
     ((kind Shop_prop) (round_trip (Shop_prop)))
     |}]
+;;
+
+(* Kind 2 was [Artefact]. The hole is deliberate: the integer is on-disk format
+   and is retired rather than reused by the next kind. *)
+let%expect_test "Kind.of_int leaves the removed artefact kind unassigned" =
+  print_s [%sexp (Criterion_id.Kind.of_int 2 : Criterion_id.Kind.t option)];
+  [%expect {| () |}]
 ;;
 
 let%expect_test "Kind.of_int is None out of range" =

@@ -53,8 +53,6 @@ val pool_timeout : float ref
     has=3x potion:haste         at least three of them, all on the floor
     has=shop potion:haste       the same item, for sale
     has=floor potion:haste      accepted; identical to the bare form
-    has=artefact                any artefact, floor and shop alike; any case,
-                                and "artifact" is the same term
     has=name~Throatcutter       a substring of the display name, on the floor
     has=props:Conj,Alch         one floor artefact carrying every property listed
     has=staff props:Conj,Alch   and that artefact is a staff
@@ -67,14 +65,14 @@ val pool_timeout : float ref
     potion:haste] wants three on the floor and is not satisfied by two plus one
     behind a counter.
 
-    Four things are deliberately not expressible. The union itself has no
+    Three things are deliberately not expressible. The union itself has no
     prefix, so the pre-2026-09-15 reading of a bare term cannot be spelled at
     all. [shop name~] is refused: gold binds the early game, so an unrand you
-    can afford in a shop is one you could have afforded off the floor.
-    [shop artefact] and [floor artefact] are refused because [artefact] spans
-    both and carries no colon for a prefix to lead. And a term takes one
-    position, so [shop floor potion:haste] is an error rather than a
-    last-one-wins.
+    can afford in a shop is one you could have afforded off the floor. And a
+    term takes one position, so [shop floor potion:haste] is an error rather
+    than a last-one-wins. [artefact] was a fourth until 2026-10: it was the one
+    term spanning both positions, and it is now refused with a message naming
+    the type pair or [props:] term that asks the real question.
 
     Search covers items only. Features and uniques parsed here until 2026-09-10
     and now report why they do not; see [criterion].

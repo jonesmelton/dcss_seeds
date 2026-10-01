@@ -34,10 +34,11 @@ let deepen_disabled = ref false
    This bounds what a client waits for, not what a query occupies. *)
 let search_timeout = ref 60.
 
-(* Seconds a search waits for a free pool connection before answering 503. Kept
-   well under [search_timeout]: a saturated pool is a capacity fact, and there
-   is nothing to gain by making the client wait out the whole query budget for
-   it. Set from SEED_POOL_TIMEOUT in {!Main}. *)
+(* Seconds a search waits for a free [Gate] permit -- and so for a pool
+   connection, since a permit is what one is taken under -- before answering
+   503. Kept well under [search_timeout]: saturation is a capacity fact, and
+   there is nothing to gain by making the client wait out the whole query
+   budget for it. Set from SEED_POOL_TIMEOUT in {!Main}. *)
 let pool_timeout = ref 5.
 
 (* "3x " is an affix on a criterion rather than a criterion of its own, so it is
@@ -69,7 +70,7 @@ let item_type s =
 ;;
 
 let not_an_item_monster =
-  "search covers items, not monsters. A seed page lists the uniques on each level."
+  "only items are searchable, not monsters. Each seed page lists its uniques."
 ;;
 
 (* "props:Conj,Alch", optionally led by a base type ("staff props:Conj,Alch").
@@ -100,8 +101,8 @@ let props_of_string ?base_type ~position rest =
           if String.mem prop ' '
           then
             Or_error.errorf
-              "no property named %S. Separate several properties with a comma, as in \
-               \"props:Conj,Alch\" -- a \"+\" between them becomes a space in a URL."
+              "no property named %S. Separate properties with commas, as in \
+               \"props:Conj,Alch\"."
               prop
           else Or_error.errorf "no property named %S" prop
         | Some canonical ->
@@ -110,8 +111,7 @@ let props_of_string ?base_type ~position rest =
              rejected". The reason comes from [Search.Prop] because the reasons
              differ -- calling [nupgr] a drawback would be wrong. *)
           (match Search.Prop.why_excluded canonical with
-           | Some why ->
-             Or_error.errorf "%S is %s, so it is not searchable." canonical why
+           | Some why -> Or_error.errorf "%S is %s and can't be searched." canonical why
            | None -> Ok canonical))
       |> Or_error.all
     in
@@ -164,34 +164,20 @@ let name_like ~position rest =
   else (
     match position with
     | Some Search.Criterion.Shop ->
-      Or_error.errorf
-        "there is no shop form of name~: gold is the binding constraint in the early \
-         game, so an unrand you can afford in a shop is one you could have afforded off \
-         the floor. Drop the \"shop \"."
+      Or_error.errorf "name~ only searches the floor. Remove the \"shop \"."
     | Some Search.Criterion.Floor | None ->
       Ok (Search.Criterion.Name_like (rest, Search.Criterion.Floor)))
 ;;
 
 (* The body every term reaches once its position is peeled off. [position] is
-   [None] for a term that named none, which is what lets "artefact" stay a union
-   while "shop artefact" is refused; everywhere else it settles to [Floor]. *)
+   [None] for a term that named none; everywhere else it settles to [Floor]. *)
 let criterion_at ~position s =
   let at = Option.value position ~default:Search.Criterion.Floor in
   if List.mem [ "artefact"; "artifact" ] (String.lowercase s) ~equal:String.equal
-  then (
-    match position with
-    | None -> Ok Search.Criterion.Artefact
-    (* The one criterion still spanning both sides, deliberately: a generic
-         artefact search is a weak question, and qualifying it would need parse
-         syntax it does not have ("artefact" carries no colon for a prefix to
-         lead). Refused rather than accepted and ignored. *)
-    | Some _ ->
-      Or_error.errorf
-        "artefact covers floor and shop alike, so a position does not apply to it. Drop \
-         the \"shop \" or \"floor \"."
-      (* Not dead. Without this arm "unique:Sigmund" splits on the colon and
-         parses as base type "unique" -- a search that runs, matches nothing,
-         and reports the build holds no such thing. *))
+  then
+    Or_error.errorf
+      "artefact isn't a search term. Search by property instead, as in \"props:Conj\" or \
+       \"weapon props:rF\"."
   else if String.is_prefix s ~prefix:"unique:"
   then Or_error.errorf "%s" not_an_item_monster
   else if String.is_prefix s ~prefix:"name~"
@@ -243,11 +229,7 @@ let criterion s =
         recognise. *)
      | Some (position, rest) ->
        (match position_prefix rest with
-        | Some _ ->
-          Or_error.errorf
-            "a term takes one position, not two: drop one of the \"shop \"/\"floor \" \
-             prefixes from %S"
-            s
+        | Some _ -> Or_error.errorf "use \"shop \" or \"floor \", not both: %S" s
         | None -> criterion_at ~position:(Some position) rest))
 ;;
 
@@ -260,8 +242,7 @@ let rejects_depth_cap s =
   if String.is_substring s ~substring:" by "
   then
     Or_error.errorf
-      "depth caps are no longer supported: drop the \" by ...\" from %S. Results cover \
-       the whole depth each seed was catalogued to."
+      "depth limits are no longer supported. Remove the \" by ...\" from %S."
       s
   else Ok ()
 ;;
@@ -275,10 +256,7 @@ let rejects_depth_cap s =
 let rejects_prop_count criterion ~min_count =
   match (criterion : Search.Criterion.t) with
   | Search.Criterion.Props _ when min_count > 1 ->
-    Or_error.errorf
-      "a count does not apply to properties: drop the \"%dx\". Two of a property is not \
-       a more interesting seed than one."
-      min_count
+    Or_error.errorf "props: terms don't take a count. Remove the \"%dx\"." min_count
   | _ -> Ok criterion
 ;;
 
@@ -467,7 +445,7 @@ let box ~vocabulary typed =
        let name_offer =
          let spelled = count_affix min_count ^ "name~" ^ word in
          Result.ok (term_of_string spelled)
-         |> Option.map ~f:(fun _ -> offering "To search item names for it:" [ spelled ])
+         |> Option.map ~f:(fun _ -> offering "Search artefact names instead:" [ spelled ])
        in
        (match Option.map (force vocabulary) ~f:item_pairs with
         | None ->
@@ -498,11 +476,11 @@ let box ~vocabulary typed =
                 |> readings
                 |> valid
               with
-              | [] -> rejected ?offer:name_offer (sprintf "Nothing is called %S." word)
+              | [] -> rejected ?offer:name_offer (sprintf "Nothing matches %S." word)
               | near ->
                 rejected
                   ~offer:(offering "Did you mean:" (List.map near ~f:fst))
-                  (sprintf "Nothing is called %S." word)))))
+                  (sprintf "Nothing matches %S." word)))))
 ;;
 
 let boxes ~vocabulary strings =
@@ -561,8 +539,7 @@ let empty_search_line (search : Search.t) =
       | Search.Criterion.Item ({ base_type; sub_type }, at) ->
         sprintf "item %s%s:%s" (position at) base_type sub_type
       | Name_like (fragment, at) -> sprintf "name %s%s" (position at) fragment
-      | Artefact -> "artefact"
-      | Props { base_type; props; position = at } ->
+      | Search.Criterion.Props { base_type; props; position = at } ->
         sprintf
           "props %s%s%s"
           (position at)

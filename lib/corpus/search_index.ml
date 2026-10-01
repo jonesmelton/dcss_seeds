@@ -228,22 +228,6 @@ group by e.base_type_id
     position
 ;;
 
-let artefact_list_sql =
-  {|
-  select null
-       , null
-       , e.seed
-       , min(ld.depth)
-       , sum(coalesce(e.quantity, 1))
-    from entries e
-    join level_depth ld
-      on ld.level_id = e.level_id
-   where e.version_id = ?
-     and e.artefact = 1
-group by e.seed
-|}
-;;
-
 let typed_prop_lists_sql position =
   sprintf
     {|
@@ -295,7 +279,6 @@ let list_queries ~version_id =
   let prop = [ int_bind version_id; int_bind Search.Prop.min_value ] in
   [ Criterion_id.Kind.Floor_item, item_lists_sql "is null", version
   ; Criterion_id.Kind.Shop_item, item_lists_sql "is not null", version
-  ; Criterion_id.Kind.Artefact, artefact_list_sql, version
   ; Criterion_id.Kind.Floor_prop, typed_prop_lists_sql "is null", prop
   ; Criterion_id.Kind.Floor_prop, bare_prop_lists_sql "is null", prop
   ; Criterion_id.Kind.Shop_prop, typed_prop_lists_sql "is not null", prop
@@ -790,7 +773,6 @@ let declines ~ids =
     | Search.Criterion.Name_like _ -> false
     | Search.Criterion.Item _
     | Search.Criterion.Feature _
-    | Search.Criterion.Artefact
     | Search.Criterion.Unique _
     | Search.Criterion.Props _ -> List.is_empty (Criterion_id.keys id))
 ;;
@@ -875,7 +857,6 @@ let resolve_names db ~version_id ~criterion_where ~cap ids =
          Option.map postings ~f:(fun postings -> (term, Resolved postings) :: acc)
        | Search.Criterion.Item _
        | Search.Criterion.Feature _
-       | Search.Criterion.Artefact
        | Search.Criterion.Unique _
        | Search.Criterion.Props _ -> Ok (Some ((term, Catalog id) :: acc))))
   |> Or_error.map ~f:(Option.map ~f:List.rev)

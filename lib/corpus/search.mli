@@ -97,14 +97,10 @@ module Criterion : sig
       seed with two potions of haste on the floor and a third behind a counter
       satisfies neither [3x potion:haste] nor [3x shop potion:haste]. A floor
       search is not a union search with the shop hits struck off -- it can match
-      strictly fewer seeds.
-
-      [Artefact] is the one criterion still holding the union, and it is where
-      that inconsistency shows most: 42.7% of artefact entries sit in a shop
-      against 14.4% of named entries (prod 1.3M, 2026-09-10). Kept anyway --
-      generic artefact search is a weak question and qualifying it would need
-      parse syntax it does not have -- so the help text states the asymmetry
-      rather than leaving it to be discovered.
+      strictly fewer seeds. The partition is total: every criterion names a
+      position, so the union is not expressible at all and there is no term to
+      qualify. [Name_like] is the only criterion that ignores its position, and
+      [Params] builds only [Floor].
 
       [Name_like] is the escape hatch for what the type vocabulary cannot name:
       an unrand is identified by a substring of its display name, its
@@ -132,7 +128,6 @@ module Criterion : sig
     | Item of Item_type.t * position
     | Name_like of string * position
     | Feature of string
-    | Artefact
     | Unique of string
     | Props of
         { base_type : string option
@@ -252,9 +247,9 @@ module Match : sig
       [name] is one exemplar: the shallowest matching item. [count] totals
       quantity across every matching row on the seed, and [distinct] counts how
       many differently-named items that total is spread over. They are only the
-      same fact when [distinct = 1]; a term like [Artefact] matches unrelated
-      items, so attributing [count] to [name] would claim sixteen of one storm
-      bow. *)
+      same fact when [distinct = 1]; a term matching unrelated items -- a name
+      fragment reaching several artefacts -- would otherwise have [count]
+      attributed to [name], claiming sixteen of one storm bow. *)
   type hit =
     { term : Term.t
     ; level : string

@@ -161,8 +161,8 @@ is what actually happened. Measured warm on prod (1.3M, 0.34.1, `D:8`,
 | `has=potion:haste` (2.0M rows) | 1.74s |
 | `has=floor potion:haste` | 1.82s |
 | `has=2x potion:haste` | 1.90s |
-| `has=artefact` (3.46M rows) | 2.48s |
-| `has=artefact&has=unique:Sigmund` | 3.42s |
+| `has=artefact` (3.46M rows; term since removed, 2026-10) | 2.48s |
+| `has=artefact&has=unique:Sigmund` (term since removed) | 3.42s |
 | three-term | 3.70s |
 | `has=name~Throatcutter` | 7.02s |
 
@@ -227,7 +227,6 @@ answered in low single-digit milliseconds warm (1.3M, 0.34.1, `D:8`,
 | `Item` with no position predicate (the pre-2026-09-15 union) | <1 | `USING COVERING INDEX` |
 | 2-term combo | ~1 | `USING COVERING INDEX` (both arms) |
 | 3-term combo | ~2-3 | `USING COVERING INDEX` (all arms) |
-| `Artefact` | <1 | `USING COVERING INDEX` |
 | `Unique` (`Sigmund`) | <1 | `USING COVERING INDEX` |
 | `Item (_, Shop)` (`shop potion:haste`) | <1 | `USING INDEX` (not covering — see below) |
 | `Item (_, Floor)` (`potion:haste`) | <1 | `USING COVERING INDEX` |
@@ -376,7 +375,8 @@ lose:
 matched set rather than a page, which is why `Rank.sort_limit` caps it at 5000
 and a larger match is refused with a 400 rather than answered slowly. That cap
 is doing its job — `wand:digging&rank=shallowest` is 0.57s, cheaper than the
-unranked `artefact`, because the cap bounds it where nothing bounds the others.
+unranked `potion:haste`, because the cap bounds it where nothing bounds the
+two-million-row term.
 
 So: **a query that is not index-backed must run under
 `Lwt_preemptive.detach`**, which hands it to a worker thread and lets the
@@ -403,28 +403,47 @@ match, since Lwt's own default cap (4) would otherwise throttle concurrency
 back down regardless of pool size.
 
 The dedicated `reader` connection from *Writer stance*, below, is unaffected
-and still exists: inline (non-detached) reads — the seed listing, a seed page,
-the store-backed vocabulary — keep using it directly. Every *search* now
+and still exists: inline (non-detached) reads — a seed page, the store-backed
+vocabulary — keep using it directly. The seed listing is no longer one of them.
+It was 17ms a hit on the scheduler thread, 7ms of it SQL and most of the rest
+serialising 147 KB of HTML, so it capped the whole process at ~57 req/s and
+held `/health` at 250ms under load (1.3M, 0.34.1, quiet box, 2026-09-30; fossil
+ticket `d0549d6c01`). It is now served from `Seed_web.Front_cache`: a detached
+build under a gate permit draws 1000 seeds and renders them as whole pages,
+default hits rotate through those strings, and a page older than 60s is
+rebuilt in the background while the old one is still served. The cost is
+staleness — a seed deepened since the last build shows its old summary for up
+to a minute. Every *search* now
 detaches and goes through the pool, not only the ones a cheapness predicate
 cleared: `Seed_web.search_is_cheap` and its inline shortcut were removed
 2026-09-29, because it asked about the plan when cost is set by the matched set.
-See `Pool`'s `.mli` for the two tradeoffs that come with it: checkout is bounded
-by `SEED_POOL_TIMEOUT` (default 5s), answering 503 with `Pool.Saturated` rather
-than waiting out the search budget, and two concurrent requests on two different
-pooled connections can see different snapshots if a write lands between their
-checkouts — accepted for a read-mostly corpus.
+See `Pool`'s `.mli` for the two tradeoffs that come with it: two concurrent
+requests on two different pooled connections can see different snapshots if a
+write lands between their checkouts — accepted for a read-mostly corpus — and
+checkout has real cost, which is why the inline reads above stay off it.
 
-**A search request is bounded twice.** `SEED_POOL_TIMEOUT` (default 5s) bounds
-the wait for a pool connection; `SEED_SEARCH_TIMEOUT` (default 60s) then races
-the running search against a timer and answers the styled 503 when the timer
-wins, so a reader is never left waiting on a query that will not finish. One
-gap, deliberate as of 2026-09-10 and left for the load test (`ops/loadtest.md`)
-to size:
+**A search request is bounded twice, and both bounds are now reachable.**
+`SEED_POOL_TIMEOUT` (default 5s) bounds the wait for a `Seed_web.Gate` permit,
+which is what a pool connection is taken under, so a saturated pool answers 503
+instead of queueing; `SEED_SEARCH_TIMEOUT` (default 60s) then races the running
+search against a timer and answers the styled 503 when the timer wins, so a
+reader is never left waiting on a query that will not finish. The permit has to
+be taken *before* detaching, which is what the gate is for: `Pool.with_conn`'s
+own deadline is checked inside the detached computation, after the worker slot
+is already held, and the queue it would have bounded is `Lwt_preemptive`'s,
+which is unbounded (`set_max_number_of_threads_queued` is vestigial in lwt
+6.1.2). Measured at 200 RPS against a 1.3M corpus, searches waited ~46s for a
+slot the pool deadline was supposed to bound at 5s, and the cheap routes lost
+their upstream connections behind them (prod, 0.34.1, 2026-09-30); see
+`lib/web/gate.mli`. One gap, deliberate as of 2026-09-10 and left for the load
+test (`ops/loadtest.md`) to size:
 
 - It does not cancel the query. sqlite3-ocaml 5.4.2 binds neither
   `sqlite3_interrupt` nor a progress handler, so the abandoned search runs to
   completion still holding its pool connection. The timeout bounds what a client
-  waits for, not what a query occupies; closing this needs a C stub.
+  waits for, not what a query occupies; closing this needs a C stub. The gate's
+  permit is released when the work finishes for the same reason -- see
+  `Gate.with_permit`.
 
 ~~It covers only the detached path. A search `search_is_cheap` calls cheap runs
 inline on the scheduler thread and never yields, so no Lwt timer can fire —
@@ -802,17 +821,16 @@ denote different sets depending on state outside the term, where `potion:haste`
 denotes floor-only always, fixed by the term text alone with nothing outside it
 consulted.
 
-`Artefact` is the one criterion still holding the union, and it takes no
-position at all — `shop artefact` is an error, not a narrowing. A generic
-artefact search is a weak question and qualifying it would need parse syntax it
-does not have (`artefact` carries no colon for a prefix to lead). The
-inconsistency is visible rather than theoretical, because artefacts are where
-shop stock concentrates: 42.7% of artefact entries sit in a shop against 14.4%
-of named entries (1.3M, 0.34.1, prod, 2026-09-10). The help text states it for
-that reason — an asymmetry that is explained is a decision, one that is
-discovered is a bug. `name~` breaks the symmetry the other way and has no shop
-form: gold binds the early game, so an unrand you can afford in a shop is one
-you could have afforded off the floor.
+The partition is total. Every criterion names a position, so the union is not
+expressible at all and there is no term to qualify. `Artefact` was the last
+holdout and was removed 2026-10: it took no position at all (`shop artefact`
+was an error, not a narrowing) because a generic artefact search is a weak
+question — 8,665 of 10,000 seeds hold one (0.34.1, D:8, local) — and
+qualifying it would have needed parse syntax it did not have. It is refused
+with a message naming the type pair or `props:` term that asks the real
+question. `name~` breaks the symmetry the other way and has no shop form: gold
+binds the early game, so an unrand you can afford in a shop is one you could
+have afforded off the floor.
 
 `cost is null` used to fall outside the covering index, so the floor arm read
 the index for the seek and the table for the test — a shape that read as cheap
@@ -1070,13 +1088,14 @@ easy to get wrong and were:
 - **The total belongs to the term, not to the item named beside it.** Grouping
   by seed is right, but it makes `name` an *exemplar* — the shallowest matching
   item — while `count` spans every matching item on the seed. For
-  `3x potion:haste` those are the same fact. For `artefact` they are not: a seed
-  with sixteen unrelated randarts rendered as `+8 storm bow {elec, penet} ×16`,
-  claiming sixteen of one bow. A hit therefore carries `distinct`, the number of
-  differently-named items the total spans, and the view quantifies the exemplar
-  only when `distinct = 1`; otherwise it states the total separately
-  (`· 16 artefacts`, falling back to `matches` for a criterion naming no
-  category — see `Criterion.plural_noun`).
+  `3x potion:haste` those are the same fact. For a term matching unrelated items
+  — a bare property carried by several artefacts, or a name fragment — they are
+  not: a seed with sixteen unrelated randarts rendered as
+  `+8 storm bow {elec, penet} ×16`, claiming sixteen of one bow. A hit therefore
+  carries `distinct`, the number of differently-named items the total spans, and
+  the view quantifies the exemplar only when `distinct = 1`; otherwise it states
+  the total separately (`· 16 artefacts`, falling back to `matches` for a
+  criterion naming no category — see `Criterion.plural_noun`).
 
 ### Covering is the whole game
 
@@ -1120,8 +1139,9 @@ search detaches.** The original rule detached only what
 `Seed_web.search_is_cheap` judged not cheap, but that predicate asked about the
 *plan* when cost is set by the *matched set* (see the struck tables below), so
 it let expensive searches run inline on the scheduler thread. It was removed
-2026-09-29; the per-search pool checkout (`SEED_POOL_TIMEOUT`) is now the only
-admission control.
+2026-09-29; the gate permit taken before each detach (`SEED_POOL_TIMEOUT`) is
+now the admission control, and `Pool.with_conn`'s own deadline is the backstop
+behind it.
 
 On the finished 100k corpus every indexed shape landed in single- or
 double-digit milliseconds (`unique` 6ms, `shop` 2ms, `min_count` 25ms,

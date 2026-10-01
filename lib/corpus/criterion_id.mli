@@ -15,12 +15,11 @@ module Kind : sig
 
       Floor and shop are separate lists rather than one list and a filter,
       because the two positions partition the entries totally and the union is
-      no longer expressible ({!Search.Criterion}). Deriving one from the other
-      would be a merge, and nothing asks for it. *)
+      not expressible ({!Search.Criterion}). Deriving one from the other would
+      be a merge, and nothing asks for it. *)
   type t =
     | Floor_item (** [a] base type, [b] sub type *)
     | Shop_item (** as [Floor_item] *)
-    | Artefact (** neither operand; the one criterion still spanning both positions *)
     | Floor_prop
     (** [a] base type or [None] for any, [b] the property. Built by
             correlating at the *entry* level, so the list is exactly "a seed
@@ -30,7 +29,8 @@ module Kind : sig
   [@@deriving compare, equal, enumerate, sexp_of]
 
   (** Stored in [search_criteria.kind]. Values are part of the on-disk format
-      and never change meaning; a new kind takes the next integer. *)
+      and never change meaning; a new kind takes the next integer. 2 held the
+      removed [Artefact] and is retired, not reused. *)
   val to_int : t -> int
 
   val of_int : int -> t option

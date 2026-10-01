@@ -62,21 +62,21 @@ let note ?position ?(filling = false) ~depth ~job ~csrf () =
 let shallow = Seed_corpus.Fill_depth.shallow
 let deep = Seed_corpus.Fill_depth.of_levels [ "Swamp:4" ]
 
-(* Without the shallow sentence the absence of a Lair reads as a fact about the
-   seed rather than about how far anyone searched. *)
-let%expect_test "a shallow seed says why its levels stop, and offers the button" =
+let%expect_test "a shallow seed states its depth, and offers the button" =
   let html =
     note ~depth:shallow ~job:None ~csrf:(Some "<input name=\"dream.csrf\"/>") ()
   in
   printf
-    "says why:   %b\n"
-    (String.is_substring html ~substring:"not because the dungeon does");
+    "says depth: %b\n"
+    (String.is_substring
+       html
+       ~substring:"Searched to <strong><span class=\"level\">D:8</span></strong>");
   printf "has button: %b\n" (String.is_substring html ~substring:"</button>");
   printf "has token:  %b\n" (String.is_substring html ~substring:"dream.csrf");
   printf "polls:      %b\n" (String.is_substring html ~substring:"hx-trigger");
   [%expect
     {|
-    says why:   true
+    says depth: true
     has button: true
     has token:  true
     polls:      false
@@ -89,7 +89,7 @@ let%expect_test "a deep seed states its depth and offers nothing" =
   let html = note ~depth:deep ~job:None ~csrf:None () in
   print_endline html;
   [%expect
-    {| <div id="depth" class="depth-note"><p>Searched down to <strong>D:14</strong>, past the usual cap.</p></div> |}]
+    {| <div id="depth" class="depth-note"><p>Searched to <strong><span class="level">D:14</span></strong>.</p></div> |}]
 ;;
 
 (* No progress bar in either waiting state: crawl emits nothing incremental.
@@ -125,7 +125,9 @@ let%expect_test "a deep seed is deep even while its job still reads running" =
       printf
         "%-8s deep:%b polls:%b button:%b\n"
         label
-        (String.is_substring html ~substring:"past the usual cap")
+        (String.is_substring
+           html
+           ~substring:"Searched to <strong><span class=\"level\">D:14</span></strong>")
         (String.is_substring html ~substring:"hx-trigger")
         (String.is_substring html ~substring:"</button>"));
   [%expect
@@ -136,10 +138,6 @@ let%expect_test "a deep seed is deep even while its job still reads running" =
     |}]
 ;;
 
-(* Position 0 is "next", never "0 ahead": a count of nothing is the one case
-   the number reads worse than the word. The build is named because the count is
-   per build -- an unqualified "3 ahead" would describe a queue nothing works
-   through. *)
 let%expect_test "a queued job says where it is in the line" =
   List.iter [ None; Some 0; Some 1; Some 7 ] ~f:(fun position ->
     let html = note ?position ~depth:shallow ~job:(Some (job ())) ~csrf:(Some "") () in
@@ -160,10 +158,10 @@ let%expect_test "a queued job says where it is in the line" =
       sentence);
   [%expect
     {|
-    none   Queued for a deeper search, down to Swamp:4. Waiting for a free dungeon generator.
-    0      Queued for a deeper search, down to Swamp:4. Waiting for a free dungeon generator. It is next in line for this build.
-    1      Queued for a deeper search, down to Swamp:4. Waiting for a free dungeon generator. One request is ahead of it on this build.
-    7      Queued for a deeper search, down to Swamp:4. Waiting for a free dungeon generator. 7 requests are ahead of it on this build.
+    none   Queued to search to Swamp:4.
+    0      Queued to search to Swamp:4. Next in queue.
+    1      Queued to search to Swamp:4. 1 ahead in queue.
+    7      Queued to search to Swamp:4. 7 ahead in queue.
     |}]
 ;;
 
@@ -297,6 +295,14 @@ let%expect_test "a book lists its spells, a parchment does not repeat its own" =
 
 module Search = Seed_corpus.Search
 
+(* The heterogeneous term these tests use is a bare property: it matches
+   unrelated artefacts, which is what makes [count] and [distinct] come apart. *)
+let props_term =
+  Search.Term.create
+    (Search.Criterion.Props
+       { base_type = None; props = [ "Conj" ]; position = Search.Criterion.Floor })
+;;
+
 (* The results are swapped, so anything inside them is destroyed by the
    response it was waiting for -- the indicator has to live in the form. And it
    has to be a word: the site's reduced-motion rule strips every animation. *)
@@ -406,8 +412,10 @@ let%expect_test "a fill in progress explains itself instead of offering the butt
     |> String.concat
   in
   printf
-    "says why:   %b\n"
-    (String.is_substring html ~substring:"not because the dungeon does");
+    "says depth: %b\n"
+    (String.is_substring
+       html
+       ~substring:"Searched to <strong><span class=\"level\">D:8</span></strong>");
   printf
     "explains:   %b\n"
     (String.is_substring html ~substring:"Deeper searches are paused");
@@ -415,7 +423,7 @@ let%expect_test "a fill in progress explains itself instead of offering the butt
   printf "polls:      %b\n" (String.is_substring html ~substring:"hx-trigger");
   [%expect
     {|
-    says why:   true
+    says depth: true
     explains:   true
     has button: false
     polls:      false
@@ -438,9 +446,7 @@ let%expect_test "a fill does not silence a job already in the queue" =
     |> String.concat
   in
   printf "polls:   %b\n" (String.is_substring html ~substring:"hx-trigger");
-  printf
-    "queued:  %b\n"
-    (String.is_substring html ~substring:"Queued for a deeper search");
+  printf "queued:  %b\n" (String.is_substring html ~substring:"Queued to search");
   [%expect
     {|
     polls:   true
@@ -454,9 +460,7 @@ let%expect_test "a fill does not silence a job already in the queue" =
    results, out of band. Without it a scripted reader is stuck at one box while
    a scripting-off reader is not. *)
 let%expect_test "the htmx response carries a form with a box for the next term" =
-  let search =
-    Search.create ~version:v ~terms:[ Search.Term.create Search.Criterion.Artefact ] ()
-  in
+  let search = Search.create ~version:v ~terms:[ props_term ] () in
   let html =
     Seed_web.Views.search_fragment
       ~search
@@ -566,7 +570,7 @@ let%expect_test "each term box carries a remove button, the blank box does not" 
 let%expect_test "the first submit button in the form is a search, not a removal" =
   let term s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
   let search =
-    Search.create ~version:v ~terms:[ term "potion:haste"; term "artefact" ] ()
+    Search.create ~version:v ~terms:[ term "potion:haste"; term "wand:digging" ] ()
   in
   let html =
     Seed_web.Views.search_page
@@ -605,7 +609,7 @@ let%expect_test "the first submit button in the form is a search, not a removal"
 let%expect_test "term boxes carry positional ids, blank box included" =
   let term s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
   let search =
-    Search.create ~version:v ~terms:[ term "name~lance"; term "artefact" ] ()
+    Search.create ~version:v ~terms:[ term "name~lance"; term "wand:digging" ] ()
   in
   let html =
     Seed_web.Views.search_page
@@ -640,9 +644,7 @@ let%expect_test "term boxes carry positional ids, blank box included" =
    therefore a property of every search response, not only the full-page
    render. *)
 let%expect_test "the htmx response carries the title, so an error does not stick" =
-  let search =
-    Search.create ~version:v ~terms:[ Search.Term.create Search.Criterion.Artefact ] ()
-  in
+  let search = Search.create ~version:v ~terms:[ props_term ] () in
   let html =
     Seed_web.Views.search_fragment
       ~search
@@ -673,14 +675,14 @@ let%expect_test "a search with no terms prompts instead of listing seeds" =
     |> String.concat
   in
   printf "has a form:     %b\n" (String.is_substring html ~substring:"id=\"search\"");
-  printf "prompts:        %b\n" (String.is_substring html ~substring:"Add a term");
+  printf "prompts:        %b\n" (String.is_substring html ~substring:"Enter a term");
   printf "no results table: %b\n" (not (String.is_substring html ~substring:"<table"));
   printf
     "no all-seeds heading: %b\n"
     (not (String.is_substring html ~substring:"all seeds on"));
   printf
     "no empty-corpus claim: %b\n"
-    (not (String.is_substring html ~substring:"have been ingested"));
+    (not (String.is_substring html ~substring:"No seeds for this build"));
   [%expect
     {|
     has a form:     true
@@ -729,7 +731,7 @@ let%expect_test "a shop with no notable stock says so without implying a gap" =
 let%expect_test "a heterogeneous hit states its total apart from its exemplar" =
   let module Search = Seed_corpus.Search in
   let version = Or_error.ok_exn (Seed_corpus.Query.Version.of_string "0.34.1") in
-  let term = Search.Term.create Search.Criterion.Artefact in
+  let term = props_term in
   let hit ~name ~count ~distinct =
     { Search.Match.term; level = "D:3"; name; count; distinct }
   in
@@ -739,6 +741,12 @@ let%expect_test "a heterogeneous hit states its total apart from its exemplar" =
       }
     ; { Search.Match.seed = "1000200"
       ; hits = [ hit ~name:"2 potions of haste" ~count:2 ~distinct:1 ]
+      }
+    ; { Search.Match.seed = "1000300"
+      ; hits = [ hit ~name:"potion of haste" ~count:3 ~distinct:1 ]
+      }
+    ; { Search.Match.seed = "1000400"
+      ; hits = [ hit ~name:"2 potions of haste" ~count:4 ~distinct:1 ]
       }
     ]
   in
@@ -755,8 +763,10 @@ let%expect_test "a heterogeneous hit states its total apart from its exemplar" =
     print_endline (String.sub rest ~pos:0 ~len:stop));
   [%expect
     {|
-    <ul class="hits"><li>+8 storm bow {elec, penet} on <span class="sc">D:3</span><span class="hit-total">16 artefacts</span></li>
-    <ul class="hits"><li>2 potions of haste ×2 on <span class="sc">D:3</span></li>
+    <ul class="hits"><li>+8 storm bow {elec, penet} on <span class="level">D:3</span><span class="hit-total">16 artefacts</span></li>
+    <ul class="hits"><li>2 potions of haste on <span class="level">D:3</span></li>
+    <ul class="hits"><li>potion of haste ×3 on <span class="level">D:3</span></li>
+    <ul class="hits"><li>2 potions of haste on <span class="level">D:3</span><span class="hit-total">4 in all</span></li>
     |}]
 ;;
 

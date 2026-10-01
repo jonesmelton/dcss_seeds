@@ -1,4 +1,6 @@
 open! Core
+module Front_cache = Front_cache
+module Gate = Gate
 module Index = Index
 module Params = Params
 module Served = Served
@@ -93,10 +95,10 @@ let bad_request err =
 (* Not [bad_request]: the reader's query is well-formed and the fault is the
    corpus's, so this is a 503 with a retry hint rather than a 400 telling them
    they got it wrong. *)
-let temporarily_unavailable message =
+let temporarily_unavailable ?(retry_after = 300) message =
   Dream.html
     ~status:`Service_Unavailable
-    ~headers:[ "Retry-After", "300" ]
+    ~headers:[ "Retry-After", Int.to_string retry_after ]
     (render_html
        (Index.render
           ~title:"Temporarily unavailable"
@@ -145,20 +147,97 @@ let served_builds db =
       None)
 ;;
 
-let seed_list_page db version request =
+(* The most-hit route renders nothing per request: pages are cached as strings
+   because serialisation, not SQL, is most of the cost. Rotation rather than a
+   random pick, so "More" walks every page before repeating one. *)
+type front =
+  { pages : string array
+  ; pool : Seed_corpus.Level.Summary.t array
+  ; builds : (Served.t * int) list
+  ; mutable next : int
+  }
+
+let front_pool_size = 1000
+let front_max_age = Time_ns.Span.of_sec 60.
+
+let render_front ~version ~builds ~page summaries =
+  render_html
+    (Index.render
+       ~version
+       ~builds
+       ~here:Index.Page.Seeds
+       ~title:"dcss garden"
+       (Views.seed_list ~version ~page summaries))
+;;
+
+let build_front ~reader ~pool ~gate key =
+  match Seed_corpus.Query.Version.of_string key with
+  | Error err -> Lwt.return (Error err)
+  | Ok version ->
+    let builds = served_builds reader in
+    let page =
+      Seed_corpus.Query.Page.create ~limit:Seed_corpus.Query.Page.default_limit ()
+    in
+    let%lwt outcome =
+      Gate.with_permit gate ~timeout:!Params.pool_timeout ~f:(fun () ->
+        Lwt_preemptive.detach
+          (fun () ->
+             match
+               Seed_corpus.Pool.with_conn pool ~timeout:!Params.pool_timeout ~f:(fun db ->
+                 Seed_corpus.Db.sample_seeds db ~version ~limit:front_pool_size)
+             with
+             | exception Seed_corpus.Pool.Saturated ->
+               Or_error.error_string "search pool busy"
+             | Error err -> Error err
+             | Ok (summaries, _) ->
+               let pages =
+                 match List.chunks_of summaries ~length:page.limit with
+                 | [] -> [ render_front ~version ~builds ~page [] ]
+                 | chunks -> List.map chunks ~f:(render_front ~version ~builds ~page)
+               in
+               Ok
+                 { pages = Array.of_list pages
+                 ; pool = Array.of_list summaries
+                 ; builds
+                 ; next = 0
+                 })
+          ())
+    in
+    let result =
+      match outcome with
+      | `Admitted result -> result
+      | `Saturated -> Or_error.error_string "search pool busy"
+    in
+    Result.iter_error result ~f:(fun err ->
+      Dream.warning (fun log ->
+        log "front page for %s not built: %s" key (Error.to_string_hum err)));
+    Lwt.return result
+;;
+
+let seed_list_page front version request =
   match Params.page request with
   | Error err -> bad_request err
   | Ok page ->
-    (* Front page samples; [after] re-samples, not resumes. *)
-    Seed_corpus.Db.sample_seeds db ~version ~limit:page.limit
-    |> Or_error.map ~f:(fun (summaries, _more) ->
-      Index.render
-        ~version
-        ~builds:(served_builds db)
-        ~here:Index.Page.Seeds
-        ~title:"dcss garden"
-        (Views.seed_list ~version ~page summaries))
-    |> or_error_response
+    (match%lwt
+       Front_cache.get front ~key:(Seed_corpus.Query.Version.to_string version)
+     with
+     | Error _ ->
+       temporarily_unavailable
+         ~retry_after:5
+         "The seed list is still loading. Try again in a moment."
+     | Ok front ->
+       if page.limit = Seed_corpus.Query.Page.default_limit
+       then (
+         let html = front.pages.(front.next % Array.length front.pages) in
+         front.next <- front.next + 1;
+         Dream.html html)
+       else
+         Dream.html
+           (render_front
+              ~version
+              ~builds:front.builds
+              ~page
+              (List.take (List.permute (Array.to_list front.pool)) page.limit)))
 ;;
 
 (* Missing seed 404s on the detail page, not here. *)
@@ -441,17 +520,16 @@ let deepen_seed ~reader ~writer ~lock_path version request =
              let refusal =
                match outcome with
                | `Queue_full ->
-                 Some "The deepening queue is full just now. Try again in a minute."
+                 Some "The queue for deeper searches is full. Try again in a minute."
                (* Reachable from a pre-fill or pre-restart page render.
                   Generator heartbeats through a fill, so never
                   [`No_generator] here. *)
                | `Filling ->
                  Some
-                   "That deeper search is unavailable right now: this build is busy \
-                    building out the corpus. Try again when it finishes."
+                   "Deeper searches are paused while new seeds are added to this build. \
+                    Try again later."
                | `No_generator ->
-                 Some
-                   "Nothing can search that build deeper at the moment. Try again later."
+                 Some "Deeper searches are unavailable right now. Try again later."
                | `Already_deep | `Queued | `Already_queued _ -> None
              in
              (match refusal with
@@ -476,24 +554,35 @@ let deepen_seed ~reader ~writer ~lock_path version request =
             ~f:render_fragment))
 ;;
 
-(* Every search detaches, checking out of [pool] under a deadline so a
-   saturated pool answers instead of queueing: [Saturated] is the fifth
-   concurrent search failing fast, not waiting out the search timeout. Blocking
-   SQLite on the scheduler thread would stall every concurrent request *and* the
-   timeout below, which is an Lwt race the scheduler has to be free to lose. The
-   old cheapness predicate was wrong in exactly that direction at corpus scale
-   -- it asked about the plan when cost is set by the matched set -- so the
-   inline shortcut is gone. See [Pool]'s saturation note. *)
-let run_search pool search ~rank =
-  Lwt_preemptive.detach
-    (fun () ->
-       match
-         Seed_corpus.Pool.with_conn pool ~timeout:!Params.pool_timeout ~f:(fun db ->
-           Seed_corpus.Db.search_seeds db search ~rank)
-       with
-       | result -> `Answered result
-       | exception Seed_corpus.Pool.Saturated -> `Saturated)
-    ()
+(* Every search takes a [Gate] permit before detaching, so a burst queues in
+   Lwt behind [SEED_POOL_TIMEOUT] rather than in [Lwt_preemptive]'s unbounded
+   worker queue. [Saturated] is the fifth concurrent search failing fast instead
+   of waiting out the search budget, which is what [Pool]'s own deadline could
+   never do: checkout runs inside the detached computation, after the worker
+   slot is already held. Blocking SQLite on the scheduler thread would stall
+   every concurrent request *and* the timeout below, which is an Lwt race the
+   scheduler has to be free to lose. The old cheapness predicate was wrong in
+   exactly that direction at corpus scale -- it asked about the plan when cost
+   is set by the matched set -- so the inline shortcut is gone. See [Gate]. *)
+let run_search pool gate search ~rank =
+  let%lwt outcome =
+    Gate.with_permit gate ~timeout:!Params.pool_timeout ~f:(fun () ->
+      Lwt_preemptive.detach
+        (fun () ->
+           (* The pool's own deadline is the backstop behind the gate, so this
+              arm should be unreachable -- but an uncaught [Saturated] here
+              surfaces as a 500 where the reader is owed a 503. *)
+           match
+             Seed_corpus.Pool.with_conn pool ~timeout:!Params.pool_timeout ~f:(fun db ->
+               Seed_corpus.Db.search_seeds db search ~rank)
+           with
+           | result -> `Answered result
+           | exception Seed_corpus.Pool.Saturated -> `Saturated)
+        ())
+  in
+  match outcome with
+  | `Admitted result -> Lwt.return result
+  | `Saturated -> Lwt.return `Saturated
 ;;
 
 (* Datalist vocabulary is a scan; detached and cached per version for process
@@ -517,20 +606,26 @@ let unrand_options version =
   | Some names -> List.map names ~f:(fun name -> "name~" ^ name)
 ;;
 
-let criteria_scan pool version ~key =
+let criteria_scan pool gate version ~key =
   let%lwt computed =
-    Lwt_preemptive.detach
-      (fun () ->
-         try
-           Seed_corpus.Pool.with_conn pool ~timeout:!Params.pool_timeout ~f:(fun db ->
-             Seed_corpus.Db.distinct_criteria db ~version)
-         with
-         | Seed_corpus.Pool.Saturated ->
-           (* The scan yields its slot rather than occupying a worker waiting
-              for one; the next miss retries because [criteria_pending] is
-              cleared below. *)
-           Or_error.error_string "search pool busy")
-      ()
+    let%lwt outcome =
+      Gate.with_permit gate ~timeout:!Params.pool_timeout ~f:(fun () ->
+        Lwt_preemptive.detach
+          (fun () ->
+             try
+               Seed_corpus.Pool.with_conn pool ~timeout:!Params.pool_timeout ~f:(fun db ->
+                 Seed_corpus.Db.distinct_criteria db ~version)
+             with
+             | Seed_corpus.Pool.Saturated -> Or_error.error_string "search pool busy")
+          ())
+    in
+    match outcome with
+    | `Admitted result -> Lwt.return result
+    | `Saturated ->
+      (* The scan yields its slot rather than occupying a worker waiting for
+         one; the next miss retries because [criteria_pending] is cleared
+         below. *)
+      Lwt.return (Or_error.error_string "search pool busy")
   in
   (match computed with
    | Error err ->
@@ -545,13 +640,13 @@ let criteria_scan pool version ~key =
   Lwt.return_unit
 ;;
 
-let criteria_for pool version =
+let criteria_for pool gate version =
   let key = Seed_corpus.Query.Version.to_string version in
   match Hashtbl.find criteria_cache key with
   | Some options -> Some options
   | None ->
     if not (Hashtbl.mem criteria_pending key)
-    then Hashtbl.set criteria_pending ~key ~data:(criteria_scan pool version ~key);
+    then Hashtbl.set criteria_pending ~key ~data:(criteria_scan pool gate version ~key);
     None
 ;;
 
@@ -592,21 +687,21 @@ let about_page db version _request =
 
 (* The catalog when the store is current, else whatever the datalist cache
    holds. Neither may wait on the datalist scan: this runs inline. *)
-let search_vocabulary db pool version =
+let search_vocabulary db pool gate version =
   match Seed_corpus.Db.catalog_item_pairs db ~version with
   | Ok (Some pairs) -> Some pairs
-  | Ok None -> criteria_for pool version
+  | Ok None -> criteria_for pool gate version
   | Error err ->
     Dream.warning (fun log ->
       log "search vocabulary unavailable: %s" (Error.to_string_hum err));
-    criteria_for pool version
+    criteria_for pool gate version
 ;;
 
 (* A 400 that hands the search back, terms as typed: logs show readers
    iterating one query five or six times, and a bare error page cost them the
    whole query each time. Status stays 400; htmx 4 swaps it regardless. *)
-let search_rejected db ~pool version request ~rank ~boxes ~problems =
-  let suggestions = criteria_for pool version in
+let search_rejected db ~pool ~gate version request ~rank ~boxes ~problems =
+  let suggestions = criteria_for pool gate version in
   if Option.is_some (Dream.header request "HX-Request")
   then
     Dream.html
@@ -641,7 +736,7 @@ let view_box (box : Params.Box.t) =
   }
 ;;
 
-let answer_search db ~pool version request ~boxes ~page ~rank ~terms =
+let answer_search db ~pool ~gate version request ~boxes ~page ~rank ~terms =
   let search = Seed_corpus.Search.create ~version ~terms ~page () in
   let resolved =
     List.filter_map boxes ~f:(fun (box : Params.Box.t) ->
@@ -659,42 +754,43 @@ let answer_search db ~pool version request ~boxes ~page ~rank ~terms =
          abandoned search runs on to completion still holding its pool
          connection, since there is no [sqlite3_interrupt] to bind. Enough
          against an accidental or probing hang, not against a determined
-         one -- that needs the interrupt. *)
+         one -- that needs the interrupt. The gate permit is held for as long,
+         because [Gate.with_permit] releases on resolution rather than on
+         cancellation; the gate bounds the *wait*, not the work. *)
       Lwt.pick
-        [ run_search pool search ~rank
+        [ run_search pool gate search ~rank
         ; Lwt.map (fun () -> `Timed_out) (Lwt_unix.sleep !Params.search_timeout)
         ]
   in
   match result with
   | `Saturated ->
-    temporarily_unavailable "Every search slot is busy right now. Try again in a moment."
+    temporarily_unavailable "Too many searches are running. Try again in a moment."
   | `Timed_out ->
     Dream.warning (fun log -> log "search over %.0fs budget" !Params.search_timeout);
     temporarily_unavailable
-      "That search took too long to answer and was stopped. Narrowing it with another \
-       term will usually make it fast enough."
+      "That search took too long and was stopped. Adding another term usually helps."
   | `Answered result ->
     (match result with
      (* A rebuild in progress is a transient state of the corpus, not a bad
       query: the reader's search is well-formed and will work shortly. *)
      | Error err when Seed_corpus.Search.is_index_rebuilding err ->
        temporarily_unavailable
-         "Searching by name is briefly unavailable while the name index rebuilds after a \
-          corpus update. Every other kind of search still works; try this one again in a \
-          few minutes."
+         "name~ searches are unavailable for a few minutes while the name index \
+          rebuilds. Other searches still work."
      (* Too broad to rank is a reader query issue, not a fault. *)
      | Error err when Seed_corpus.Search.Rank.is_too_broad err ->
        search_rejected
          db
          ~pool
+         ~gate
          version
          request
          ~rank
          ~boxes:(Views.Box.of_terms terms)
          ~problems:
            [ Printf.sprintf
-               "That search matches more than %d seeds, which is too many to rank by %s. \
-                Add another term to narrow it, or rank by seed."
+               "That search matches more than %d seeds, too many to rank by %s. Add \
+                another term, or rank by seed."
                Seed_corpus.Search.Rank.sort_limit
                (Seed_corpus.Search.Rank.to_string rank)
            ]
@@ -707,7 +803,7 @@ let answer_search db ~pool version request ~boxes ~page ~rank ~terms =
          && (not (Seed_corpus.Search.is_empty search))
          && Option.is_none search.page.after
        then Dream.info (fun log -> log "%s" (Params.empty_search_line search));
-       let suggestions = criteria_for pool version in
+       let suggestions = criteria_for pool gate version in
        let body = Views.search_page ~resolved ~search ~suggestions ~rank ~more matches in
        if Option.is_some (Dream.header request "HX-Request")
        then
@@ -733,7 +829,7 @@ let answer_search db ~pool version request ~boxes ~page ~rank ~terms =
                  body)))
 ;;
 
-let search_page db ~pool version request =
+let search_page db ~pool ~gate version request =
   if !Params.search_disabled
   then
     if Option.is_some (Dream.header request "HX-Request")
@@ -753,7 +849,7 @@ let search_page db ~pool version request =
       |> Params.without_dropped ~drop:(Dream.query request "drop")
     in
     let boxes =
-      Params.boxes ~vocabulary:(lazy (search_vocabulary db pool version)) typed
+      Params.boxes ~vocabulary:(lazy (search_vocabulary db pool gate version)) typed
     in
     let page = Params.page request in
     let rank = Params.rank request in
@@ -764,7 +860,7 @@ let search_page db ~pool version request =
     in
     let rank = Result.ok rank |> Option.value ~default:Seed_corpus.Search.Rank.default in
     let rejected ~boxes ~problems =
-      search_rejected db ~pool version request ~rank ~boxes ~problems
+      search_rejected db ~pool ~gate version request ~rank ~boxes ~problems
     in
     match boxes, page with
     | Error _, _ ->
@@ -778,13 +874,24 @@ let search_page db ~pool version request =
     | Ok boxes, Ok page when List.is_empty problems ->
       (match Params.terms_of_boxes boxes with
        | None -> rejected ~boxes:(List.map boxes ~f:view_box) ~problems:[]
-       | Some terms -> answer_search db ~pool version request ~boxes ~page ~rank ~terms)
+       | Some terms ->
+         answer_search db ~pool ~gate version request ~boxes ~page ~rank ~terms)
     | Ok boxes, _ -> rejected ~boxes:(List.map boxes ~f:view_box) ~problems)
 ;;
 
 (* Styled 404 as trailing catch-all route; [Dream.router] gives bare bodiless
    404 for unmatched paths. Must stay last. *)
 let router ~reader ~writer ~pool ~lock_path =
+  (* Sized from the pool, because the two are one budget: a permit is what a
+     pool connection is taken under. Sizing them apart restores the unbounded
+     queue in [Lwt_preemptive] with extra steps. *)
+  let gate = Gate.create ~size:(Seed_corpus.Pool.size pool) in
+  let front =
+    Front_cache.create
+      ~max_age:front_max_age
+      ~now:Time_ns.now
+      ~build:(build_front ~reader ~pool ~gate)
+  in
   Dream.router
     [ Dream.get "/" current_version_redirect
     ; Dream.get "/health" (health reader)
@@ -792,9 +899,9 @@ let router ~reader ~writer ~pool ~lock_path =
       (* Browsers request /favicon.ico at the root regardless of the <link>. *)
     ; Dream.get "/favicon.ico" (Dream.from_filesystem "static" "favicon.ico")
     ; Dream.get "/sitemap.xml" sitemap
-    ; Dream.get "/:version/" (with_version (seed_list_page reader))
+    ; Dream.get "/:version/" (with_version (seed_list_page front))
     ; Dream.get "/:version/jump" (with_version jump_to_seed)
-    ; Dream.get "/:version/search" (with_version (search_page reader ~pool))
+    ; Dream.get "/:version/search" (with_version (search_page reader ~pool ~gate))
     ; Dream.get "/:version/search/help" (with_version (search_help_page reader))
     ; Dream.get "/:version/about" (with_version (about_page reader))
       (* Scoped rather than global because a session is a Set-Cookie on every

@@ -47,9 +47,8 @@ let corpus =
   ; {|#SEED#((format 4)(version "0.34.1")(seed "33")(level "D:2")(cats (items (((artefact t)(artprops ((rF -2)(Str 3)))(base_type "armour")(kind "item")(name "+0 cloak of Miasma {rF- Str+3}")(quantity 1)(sub_type "cloak")(text "+0 cloak of Miasma"))))))|}
   ; {|#SEED#((format 4)(version "0.34.1")(seed "34")(level "D:6")(cats (items (((artefact t)(artprops ((rF 2)))(base_type "armour")(kind "item")(name "+2 scale mail of Ember {rF++}")(plus 2)(quantity 1)(sub_type "scale mail")(text "+2 scale mail of Ember"))))))|}
     (* An unrand behind a counter, and the only Wyrmbane in the fixture. It is
-       what makes the two position rules observable rather than asserted:
-       [artefact] is still a union and finds it, [name~] has no shop form and
-       cannot. *)
+       what makes [name~]'s missing shop form observable rather than asserted:
+       a bare [name~] reads the floor and cannot reach it. *)
   ; {|#SEED#((format 4)(version "0.34.1")(seed "21")(level "D:4")(cats (items (((artefact t)(base_type "weapon")(cost 4000)(kind "item")(name "+8 Wyrmbane {holy, slay+4}")(plus 8)(quantity 1)(sub_type "demon blade")(text "+8 Wyrmbane"))))))|}
   ]
 ;;
@@ -68,6 +67,7 @@ let fresh_db () =
 
 let haste = { Search.Item_type.base_type = "potion"; sub_type = "haste" }
 let digging = { Search.Item_type.base_type = "wand"; sub_type = "digging" }
+let acquirement = { Search.Item_type.base_type = "scroll"; sub_type = "acquirement" }
 let floor item = Search.Criterion.Item (item, Search.Criterion.Floor)
 let shop item = Search.Criterion.Item (item, Search.Criterion.Shop)
 let named s = Search.Criterion.Name_like (s, Search.Criterion.Floor)
@@ -326,41 +326,16 @@ let%expect_test "name_like does not reach shop stock, and has no form that would
   Db.close db
 ;;
 
-(* [Artefact] is the one criterion still spanning both sides, and seed 21's
-   shop-stocked Wyrmbane is what makes that observable. Deliberate: artefacts
-   are where shop stock concentrates, and "artefact" carries no colon for a
-   position prefix to lead. *)
-let%expect_test "artefact is its own criterion" =
-  let db = fresh_db () in
-  run db [ Search.Term.create Search.Criterion.Artefact ];
-  [%expect
-    {|
-    seeds on 0.34.1 with an artefact
-      20: ring of the Pariah {rC+ Str+5} x4 on D:2
-      21: +8 Wyrmbane {holy, slay+4} x1 on D:4
-      3: +7 Throatcutter {drain, coup de grace} x1 on D:1
-      30: staff of Olgreb {Conj Alch} x1 on D:3
-      31: staff "Zeqog" {Conj} x2 on D:4
-      32: +1 robe of Vaeh {Conj Alch} x1 on D:5
-      33: +0 cloak of Miasma {rF- Str+3} x1 on D:2
-      34: +2 scale mail of Ember {rF++} x1 on D:6
-      7: +2 Blade of 100%_pure {holy} x1 on D:2
-      [end]
-    |}];
-  Db.close db
-;;
-
 (* A heterogeneous term matches distinct items, so the evidence total is a
-   count of *the category*, not of the named exemplar. Reporting "ring of the
-   Pariah x4" would claim four of one ring. *)
+   count of *the category*, not of the named exemplar. "Str" reaches two
+   differently-named artefacts in seed 20's hoard, so reporting the exemplar
+   with the total would claim two of one ring. *)
 let%expect_test "a heterogeneous term separates its exemplar from its total" =
   let db = fresh_db () in
   let show (h : Search.Match.hit) =
     sprintf "%s | count %d | distinct %d | %s" h.name h.count h.distinct h.level
   in
-  let search =
-    Search.create ~version ~terms:[ Search.Term.create Search.Criterion.Artefact ] ()
-  in
+  let search = Search.create ~version ~terms:[ Search.Term.create (named "Str") ] () in
   (match Db.search_seeds db search ~rank:Search.Rank.default with
    | Error err -> print_endline (Error.to_string_hum err)
    | Ok (matches, _) ->
@@ -368,15 +343,8 @@ let%expect_test "a heterogeneous term separates its exemplar from its total" =
        List.iter m.hits ~f:(fun h -> printf "%s: %s\n" m.seed (show h))));
   [%expect
     {|
-    20: ring of the Pariah {rC+ Str+5} | count 4 | distinct 4 | D:2
-    21: +8 Wyrmbane {holy, slay+4} | count 1 | distinct 1 | D:4
-    3: +7 Throatcutter {drain, coup de grace} | count 1 | distinct 1 | D:1
-    30: staff of Olgreb {Conj Alch} | count 1 | distinct 1 | D:3
-    31: staff "Zeqog" {Conj} | count 2 | distinct 2 | D:4
-    32: +1 robe of Vaeh {Conj Alch} | count 1 | distinct 1 | D:5
+    20: ring of the Pariah {rC+ Str+5} | count 2 | distinct 2 | D:2
     33: +0 cloak of Miasma {rF- Str+3} | count 1 | distinct 1 | D:2
-    34: +2 scale mail of Ember {rF++} | count 1 | distinct 1 | D:6
-    7: +2 Blade of 100%_pure {holy} | count 1 | distinct 1 | D:2
     |}];
   Db.close db
 ;;
@@ -852,7 +820,6 @@ let%expect_test "is_cheap rejects every name_like fragment" =
     ; named "abc"
     ; named "Throatcutter"
     ; floor haste
-    ; Search.Criterion.Artefact
     ; Search.Criterion.Unique "Sigmund"
     ];
   [%expect
@@ -861,7 +828,6 @@ let%expect_test "is_cheap rejects every name_like fragment" =
     named like "abc"               -> cheap=false
     named like "Throatcutter"      -> cheap=false
     potion of haste                -> cheap=true
-    an artefact                    -> cheap=true
     Sigmund                        -> cheap=true
     |}]
 ;;
@@ -925,11 +891,12 @@ let%expect_test "Props beside another term intersects by seed" =
   run
     db
     [ Search.Term.create (props ~base_type:"armour" [ "Conj" ])
-    ; Search.Term.create Search.Criterion.Artefact
+    ; Search.Term.create
+        (floor { Search.Item_type.base_type = "armour"; sub_type = "robe" })
     ];
   [%expect
     {|
-    seeds on 0.34.1 with armour with Conj, an artefact
+    seeds on 0.34.1 with armour with Conj, robe
       32: +1 robe of Vaeh {Conj Alch} x1 on D:5; +1 robe of Vaeh {Conj Alch} x1 on D:5
       [end]
     |}];
@@ -996,11 +963,11 @@ module Synth = struct
     ; haste_shop_qty : int (* total shop potions, 0 for none *)
     ; digging : bool (* one floor wand of digging *)
     ; has_shop_feature : bool (* an unrelated feature term can drive/probe on *)
-    ; artefact : bool
+    ; scroll : bool
     }
 
   (* 40 seeds, deterministic from the index. The residues are chosen so every
-     combination of (floor haste, shop haste, digging, shop feature, artefact)
+     combination of (floor haste, shop haste, digging, shop feature, scroll)
      appears at least once, which is what makes the multi-term intersections and
      the min_count-as-driver-vs-non-driver cases exercise a boundary rather than
      vacuously pass. *)
@@ -1012,7 +979,7 @@ module Synth = struct
       ; haste_shop_qty = i / 4 % 3 (* 0,1,2 potions behind a counter *)
       ; digging = i % 5 = 0
       ; has_shop_feature = i % 3 = 0
-      ; artefact = i % 7 = 0
+      ; scroll = i % 7 = 0
       })
   ;;
 end
@@ -1053,13 +1020,10 @@ let synth_lines (s : Synth.t) =
       {|((base_type "wand")(kind "item")(name "wand of digging")(quantity 1)(sub_type "digging")(text "wand of digging"))|}
     else ""
   in
-  let artefact =
-    if s.Synth.artefact
+  let scroll =
+    if s.Synth.scroll
     then
-      sprintf
-        {|((artefact t)(base_type "weapon")(kind "item")(name "+3 seed %d's blade")(plus 3)(quantity 1)(sub_type "dagger")(text "+3 seed %d's blade"))|}
-        s.Synth.seed
-        s.Synth.seed
+      {|((base_type "scroll")(kind "item")(name "scroll of acquirement")(quantity 1)(sub_type "acquirement")(text "scroll of acquirement"))|}
     else ""
   in
   let split = s.Synth.haste_floor_qty >= 2 in
@@ -1082,7 +1046,7 @@ let synth_lines (s : Synth.t) =
                ~cost:None
            ; potion ~qty:s.Synth.haste_shop_qty ~cost:(Some 100)
            ; digging
-           ; artefact
+           ; scroll
            ])
   ]
   @
@@ -1177,19 +1141,19 @@ let%expect_test "two-term intersection matches the naive reference" =
 let%expect_test "three-term intersection matches the naive reference" =
   let db = synth_db () in
   let expected =
-    seeds_where Synth.all ~f:(fun s -> s.digging && s.artefact && s.haste_floor_qty > 0)
+    seeds_where Synth.all ~f:(fun s -> s.digging && s.scroll && s.haste_floor_qty > 0)
   in
   expect_same
-    ~label:"digging & artefact & potion:haste"
+    ~label:"digging & scroll:acquirement & potion:haste"
     expected
     (matched_set
        db
        [ Search.Term.create (floor digging)
-       ; Search.Term.create Search.Criterion.Artefact
+       ; Search.Term.create (floor acquirement)
        ; Search.Term.create (floor haste)
        ]);
   Db.close db;
-  [%expect {| digging & artefact & potion:haste: match (1 seeds) |}]
+  [%expect {| digging & scroll:acquirement & potion:haste: match (1 seeds) |}]
 ;;
 
 (* min_count as the sole term, so it is necessarily the driver. *)

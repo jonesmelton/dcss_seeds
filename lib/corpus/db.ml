@@ -558,9 +558,9 @@ let list_seeds t ~version ~page =
    neighbourhoods (9402, 9403, 9404), which restores the appearance of order
    the sampler exists to avoid.
 
-   Each seek is a covering lookup, so cost is [limit] index seeks. [limit] is
-   capped at 200. Ordering by random() would be uniform but scans the whole
-   version: 88ms over 10k seeds, linear.
+   Each seek is a covering lookup, so cost is [limit] index seeks. Ordering by
+   random() would be uniform but scans the whole version: 88ms over 10k seeds,
+   linear.
 
    A cursor past the last seed returns nothing and restarts from the beginning,
    biasing slightly toward the low end of the keyspace. Crawl's seeds are
@@ -1413,7 +1413,6 @@ let criterion_where (criterion : Search.Criterion.t) ~alias =
     , [ Sqlite3.Data.TEXT base_type; Sqlite3.Data.TEXT sub_type ] )
   | Search.Criterion.Feature feat ->
     sprintf "%s = %s" (col "feat_id") string_id_sql, [ Sqlite3.Data.TEXT feat ]
-  | Search.Criterion.Artefact -> sprintf "%s = 1" (col "artefact"), []
   (* [unique_mons = 1] implies [cat = Monsters]; the extra predicate is not in
      entries_search_unique and costs a table lookup per row. *)
   | Search.Criterion.Unique name ->
@@ -1529,25 +1528,24 @@ let props_seek ~base_type ~props ~position ~entries_alias ~props_alias =
 
 (* Static driver preference: rare things first. [Unique] and shop stock narrow
    hardest -- a shop holds a fraction of what the floor does, which is why
-   [Item (_, Shop)] outranks its floor twin; [Artefact] and [Props] are least
-   selective. Ties keep caller's order. *)
+   [Item (_, Shop)] outranks its floor twin; [Props] is least selective. Ties
+   keep caller's order. *)
 let criterion_driver_rank (criterion : Search.Criterion.t) =
   match criterion with
   | Search.Criterion.Unique _ | Search.Criterion.Item (_, Search.Criterion.Shop) -> 0
   | Search.Criterion.Item (_, Search.Criterion.Floor)
   | Search.Criterion.Feature _ | Search.Criterion.Name_like _ -> 1
-  (* Last, and at one rank for both positions. The property [exists]es are
-     filters on a driving row rather than a seek of their own, so [Props] drives
-     only when nothing else can. With a base type that fallback is an ordinary
-     type seek; without one it is a scan of the build, which is what [is_cheap]
-     answers for.
+  (* Last. The property [exists]es are filters on a driving row rather than a
+     seek of their own, so [Props] drives only when nothing else can. With a
+     base type that fallback is an ordinary type seek; without one it is a scan
+     of the build, which is what [is_cheap] answers for.
 
      Declining to promote [Props (_, Shop)] the way [Item (_, Shop)] is promoted
      is the decision, not the oversight: that would be a fresh static-rank
      judgement in a function the posting-list index deletes outright (postings
      merge shortest-list-first, so order comes from list length), and the whole
      cost of getting it wrong is a different result order over the same set. *)
-  | Search.Criterion.Artefact | Search.Criterion.Props _ -> 2
+  | Search.Criterion.Props _ -> 2
 ;;
 
 (* [min_count > 1] pushes a term to the back: as driver it streams a
@@ -1596,8 +1594,9 @@ let driver_select (term : Search.Term.t) =
    both, 0.14s (`bear` + `hat`, 1.3M, 2026-09-09).
 
    The inner keyset bound is redundant against the outer [e.seed > ?], but it
-   caps what gets materialised -- [artefact] as a non-driver materialises 1.13M
-   seeds without it (4.7s vs 1.1s).
+   caps what gets materialised -- a term matching most of the build as a
+   non-driver materialises 1.13M seeds without it (4.7s vs 1.1s; [artefact],
+   since removed).
 
    [entries.seed] is not null, so [in] and [exists] agree; that is a
    precondition of the rewrite, not an incidental property. *)
@@ -2283,7 +2282,6 @@ let refuse_stale_trigram t (search : Search.t) =
       | Search.Criterion.Props _
       | Search.Criterion.Item _
       | Search.Criterion.Feature _
-      | Search.Criterion.Artefact
       | Search.Criterion.Unique _ -> false)
     && not (fts_is_current t)
   then

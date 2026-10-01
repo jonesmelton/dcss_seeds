@@ -15,6 +15,7 @@ open Tyxml.Html
 module Svg = Tyxml.Svg
 
 let th_col label = th [ txt label ]
+let level_name name = span ~a:[ a_class [ "level" ] ] [ txt name ]
 let th_num label = th ~a:[ a_class [ "num" ] ] [ txt label ]
 
 let version_path version =
@@ -162,12 +163,12 @@ let seed_list ~version ~(page : Query.Page.t) summaries =
       @ List.map s.portals ~f:(fun (level, parent) ->
         let where =
           match parent with
-          | Some p -> sprintf "%s %s" level p
-          | None -> level
+          | Some p -> [ level_name level; txt " "; level_name p ]
+          | None -> [ level_name level ]
         in
         span
           ~a:[ a_class [ "tag"; "tag--portal" ] ]
-          (tile (Depth.feat_of_portal level) @ [ txt where ]))
+          (tile (Depth.feat_of_portal level) @ where))
     in
     tr
       [ td
@@ -179,7 +180,7 @@ let seed_list ~version ~(page : Query.Page.t) summaries =
       ; td
           ~a:[ a_class [ "num" ] ]
           [ (match s.temple with
-             | Some level -> txt level
+             | Some level -> level_name level
              | None -> unknown)
           ]
       ; td
@@ -222,7 +223,7 @@ let seed_list ~version ~(page : Query.Page.t) summaries =
   in
   [ jump ]
   @ (if List.is_empty summaries
-     then [ p [ txt "No seeds have been ingested for this build yet." ] ]
+     then [ p [ txt "No seeds for this build yet." ] ]
      else
        [ div
            ~a:[ a_class [ "table-scroll"; "table-scroll--wide" ] ]
@@ -234,25 +235,26 @@ let seed_list ~version ~(page : Query.Page.t) summaries =
                         ~label:"How to read this table"
                         [ p
                             [ txt
-                                "A handful of seeds from this build, picked at random. A \
-                                 seed number says nothing about what the seed holds, so \
-                                 there is no first or last one. Search to find seeds by \
-                                 their contents."
+                                "A random sample of seeds from this build. Use search to \
+                                 find seeds by what they contain."
                             ]
                         ; p
-                            [ txt
-                                "Everything here is what the first eight floors (D:8) \
-                                 hold: heat is a rough unsorted mark of how the seed \
-                                 compares to others at D:8 depth, and a dash means \
-                                 nothing that shallow rather than nothing at all."
+                            [ txt "Every column covers "
+                            ; level_name "D:1"
+                            ; txt " to "
+                            ; level_name "D:8"
+                            ; txt
+                                ". Heat roughly ranks a seed against the others at that \
+                                 depth. A dash means none found by "
+                            ; level_name "D:8"
+                            ; txt "."
                             ]
                         ; p
-                            [ txt "Under "
+                            [ txt "In "
                             ; em [ txt "others" ]
                             ; txt
-                                ": \"acq\" is a scroll of acquirement and \"xp\" \
-                                 a                                  potion of \
-                                 experience, on the floor."
+                                ", \"acq\" is a scroll of acquirement and \"xp\" a \
+                                 potion of experience, both on the floor."
                             ]
                         ]
                     ])
@@ -355,7 +357,7 @@ let ways_on_lines entries =
                (String.is_substring
                   (String.lowercase e.name)
                   ~substring:(String.lowercase branch)) ->
-        [ span ~a:[ a_class [ "destination" ] ] [ txt (sprintf " (%s)" branch) ] ]
+        [ span ~a:[ a_class [ "destination" ] ] [ txt " ("; level_name branch; txt ")" ] ]
       | _ -> []
     in
     line ~extra:destination e)
@@ -556,12 +558,7 @@ let level_section (l : Level.t) =
    at too late. A trove's toll sits beside the timer for the same reason. *)
 let branch_index entrances =
   if List.is_empty entrances
-  then
-    [ p
-        ~a:[ a_class [ "subtitle" ] ]
-        [ txt "No branch or portal entrance within the extracted floors. Might be deeper."
-        ]
-    ]
+  then [ p ~a:[ a_class [ "subtitle" ] ] [ txt "No branch or portal entrances found." ] ]
   else
     [ ul
         ~a:[ a_class [ "branches" ] ]
@@ -591,7 +588,7 @@ let branch_index entrances =
              ([ span
                   ~a:[ a_class [ "branch-name" ] ]
                   (tile (Some e.feat) @ [ txt e.branch ])
-              ; span ~a:[ a_class [ "num"; "branch-level" ] ] [ txt e.level ]
+              ; span ~a:[ a_class [ "num"; "branch-level"; "level" ] ] [ txt e.level ]
               ]
               @ timer
               @ toll)))
@@ -649,7 +646,7 @@ let deepen_button ~version ~seed ~csrf =
         [ input ~a:[ a_input_type `Hidden; a_name "dream.csrf"; a_value csrf ] ()
         ; button
             ~a:[ a_button_type `Submit ]
-            [ txt (sprintf "Search down to %s" Fill_depth.deep_cap) ]
+            [ txt "Search to "; level_name Fill_depth.deep_cap ]
         ]
     ]
 ;;
@@ -663,32 +660,23 @@ let polling_attrs ~seed ~version =
   ]
 ;;
 
-(* The levels are the authority on how deep a seed is; the job row only records
-   that someone asked. They disagree in a real window -- ingest commits the
-   levels and the generator can die before it sets finished_at -- so a deep seed
-   is reported deep whatever its job says. *)
-(* Position 0 is "next", not "0 ahead": a count of nothing is the one case the
-   number reads worse than the word. The build is named because the count is per
-   build -- a generator claims per version, so an unqualified "3 ahead" would be
-   a claim about a queue that does not exist. *)
 let queue_place position =
   match position with
   | None -> []
-  | Some 0 -> [ txt " It is next in line for this build." ]
-  | Some 1 -> [ txt " One request is ahead of it on this build." ]
-  | Some n -> [ txt (sprintf " %d requests are ahead of it on this build." n) ]
+  | Some 0 -> [ txt " Next in queue." ]
+  | Some n -> [ txt (sprintf " %d ahead in queue." n) ]
 ;;
 
 (* Fill holds the write lock for hours; button withdrawn with reason rather
    than letting enqueue succeed and strand the reader on the wrong cause. *)
 let filling_note =
-  p
-    [ txt
-        "Deeper searches are paused: this build is busy building out the corpus. They \
-         resume when it finishes."
-    ]
+  p [ txt "Deeper searches are paused while new seeds are added to this build." ]
 ;;
 
+(* The levels are the authority on how deep a seed is; the job row only records
+   that someone asked. They disagree in a real window -- ingest commits the
+   levels and the generator can die before it sets finished_at -- so a deep seed
+   is reported deep whatever its job says. *)
 let depth_note ~version ~seed ~depth ~job ~position ~csrf ~filling =
   let wrap ?(extra = []) children =
     [ div ~a:(a_id depth_note_id :: a_class [ "depth-note" ] :: extra) children ]
@@ -700,49 +688,27 @@ let depth_note ~version ~seed ~depth ~job ~position ~csrf ~filling =
     wrap
       ~extra:(polling_attrs ~seed ~version)
       [ p
-          [ txt
-              (sprintf
-                 "Searching this seed down to %s. It takes a few seconds."
-                 Fill_depth.deep_cap)
+          [ txt "Searching to "
+          ; level_name Fill_depth.deep_cap
+          ; txt ". This takes a few seconds."
           ]
       ]
   | Some job when Job.State.equal (Job.state job) Job.State.Queued ->
     wrap
       ~extra:(polling_attrs ~seed ~version)
       [ p
-          (txt
-             (sprintf
-                "Queued for a deeper search, down to %s. Waiting for a free dungeon \
-                 generator."
-                Fill_depth.deep_cap)
-           :: queue_place position)
+          ([ txt "Queued to search to "; level_name Fill_depth.deep_cap; txt "." ]
+           @ queue_place position)
       ]
   | Some { error = Some error; _ } ->
     wrap
-      ([ p
-           ~a:[ a_class [ "failed" ] ]
-           [ txt "That deeper search did not finish: "; txt error ]
-       ]
+      ([ p ~a:[ a_class [ "failed" ] ] [ txt "Deeper search failed: "; txt error ] ]
        @ if filling then [ filling_note ] else deepen_button ~version ~seed ~csrf)
   | _ when Fill_depth.is_deep depth ->
-    wrap
-      [ p
-          [ txt "Searched down to "
-          ; strong [ txt searched_to ]
-          ; txt ", past the usual cap."
-          ]
-      ]
+    wrap [ p [ txt "Searched to "; strong [ level_name searched_to ]; txt "." ] ]
   | _ ->
-    (* Without this sentence, absence reads as fact about the seed. *)
     wrap
-      ([ p
-           [ txt "Searched down to "
-           ; strong [ txt searched_to ]
-           ; txt
-               ". The levels end there because that is how far this seed was searched, \
-                not because the dungeon does."
-           ]
-       ]
+      ([ p [ txt "Searched to "; strong [ level_name searched_to ]; txt "." ] ]
        @ if filling then [ filling_note ] else deepen_button ~version ~seed ~csrf)
 ;;
 
@@ -761,7 +727,7 @@ let seed_detail ~version ~seed ~job ~position ~csrf ~filling levels =
   ; p [ a ~a:[ a_href (version_path version ^ "/") ] [ txt "← All seeds" ] ]
   ]
   @ depth_note ~version ~seed ~depth ~job ~position ~csrf ~filling
-  @ [ h2 [ txt "Ways on" ] ]
+  @ [ h2 [ txt "Branches and portals" ] ]
   @ branch_index (Floor.entrances levels)
   @ [ h2 [ txt "Exclusive draws" ]
     ; help_note
@@ -769,8 +735,8 @@ let seed_detail ~version ~seed ~job ~position ~csrf ~filling levels =
         [ p
             [ txt
                 "Crawl draws one member of each group per game, so a seed with one \
-                 cannot have the others. A dash means we haven't seen any from that\n\
-                \                 group yet in this seed so it's still unknown."
+                 cannot have the others. A dash means we haven't seen any from that \
+                 group yet in this seed so it's still unknown."
             ]
         ]
     ]
@@ -879,7 +845,7 @@ let search_form
   let box ?(value = "") ?(placeheld = false) ?(invalid = false) i =
     let placeholder =
       if placeheld
-      then [ a_placeholder "potion:haste, artefact, staff props:Conj" ]
+      then [ a_placeholder "potion:haste, scroll:acquirement, staff props:Conj" ]
       else []
     in
     let invalid =
@@ -1025,7 +991,7 @@ let search_form
             Ligatures are off here -- see the note on name~. *)
        ; p
            ~a:[ a_id "search-help"; a_class [ "subtitle" ] ]
-           [ txt "One term per box, floor loot only unless the term says "
+           [ txt "One term per box. Terms search the floor unless prefixed with "
            ; code [ txt "shop " ]
            ; txt ". Items: "
            ; code [ txt "potion:haste" ]
@@ -1038,10 +1004,12 @@ let search_form
            ; txt ", "
            ; code [ txt "staff props:Conj,Alch" ]
            ; txt ". Also "
-           ; code [ txt "artefact" ]
+           ; code [ txt "scroll:acquirement" ]
            ; txt " and "
            ; code [ txt "name~Throatcutter" ]
-           ; txt ". "
+           ; txt ". A bare word like "
+           ; code [ txt "haste" ]
+           ; txt " is looked up for you. "
            ; a
                ~a:[ a_href (search_help_path version) ]
                [ txt "Full syntax, with examples" ]
@@ -1055,13 +1023,25 @@ let search_form
 ;;
 
 (* [count] belongs to the term, not to [name], and the two coincide only when
-   one item supplied the whole total. Spread over several names -- an artefact
+   one item supplied the whole total. Spread over several names -- a property
    search, a name fragment matching a family -- [name] is an exemplar, and
    quantifying it would claim sixteen of one storm bow. *)
 let hit_line (h : Search.Match.hit) =
-  let quantity = if h.count > 1 && h.distinct = 1 then sprintf " ×%d" h.count else "" in
+  (* Crawl's name already spells a stack's quantity ("2 potions of haste"), so
+     a multiplier after it reads as multiplying that: "×2" would claim four. *)
+  let stack =
+    match String.lsplit2 h.name ~on:' ' with
+    | Some (digits, _) when String.for_all digits ~f:Char.is_digit ->
+      Option.value (Int.of_string_opt digits) ~default:1
+    | _ -> 1
+  in
+  let quantity =
+    if h.distinct = 1 && stack = 1 && h.count > 1 then sprintf " ×%d" h.count else ""
+  in
   let total =
-    if h.distinct > 1
+    if h.distinct = 1 && stack > 1 && h.count <> stack
+    then [ span ~a:[ a_class [ "hit-total" ] ] [ txt (sprintf "%d in all" h.count) ] ]
+    else if h.distinct > 1
     then (
       let noun =
         match Search.Criterion.plural_noun h.term.criterion with
@@ -1071,21 +1051,13 @@ let hit_line (h : Search.Match.hit) =
       [ span ~a:[ a_class [ "hit-total" ] ] [ txt (sprintf "%d %s" h.count noun) ] ])
     else []
   in
-  li
-    ([ txt h.name
-     ; txt quantity
-     ; txt " on "
-     ; span ~a:[ a_class [ "sc" ] ] [ txt h.level ]
-     ]
-     @ total)
+  li ([ txt h.name; txt quantity; txt " on "; level_name h.level ] @ total)
 ;;
 
 (* A term-less search is an unasked question, not a request for the corpus.
    Rendering the first page of it lists seeds in string order -- 1, 10, 100 --
    which answers nothing and costs an unfiltered scan to produce. *)
-let search_prompt =
-  [ p [ txt "Add a term above to find seeds. A seed must satisfy every box you fill." ] ]
-;;
+let search_prompt = [ p [ txt "Enter a term to find seeds. Results match every term." ] ]
 
 let search_results ~(search : Search.t) ~rank ~more matches =
   if Search.is_empty search
@@ -1147,7 +1119,7 @@ let search_results ~(search : Search.t) ~rank ~more matches =
             ; txt (if count = 1 then " seed" else " seeds")
             ; txt
                 (match more with
-                 | `More -> " on this page, and more beyond it."
+                 | `More -> " on this page."
                  | `End -> ".")
             ]
         ]
@@ -1155,12 +1127,12 @@ let search_results ~(search : Search.t) ~rank ~more matches =
     ([ heading ] @ tally)
     @
     if List.is_empty matches
-    then [ p [ txt "No seed in this build matches every term." ] ]
+    then [ p [ txt "No matching seeds." ] ]
     else
       [ div
           ~a:[ a_class [ "table-scroll"; "table-scroll--wide" ] ]
           [ table
-              ~thead:(thead [ tr [ th_col "seed"; th_col "what was found" ] ])
+              ~thead:(thead [ tr [ th_col "seed"; th_col "matches" ] ])
               (List.map matches ~f:row)
           ]
       ]
@@ -1170,9 +1142,7 @@ let search_results ~(search : Search.t) ~rank ~more matches =
 (* Placeholder when search is disabled. No form, no query parsing. *)
 let search_unavailable =
   [ h1 [ txt "Search" ]
-  ; p
-      ~a:[ a_class [ "subtitle" ] ]
-      [ txt "Search is unavailable just now. The rest of the site is unaffected." ]
+  ; p ~a:[ a_class [ "subtitle" ] ] [ txt "Search is temporarily unavailable." ]
   ]
 ;;
 
@@ -1273,182 +1243,176 @@ let search_help ~version =
   ; p
       ~a:[ a_class [ "subtitle" ] ]
       [ txt
-          "Every box is one term, and a seed must satisfy all of them. Each example \
-           below is a link. Follow it to see what it returns on this version."
+          "One term per box; results match every term. Each example below links to its \
+           search on this build."
       ]
   ; h2 [ txt "Items" ]
   ; p
-      [ txt "An item is named by its type, not by how it reads on the floor: "
+      [ txt "Items are searched by type, written base:sub, as in "
       ; code [ txt "potion:haste" ]
-      ; txt ", where the first half is the base type and the second is the sub type."
+      ; txt "."
       ]
   ; examples
       [ [ "potion:haste" ], "a potion of haste"
       ; [ "wand:digging" ], "a wand of digging"
       ; [ "scroll:acquirement" ], "a scroll of acquirement"
       ; ( [ "weapon:executioner's axe" ]
-        , "an executioner's axe. A sub type can contain spaces and apostrophes" )
+        , "an executioner's axe; spaces and apostrophes are fine" )
+      ]
+  ; h2 [ txt "A bare word" ]
+  ; p
+      [ txt
+          "A word without a colon is matched against item types and properties. If \
+           exactly one matches, that is what gets searched, and the page says so. \
+           Otherwise you get a list of candidates, or a "
+      ; code [ txt "name~" ]
+      ; txt " search to try."
+      ]
+  ; examples
+      [ [ "haste" ], "read as potion:haste"
+      ; [ "flight" ], "read as jewellery:ring of flight"
+      ; [ "Shatter" ], "read as the parchment of Shatter"
+      ; [ "conj" ], "read as props:Conj"
+      ; [ "axe" ], "several axes to choose from"
+      ; [ "Throatcutter" ], "offers name~Throatcutter"
+      ]
+  ; p
+      [ txt "Counts and "
+      ; code [ txt "shop " ]
+      ; txt " still work: "
+      ; code [ txt "3x shop haste" ]
+      ; txt " becomes "
+      ; code [ txt "3x shop potion:haste" ]
+      ; txt "."
       ]
   ; h2 [ txt "Floor and shop" ]
   ; p
-      [ txt
-          "A price is the only thing separating shop stock from loot lying on the \
-           ground, and a term reads the floor unless it says otherwise. "
+      [ txt "Terms search floor items by default. Put "
       ; code [ txt "shop " ]
-      ; txt " in front asks for the priced half instead, one term at a time. "
+      ; txt " at the start of a term to search shop stock instead. "
       ; code [ txt "floor " ]
-      ; txt " is accepted and asks for exactly what the bare term already asked for."
+      ; txt " is also accepted and changes nothing."
       ]
   ; examples
-      [ [ "potion:haste" ], "on the floor, shop stock left out"
-      ; [ "shop potion:haste" ], "for sale, and only for sale"
-      ; [ "floor potion:haste" ], "the same search as the bare term"
-      ; [ "shop staff props:Conj" ], "a Conjurations-enhancing staff, for sale"
-      ]
-  ; p
-      [ txt "The position leads the whole term, ahead of a base type ("
-      ; code [ txt "shop staff props:Conj" ]
-      ; txt "), and a term takes one position, never both."
+      [ [ "potion:haste" ], "on the floor"
+      ; [ "shop potion:haste" ], "in a shop"
+      ; [ "floor potion:haste" ], "same as potion:haste"
+      ; [ "shop staff props:Conj" ], "a staff enhancing Conjurations, in a shop"
       ]
   ; p
       [ txt
-          "Floor and shop divide every item between them, which is what makes this more \
-           than a filter on the results. A floor search is not a both-ways search with \
-           the priced hits crossed off, and it can return strictly fewer seeds: two \
-           potions of haste on the floor and a third behind a counter satisfy neither "
+          "A term can't search both, and counts don't combine across them: two potions \
+           of haste on the floor and one in a shop match neither "
       ; code [ txt "3x potion:haste" ]
       ; txt " nor "
       ; code [ txt "3x shop potion:haste" ]
-      ; txt
-          ". There is no term for \"either one\" — that question has no spelling here at \
-           all."
-      ]
-  ; p
-      [ txt "Two terms sit outside this. "
+      ; txt ". "
       ; code [ txt "name~" ]
-      ; txt
-          " has no shop form, because gold is what binds the early game: an unrand you \
-           can afford in a shop is one you could have afforded off the floor, so the \
-           question is not worth asking and the term always reads the floor. "
-      ; code [ txt "artefact" ]
-      ; txt
-          " goes the other way and still covers both, because \"any artefact at all\" is \
-           a weak enough question that cutting it by price is not the interesting cut. \
-           That second one is worth knowing about rather than discovering: 42.7% of \
-           artefacts sit in a shop against 14.4% of items with a stored name, so "
-      ; code [ txt "artefact" ]
-      ; txt " is the one term that brings shop stock back in quantity."
+      ; txt " only searches the floor."
       ]
   ; h2 [ txt "How many" ]
   ; p
-      [ txt "An affix qualifies any term. "
+      [ txt "Put "
       ; code [ txt "3x " ]
-      ; txt " in front sets a minimum count, across the whole known seed."
-      ]
-  ; examples
-      [ [ "3x potion:haste" ], "at least three potions of haste, all of them on the floor"
-      ; [ "3x shop potion:haste" ], "at least three of them for sale"
-      ]
-  ; h2 [ txt "Artefacts and names" ]
-  ; p
-      [ txt "An unrand's display name carries a varying enchantment prefix, so "
+      ; txt " in front of an item or "
       ; code [ txt "name~" ]
-      ; txt
-          " matches a substring of it (at least three characters). For anything with a \
-           type, the type is both faster and more accurate."
+      ; txt " term to require at least that many, counted across the whole seed. "
+      ; code [ txt "props:" ]
+      ; txt " terms don't take a count."
       ]
   ; examples
-      [ [ "artefact" ], "any artefact, randart or unrand, floor or shop alike"
-      ; [ "name~Throatcutter" ], "the unrand, lying on the floor"
+      [ [ "3x potion:haste" ], "at least three potions of haste on the floor"
+      ; [ "3x shop potion:haste" ], "at least three in shops"
+      ]
+  ; h2 [ txt "Artefact names" ]
+  ; p
+      [ code [ txt "name~" ]
+      ; txt
+          " matches part of an artefact's name, at least three characters. Use it for \
+           unrands; for anything else, search the type."
+      ]
+  ; examples
+      [ [ "name~Throatcutter" ], "Throatcutter, on the floor"
+      ; [ "name~demon trident \"Rift\"" ], "the demon trident Rift"
+      ; [ "name~hat of the Alchemist" ], "the hat of the Alchemist"
+      ; [ "name~+9 hand cannon" ], "an artefact hand cannon at +9"
+      ; [ "name~+20" ], "any artefact at exactly +20, whatever it is"
       ]
   ; help_note
-      ~label:"Why a result sometimes names one item and counts another number"
+      ~label:"Why a result shows one item and a different count"
       [ p
           [ txt
-              "A term matching several different items names the shallowest one it found \
-               and states the total beside it, as in "
-          ; code [ txt "+8 storm bow {elec, penet} on D:3 · 16 artefacts" ]
+              "When a term matches several different items, the result shows the \
+               shallowest one and the total. "
+          ; code [ txt "props:rF" ]
+          ; txt " might show "
+          ; code [ txt "+2 ring mail of Gudd {rElec rF+} on D:2 · 2 artefacts" ]
           ; txt
-              ". The bow is one of sixteen artefacts, not sixteen bows. A term matching \
-               a single item quantifies it directly instead ("
-          ; code [ txt "2 potions of haste ×2" ]
+              ": that ring mail and one other artefact. A term matching one kind of item \
+               shows a count instead ("
+          ; code [ txt "potion of haste ×3" ]
           ; txt ")."
           ]
       ]
   ; help_note
       ~label:"Why name~ does not find a potion of haste"
       [ p
-          [ txt
-              "The corpus stores a name only where it cannot rebuild one from the other \
-               columns, which is 92% of rows saved. A potion of haste has no stored \
-               name; it is reconstructed from "
-          ; code [ txt "potion" ]
-          ; txt " and "
-          ; code [ txt "haste" ]
-          ; txt " when it is shown to you. So "
-          ; code [ txt "name~potion of haste" ]
-          ; txt " matches nothing, and "
+          [ code [ txt "name~" ]
+          ; txt " only matches artefact names. For anything else, search the type: "
           ; code [ txt "potion:haste" ]
-          ; txt " is the term for that question."
+          ; txt ", not "
+          ; code [ txt "name~potion of haste" ]
+          ; txt "."
           ]
       ]
   ; h2 [ txt "Artefact properties" ]
   ; p
-      [ txt "An artefact's properties are searchable by name with "
-      ; code [ txt "props:" ]
-      ; txt ", separated by commas. Every property named must sit on the "
-      ; em [ txt "same" ]
-      ; txt " artefact."
-      ]
-  ; p
-      [ txt "Put a base type in front to say what the artefact has to be. "
+      [ code [ txt "props:" ]
+      ; txt
+          " searches artefact properties. List several with commas; they must all be on \
+           the same artefact. Put a base type in front to restrict the item: "
       ; code [ txt "staff props:Conj,Alch" ]
-      ; txt "."
+      ; txt ". Property names are case-insensitive."
       ]
-  ; p [ txt "Naming a base type is optional." ]
   ; examples
-      [ [ "props:Alch" ], "any artefact enhancing Alchemy — staff, ring, robe, anything"
-      ; [ "props:rF,rC" ], "one artefact carrying fire and cold resistance together"
-      ; ( [ "props:rF,rC,rN" ]
-        , "one artefact covering all three of fire, cold and negative energy" )
-      ; [ "staff props:Alch" ], "an Alchemy-enhancing staff"
-      ; [ "staff props:Conj,Alch" ], "a staff enhancing both Conjurations and Alchemy"
-      ; [ "staff props:Conj,Alch,rC" ], "that staff, and it resists cold as well. Rare"
-      ; [ "weapon props:rF" ], "a weapon with"
-      ; [ "weapon props:rF,rC" ], "a weapon with both resistances"
-      ; [ "weapon props:rF,rC,Will" ], "a weapon carrying both plus willpower"
+      [ [ "props:Alch" ], "any artefact enhancing Alchemy"
+      ; [ "props:rF,rC" ], "one artefact with rF and rC"
+      ; [ "props:rF,rC,rN" ], "one artefact with rF, rC and rN"
+      ; [ "staff props:Alch" ], "a staff enhancing Alchemy"
+      ; [ "staff props:Conj,Alch" ], "a staff enhancing Conjurations and Alchemy"
+      ; [ "staff props:Conj,Alch,rC" ], "the same, plus rC (rare)"
+      ; [ "weapon props:rF" ], "a weapon with rF"
+      ; [ "weapon props:rF,rC" ], "a weapon with rF and rC"
+      ; [ "weapon props:rF,rC,Will" ], "a weapon with rF, rC and Will"
       ]
   ; help_note
       ~label:"Why some combinations return nothing"
       [ p
-          [ txt "Properties do not roll evenly across item types. School enhancers ("
+          [ txt "Some properties never roll on some item types. School enhancers ("
           ; code [ txt "Conj" ]
           ; txt ", "
           ; code [ txt "Alch" ]
           ; txt ", "
           ; code [ txt "Fire" ]
-          ; txt ") never appear on weapons at all, and "
+          ; txt ") never appear on weapons, and "
           ; code [ txt "Slay" ]
-          ; txt
-              " never on staves — so those searches are empty for a reason that has \
-               nothing to do with your seed."
+          ; txt " never appears on staves."
           ]
       ]
   ; help_note
-      ~label:"Why a property has no strength, and why drawbacks are missing"
+      ~label:"Property strength and drawbacks"
       [ p
-          [ txt "A property term matches any positive strength. "
-          ; code [ txt "props:rF" ]
-          ; txt " finds "
+          [ code [ txt "props:rF" ]
+          ; txt " matches "
           ; code [ txt "rF+" ]
           ; txt " and "
           ; code [ txt "rF++" ]
-          ; txt " alike, and never "
+          ; txt ", but not "
           ; code [ txt "rF-" ]
           ; txt "."
           ]
       ; p
-          [ txt "Drawbacks are not searchable at all."
+          [ txt "Drawbacks are not searchable at all. "
           ; code [ txt "*Rage" ]
           ; txt " is the exception and can be searched, because it's hilarious."
           ]
@@ -1460,18 +1424,16 @@ let search_help ~version =
            have to search twice and compare."
       ]
   ; examples
-      [ ( [ "3x scroll:acquirement"; "armour:crystal plate armour" ]
-        , "three scrolls of acquirement and a crystal plate armour, on one seed" )
-      ; ( [ "shop wand:digging"; "artefact" ]
-        , "a wand of digging for sale, and an artefact anywhere in the extracted floors \
-           — the second term covers shop stock too" )
+      [ ( [ "scroll:acquirement"; "armour:crystal plate armour" ]
+        , "a scroll of acquirement and a crystal plate armour, on one seed" )
+      ; ( [ "shop wand:digging"; "scroll:acquirement" ]
+        , "a wand of digging in a shop, and a scroll of acquirement on the floor" )
       ]
-  ; h2 [ txt "What a search cannot tell you" ]
+  ; h2 [ txt "Depth" ]
   ; p
-      [ txt
-          "A seed is only searched as deep as it has been extracted, and most are \
-           extracted to D:8. \"No Wyrmbane at all\" and \"didn't find it at the depth we \
-           read\" are both possible and a term matching nothing may be either."
+      [ txt "Most seeds are only searched to "
+      ; level_name "D:8"
+      ; txt ", so a seed that doesn't match may still have the item deeper down."
       ]
   ; p [ a ~a:[ a_href (version_path version ^ "/search") ] [ txt "← Back to search" ] ]
   ]
@@ -1500,12 +1462,11 @@ let about ~version =
            them. This site reads the first several floors of many seeds ahead of time \
            and writes down what it found."
       ]
-  ; h2 [ txt "The build is part of the seed" ]
+  ; h2 [ txt "Versions" ]
   ; p
       [ txt
-          "A seed number on its own tells you nothing. The same number generates an \
-           entirely different dungeon on every version of crawl, so every page here is \
-           scoped to one build named at the top."
+          "The same seed generates a different dungeon on each version of crawl, so \
+           every page here is for the one build named at the top."
       ]
   ; h2 [ txt "How much of the seed space is here" ]
   ; p
@@ -1519,9 +1480,13 @@ let about ~version =
   ; p
       [ txt
           "Each seed is also only searched down to dungeon floor 8 to start with. You \
-           can deepen individual seeds down to the end of the main dungeon, including \
-           Orc, Lair, and their branches. Seed heat is calculated based on the D:8 read, \
-           not a total assessment of the seed."
+           can deepen individual seeds down to the end of the main dungeon, including "
+      ; level_name "Orc"
+      ; txt ", "
+      ; level_name "Lair"
+      ; txt ", and their branches. Seed heat is calculated based on the "
+      ; level_name "D:8"
+      ; txt " read, not a total assessment of the seed."
       ]
   ; h2 [ txt "The game" ]
   ; p

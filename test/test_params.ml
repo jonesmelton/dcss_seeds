@@ -22,7 +22,6 @@ let%expect_test "term syntax" =
     ; "3x floor potion:haste by D:5"
     ; "altar_trog"
     ; "enter_shop"
-    ; "artefact"
     ; "unique:Sigmund"
     ; "name~Throatcutter"
     ];
@@ -30,15 +29,14 @@ let%expect_test "term syntax" =
     {|
     potion:haste                 -> potion of haste
     3x potion:haste              -> 3+ potion of haste
-    potion:haste by D:5          -> error: depth caps are no longer supported: drop the " by ..." from "potion:haste by D:5". Results cover the whole depth each seed was catalogued to.
-    3x potion:haste by D:5       -> error: depth caps are no longer supported: drop the " by ..." from "3x potion:haste by D:5". Results cover the whole depth each seed was catalogued to.
+    potion:haste by D:5          -> error: depth limits are no longer supported. Remove the " by ..." from "potion:haste by D:5".
+    3x potion:haste by D:5       -> error: depth limits are no longer supported. Remove the " by ..." from "3x potion:haste by D:5".
     shop potion:haste            -> potion of haste in a shop
     floor potion:haste           -> potion of haste
-    3x floor potion:haste by D:5 -> error: depth caps are no longer supported: drop the " by ..." from "3x floor potion:haste by D:5". Results cover the whole depth each seed was catalogued to.
+    3x floor potion:haste by D:5 -> error: depth limits are no longer supported. Remove the " by ..." from "3x floor potion:haste by D:5".
     altar_trog                   -> error: search covers items, not features: "altar_trog"
     enter_shop                   -> error: search covers items, not features: "enter_shop"
-    artefact                     -> an artefact
-    unique:Sigmund               -> error: search covers items, not monsters. A seed page lists the uniques on each level.
+    unique:Sigmund               -> error: only items are searchable, not monsters. Each seed page lists its uniques.
     name~Throatcutter            -> named like "Throatcutter"
     |}]
 ;;
@@ -65,7 +63,6 @@ let%expect_test "a position prefix is peeled off and the rest parses as it would
     ; "shop props:Conj"
     ; "staff props:Conj"
     ; "shop staff props:Conj"
-    ; "artefact"
     ; "3x shop potion:haste"
     ];
   [%expect
@@ -79,7 +76,6 @@ let%expect_test "a position prefix is peeled off and the rest parses as it would
     shop props:Conj            -> ((criterion(Props(base_type())(props(Conj))(position Shop)))(min_count 1))
     staff props:Conj           -> ((criterion(Props(base_type(staff))(props(Conj))(position Floor)))(min_count 1))
     shop staff props:Conj      -> ((criterion(Props(base_type(staff))(props(Conj))(position Shop)))(min_count 1))
-    artefact                   -> ((criterion Artefact)(min_count 1))
     3x shop potion:haste       -> ((criterion(Item((base_type potion)(sub_type haste))Shop))(min_count 3))
     |}]
 ;;
@@ -95,12 +91,8 @@ let%expect_test "position guards" =
       "shop floor potion:haste"
     ; "floor shop potion:haste"
     ; "shop shop potion:haste"
-      (* DECISION 4: artefact spans both sides and has no colon for a prefix to
-         lead, so a position on it is refused rather than ignored. *)
-    ; "shop artefact"
-    ; "floor artefact"
-      (* DECISION 3: no shop form of name~, and its own message -- never a
-         fallthrough to the not-a-feature branch. *)
+      (* No shop form of name~, and its own message -- never a fallthrough to
+         the not-a-feature branch. *)
     ; "shop name~Wyrmbane"
       (* A position must not rescue a term search dropped on other grounds. *)
     ; "shop unique:Sigmund"
@@ -108,14 +100,40 @@ let%expect_test "position guards" =
     ];
   [%expect
     {|
-    shop floor potion:haste    -> error: a term takes one position, not two: drop one of the "shop "/"floor " prefixes from "shop floor potion:haste"
-    floor shop potion:haste    -> error: a term takes one position, not two: drop one of the "shop "/"floor " prefixes from "floor shop potion:haste"
-    shop shop potion:haste     -> error: a term takes one position, not two: drop one of the "shop "/"floor " prefixes from "shop shop potion:haste"
-    shop artefact              -> error: artefact covers floor and shop alike, so a position does not apply to it. Drop the "shop " or "floor ".
-    floor artefact             -> error: artefact covers floor and shop alike, so a position does not apply to it. Drop the "shop " or "floor ".
-    shop name~Wyrmbane         -> error: there is no shop form of name~: gold is the binding constraint in the early game, so an unrand you can afford in a shop is one you could have afforded off the floor. Drop the "shop ".
-    shop unique:Sigmund        -> error: search covers items, not monsters. A seed page lists the uniques on each level.
-    floor unique:Sigmund       -> error: search covers items, not monsters. A seed page lists the uniques on each level.
+    shop floor potion:haste    -> error: use "shop " or "floor ", not both: "shop floor potion:haste"
+    floor shop potion:haste    -> error: use "shop " or "floor ", not both: "floor shop potion:haste"
+    shop shop potion:haste     -> error: use "shop " or "floor ", not both: "shop shop potion:haste"
+    shop name~Wyrmbane         -> error: name~ only searches the floor. Remove the "shop ".
+    shop unique:Sigmund        -> error: only items are searchable, not monsters. Each seed page lists its uniques.
+    floor unique:Sigmund       -> error: only items are searchable, not monsters. Each seed page lists its uniques.
+    |}]
+;;
+
+(* [artefact] was the one criterion spanning both positions and has no colon
+   for a position prefix to lead. Removed 2026-10, and every spelling ticket
+   48784e91b7 taught the parser is rejected with the message naming what
+   replaced it -- including a position prefix, which must not get the generic
+   position message instead. *)
+let%expect_test "artefact is rejected in every spelling it used to accept" =
+  List.iter
+    ~f:show_parse
+    [ "artefact"
+    ; "Artefact"
+    ; "ARTEFACT"
+    ; "artifact"
+    ; "3x Artifact"
+    ; "shop artefact"
+    ; "floor artifact"
+    ];
+  [%expect
+    {|
+    artefact                   -> error: artefact isn't a search term. Search by property instead, as in "props:Conj" or "weapon props:rF".
+    Artefact                   -> error: artefact isn't a search term. Search by property instead, as in "props:Conj" or "weapon props:rF".
+    ARTEFACT                   -> error: artefact isn't a search term. Search by property instead, as in "props:Conj" or "weapon props:rF".
+    artifact                   -> error: artefact isn't a search term. Search by property instead, as in "props:Conj" or "weapon props:rF".
+    3x Artifact                -> error: artefact isn't a search term. Search by property instead, as in "props:Conj" or "weapon props:rF".
+    shop artefact              -> error: artefact isn't a search term. Search by property instead, as in "props:Conj" or "weapon props:rF".
+    floor artifact             -> error: artefact isn't a search term. Search by property instead, as in "props:Conj" or "weapon props:rF".
     |}]
 ;;
 
@@ -125,27 +143,6 @@ let%expect_test "position guards" =
    matches nothing, and tells the reader the build holds no such thing.
    Reordering the two would not have fixed it, because the props logic was never
    in the prefix table to reorder. *)
-let%expect_test "artefact is matched case-insensitively and in either spelling" =
-  List.iter
-    ~f:show_parse
-    [ "Artefact"
-    ; "ARTEFACT"
-    ; "artifact"
-    ; "3x Artifact"
-    ; "shop artifact"
-    ; "floor Artefact"
-    ];
-  [%expect
-    {|
-    Artefact                   -> ((criterion Artefact)(min_count 1))
-    ARTEFACT                   -> ((criterion Artefact)(min_count 1))
-    artifact                   -> ((criterion Artefact)(min_count 1))
-    3x Artifact                -> ((criterion Artefact)(min_count 3))
-    shop artifact              -> error: artefact covers floor and shop alike, so a position does not apply to it. Drop the "shop " or "floor ".
-    floor Artefact             -> error: artefact covers floor and shop alike, so a position does not apply to it. Drop the "shop " or "floor ".
-    |}]
-;;
-
 let%expect_test "shop props: is a property search, not a base type named props" =
   List.iter ~f:show_parse [ "shop props:Conj"; "shop staff props:Conj,Alch" ];
   [%expect
@@ -218,8 +215,6 @@ let%expect_test "every term the parser builds round-trips through to_query_strin
     ; "shop weapon:executioner's axe"
     ; "name~Wyrmbane"
     ; "floor name~Wyrmbane"
-    ; "artefact"
-    ; "3x artefact"
     ; "props:Conj"
     ; "props:Conj,Alch"
     ; "props:+Blink"
@@ -241,8 +236,6 @@ let%expect_test "every term the parser builds round-trips through to_query_strin
     shop weapon:executioner's axe -> shop weapon:executioner's axe same
     name~Wyrmbane              -> name~Wyrmbane              same
     floor name~Wyrmbane        -> name~Wyrmbane              same
-    artefact                   -> artefact                   same
-    3x artefact                -> 3x artefact                same
     props:Conj                 -> props:Conj                 same
     props:Conj,Alch            -> props:Conj,Alch            same
     props:+Blink               -> props:+Blink               same
@@ -287,7 +280,7 @@ let%expect_test "malformed terms are errors, not dropped filters" =
                                  -> error: empty search term
     potion:                      -> error: not a <base>:<sub> item: "potion:"
     :haste                       -> error: not a <base>:<sub> item: ":haste"
-    unique:                      -> error: search covers items, not monsters. A seed page lists the uniques on each level.
+    unique:                      -> error: only items are searchable, not monsters. Each seed page lists its uniques.
     name~                        -> error: name~ needs something to match
     name~ab                      -> error: name~ needs at least 3 characters (got 2)
     floor                        -> error: "floor" needs an item after it, as in "floor potion:haste"
@@ -404,10 +397,10 @@ let%expect_test "drawbacks are not searchable" =
   List.iter ~f:show [ "props:*Slow"; "props:Conj,*Noise"; "props:^Contam"; "props:nupgr" ];
   [%expect
     {|
-    props:*Slow                  -> error: "*Slow" is a drawback, and nobody picks a seed for one, so it is not searchable.
-    props:Conj,*Noise            -> error: "*Noise" is a drawback, and nobody picks a seed for one, so it is not searchable.
-    props:^Contam                -> error: "^Contam" is a drawback, and nobody picks a seed for one, so it is not searchable.
-    props:nupgr                  -> error: "nupgr" is an internal flag on artefacts that upgrade themselves, not a property the game ever shows you, so it is not searchable.
+    props:*Slow                  -> error: "*Slow" is a drawback and can't be searched.
+    props:Conj,*Noise            -> error: "*Noise" is a drawback and can't be searched.
+    props:^Contam                -> error: "^Contam" is a drawback and can't be searched.
+    props:nupgr                  -> error: "nupgr" is an internal flag and can't be searched.
     |}]
 ;;
 
@@ -427,8 +420,8 @@ let%expect_test "properties take no count" =
   List.iter ~f:show [ "3x props:Conj"; "2x staff props:Conj,Alch"; "1x props:Conj" ];
   [%expect
     {|
-    3x props:Conj                -> error: a count does not apply to properties: drop the "3x". Two of a property is not a more interesting seed than one.
-    2x staff props:Conj,Alch     -> error: a count does not apply to properties: drop the "2x". Two of a property is not a more interesting seed than one.
+    3x props:Conj                -> error: props: terms don't take a count. Remove the "3x".
+    2x staff props:Conj,Alch     -> error: props: terms don't take a count. Remove the "2x".
     1x props:Conj                -> an artefact with Conj
     |}]
 ;;
@@ -469,7 +462,6 @@ let%expect_test "help page examples parse" =
     ; "shop wand:digging"
     ; "3x potion:haste"
     ; "3x floor potion:haste"
-    ; "artefact"
     ; "name~Throatcutter"
     ; "props:Alch"
     ; "props:rF,rC"
@@ -493,7 +485,7 @@ let%expect_test "unknown properties are rejected, not searched" =
   List.iter ~f:show [ "props:Conj Alch"; "props:Blink"; "props:rFire"; "props:Conj,Xyz" ];
   [%expect
     {|
-    props:Conj Alch              -> error: no property named "Conj Alch". Separate several properties with a comma, as in "props:Conj,Alch" -- a "+" between them becomes a space in a URL.
+    props:Conj Alch              -> error: no property named "Conj Alch". Separate properties with commas, as in "props:Conj,Alch".
     props:Blink                  -> error: no property named "Blink"
     props:rFire                  -> error: no property named "rFire"
     props:Conj,Xyz               -> error: no property named "Xyz"
@@ -526,13 +518,13 @@ let%expect_test "an empty first page logs the version and the terms by kind" =
       let terms = Seed_web.Params.terms_of_strings has |> Or_error.ok_exn in
       print_endline (Seed_web.Params.empty_search_line (Search.create ~version ~terms ())))
     [ [ "potion:haste"; "staff props:Conj,Alch" ]
-    ; [ "3x shop potion:haste"; "shop props:rF"; "artefact" ]
+    ; [ "3x shop potion:haste"; "shop props:rF"; "shop scroll:acquirement" ]
     ; [ "name~robe of\nVines" ]
     ];
   [%expect
     {|
     search found nothing on 0.34.1: item potion:haste; props staff Conj,Alch
-    search found nothing on 0.34.1: 3x item shop potion:haste; props shop rF; artefact
+    search found nothing on 0.34.1: 3x item shop potion:haste; props shop rF; item shop scroll:acquirement
     search found nothing on 0.34.1: name robe of\nVines
     |}]
 ;;
@@ -624,13 +616,13 @@ let%expect_test "an ambiguous or misspelled word offers, and does not run" =
     {|
     talisman           -> rejected: "talisman" could mean several things. Pick one: [talisman:blade talisman | talisman:granite talisman]
     fire               -> rejected: "fire" could mean several things. Pick one: [staff:fire | props:Fire]
-    aquirement         -> rejected: Nothing is called "aquirement". Did you mean: [scroll:acquirement]
-    hsate              -> rejected: Nothing is called "hsate". Did you mean: [potion:haste]
-    3x scroll of aquirement -> rejected: Nothing is called "scroll of aquirement". Did you mean: [3x scroll:acquirement]
-    broad              -> rejected: Nothing is called "broad". Did you mean: [weapon:broad axe]
-    axe                -> rejected: Nothing is called "axe". Did you mean: [weapon:broad axe | weapon:hand axe]
-    granite            -> rejected: Nothing is called "granite". Did you mean: [talisman:granite talisman]
-    3x rF              -> rejected: a count does not apply to properties: drop the "3x". Two of a property is not a more interesting seed than one.
+    aquirement         -> rejected: Nothing matches "aquirement". Did you mean: [scroll:acquirement]
+    hsate              -> rejected: Nothing matches "hsate". Did you mean: [potion:haste]
+    3x scroll of aquirement -> rejected: Nothing matches "scroll of aquirement". Did you mean: [3x scroll:acquirement]
+    broad              -> rejected: Nothing matches "broad". Did you mean: [weapon:broad axe]
+    axe                -> rejected: Nothing matches "axe". Did you mean: [weapon:broad axe | weapon:hand axe]
+    granite            -> rejected: Nothing matches "granite". Did you mean: [talisman:granite talisman]
+    3x rF              -> rejected: props: terms don't take a count. Remove the "3x".
     |}]
 ;;
 
@@ -640,10 +632,10 @@ let%expect_test "an unknown word offers a name search" =
   List.iter ~f:show_box [ "spectral"; "3x spectral"; "shop spectral"; "xy"; "altar_trog" ];
   [%expect
     {|
-    spectral           -> rejected: Nothing is called "spectral". To search item names for it: [name~spectral]
-    3x spectral        -> rejected: Nothing is called "spectral". To search item names for it: [3x name~spectral]
-    shop spectral      -> rejected: Nothing is called "spectral". To search item names for it: [name~spectral]
-    xy                 -> rejected: Nothing is called "xy".
+    spectral           -> rejected: Nothing matches "spectral". Search artefact names instead: [name~spectral]
+    3x spectral        -> rejected: Nothing matches "spectral". Search artefact names instead: [3x name~spectral]
+    shop spectral      -> rejected: Nothing matches "spectral". Search artefact names instead: [name~spectral]
+    xy                 -> rejected: Nothing matches "xy".
     altar_trog         -> rejected: search covers items, not features: "altar_trog"
     |}]
 ;;
@@ -656,8 +648,8 @@ let%expect_test "without a vocabulary a bare word is told the syntax" =
   List.iter ~f:(show_box ~vocabulary:(lazy None)) [ "hat"; "fire" ];
   [%expect
     {|
-    hat                -> rejected: "hat" needs a prefix: an item is written base:sub, as in potion:haste. To search item names for it: [name~hat]
-    fire               -> rejected: "fire" needs a prefix: an item is written base:sub, as in potion:haste. To search item names for it: [name~fire]
+    hat                -> rejected: "hat" needs a prefix: an item is written base:sub, as in potion:haste. Search artefact names instead: [name~hat]
+    fire               -> rejected: "fire" needs a prefix: an item is written base:sub, as in potion:haste. Search artefact names instead: [name~fire]
     |}]
 ;;
 
@@ -680,7 +672,7 @@ let%expect_test "a well-formed term never forces the vocabulary" =
     potion:            -> rejected: not a <base>:<sub> item: "potion:"
     name~ab            -> rejected: name~ needs at least 3 characters (got 2)
     shop               -> rejected: "shop" needs an item after it, as in "shop potion:haste"
-    haste by D:5       -> rejected: depth caps are no longer supported: drop the " by ..." from "haste by D:5". Results cover the whole depth each seed was catalogued to.
+    haste by D:5       -> rejected: depth limits are no longer supported. Remove the " by ..." from "haste by D:5".
     forced false
     |}]
 ;;

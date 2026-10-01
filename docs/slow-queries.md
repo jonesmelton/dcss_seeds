@@ -45,10 +45,13 @@ single-prop case is already usable and the multi-prop case is the feature.
 
 ### "Show me a seed with a big pile of acquirement"
 
-`9x artefact` — **503 after 30.0s**, the only 503 in the window.
+`9x artefact` — **503 after 30.0s**, the only 503 in the window. (`artefact`
+was removed as a search term 2026-10; the reader was reaching for
+`9x scroll:acquirement` through a proxy, and the direct term answers in 0.55ms
+(10,000 seeds, 0.34.1, D:8, local).)
 
 That is the search timeout firing, which is the honest failure, but the reader
-asked a reasonable question and got nothing. `artefact` alone returns in 22ms;
+asked a reasonable question and got nothing. `artefact` alone returned in 22ms;
 the count is what kills it.
 
 Someone else spent 20:04–20:05 walking `10x → 9x → 8x → 7x scroll:acquirement`
