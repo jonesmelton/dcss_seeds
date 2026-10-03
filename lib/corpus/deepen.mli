@@ -73,7 +73,10 @@ val failure_message : consecutive:int -> Context.t option -> string -> string
     The pipeline's exit status is its last stage's, so a crawl crash surfaces as
     ingest reading nothing and succeeding. Caught downstream instead:
     [Db.write_batch] recomputes fill depth from the levels that landed, so a
-    partial extraction shows up as a seed that never reached its cap. *)
+    partial extraction shows up as a seed that never reached its cap.
+
+    Ingest runs [-requested]: a job is a reader's request, so a seed it adds
+    stays out of the random sample and a seed it deepens keeps its origin. *)
 val extract_command
   :  Build.t
   -> seed:string

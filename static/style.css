@@ -1015,7 +1015,8 @@ h1 .copy-seed {
   margin-top: 0.75rem;
 }
 
-.deepen button {
+.deepen button,
+.seed-flag button {
   font: inherit;
   font-size: 0.9rem;
   background: transparent;
@@ -1026,9 +1027,34 @@ h1 .copy-seed {
   cursor: pointer;
 }
 
-.deepen button:hover {
+.deepen button:hover,
+.seed-flag button:hover {
   background: var(--accent);
   color: var(--paper);
+}
+
+/* Same left edge as the depth note's content, so the two buttons stand in one
+   column; the rule itself is not repeated, since the flag is not a state of
+   the seed's search. */
+.seed-flag {
+  border-left: 3px solid transparent;
+  padding-left: 1rem;
+  margin: -0.75rem 0 1.5rem;
+}
+
+.seed-flag form {
+  margin: 0;
+}
+
+/* The confirmation takes focus when it replaces the button, so it must not
+   draw a ring for a message that is not interactive. */
+.seed-flag p {
+  margin: 0.35rem 0;
+  color: var(--ink-2);
+}
+
+.seed-flag p:focus {
+  outline: none;
 }
 
 /* ── Status ────────────────────────────────────────────────────────────── */
@@ -1212,6 +1238,11 @@ h1 .copy-seed {
 
 .term-problem .offers li {
   margin: 0;
+}
+
+.offers {
+  font-family: var(--sans);
+  font-variant-numeric: lining-nums;
 }
 
 .resolved {

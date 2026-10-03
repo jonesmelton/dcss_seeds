@@ -146,6 +146,15 @@ claim about the seed.
   seed marked cold at D:8 may be blazing at D:15; the cap is invisible in the
   data and cannot be inferred from the page. Naming it is correctness, not
   explanation.
+- **The population is the random sample.** A seed a reader submitted
+  (`seed_fills.origin = 'submit'`) is scored but never counted: it is outside
+  the cohort behind `surprise`, the cut points and `n`. `rescore` scores it in
+  the same pass as the sample and bands it against the sample's cuts; the
+  generator scores a new one alone at job finish (`Db.score_seed`), against
+  the `n` `rescore` stored in `heat_cohorts`, so both give it the same score.
+  An early-spell count or item count no sample seed reached falls back the way
+  any unseen count does in `surprise_lookup`, to the largest stored count
+  below it.
 - **Shop stock is excluded.** Surprise ranges over `entries` where `cost is
   null` — what the seed *gives* you, not what it sells you.
 - **Depth is reach order.** `shallowest` is a `Depth.t`, never generation order;

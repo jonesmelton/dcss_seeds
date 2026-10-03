@@ -23,6 +23,21 @@ module State : sig
   val to_string : t -> string
 end
 
+(** Who asked. A deepen extends a seed the corpus holds; a submission is a
+    seed a reader named that it does not hold. Both are claimed from one queue,
+    deepens first, so a flood of submissions cannot starve them. *)
+module Origin : sig
+  type t =
+    | Deepen
+    | Submit
+  [@@deriving compare, equal, sexp_of]
+
+  (** The [ingest_jobs.origin] spelling. *)
+  val to_string : t -> string
+
+  val of_string : string -> t Or_error.t
+end
+
 type t =
   { seed : string
   ; version : Query.Version.t
@@ -32,6 +47,7 @@ type t =
   ; finished_at : int option
   ; attempts : int
   ; error : string option
+  ; origin : Origin.t
   }
 [@@deriving sexp_of]
 

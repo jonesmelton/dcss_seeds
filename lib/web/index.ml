@@ -10,6 +10,7 @@ open Tyxml.Html
 module Page = struct
   type t =
     | Seeds
+    | Community
     | Search
     | About
     | Other
@@ -36,8 +37,11 @@ let theme_toggle =
 (* Links stay inside the build the reader is in, for the same reason the
    masthead link does: a nav that silently moves them to the current build is
    worse than no nav. Error chrome has no build to scope them to, so it gets
-   none. *)
-let nav_links ~version ~here =
+   none.
+
+   [community] adds the garden link, and is false wherever the feedback store is
+   not configured -- there is no page to point at, so there is no link. *)
+let nav_links ~version ~here ~community =
   match version with
   | None -> txt ""
   | Some v ->
@@ -57,10 +61,11 @@ let nav_links ~version ~here =
     nav
       ~a:[ a_class [ "masthead-nav" ] ]
       [ ul
-          [ entry Page.Seeds "seeds" "/"
-          ; entry Page.Search "search" "/search"
-          ; entry Page.About "about" "/about"
-          ]
+          ([ entry Page.Seeds "seeds" "/" ]
+           @ (if community
+              then [ entry Page.Community "community garden" "/community" ]
+              else [])
+           @ [ entry Page.Search "search" "/search"; entry Page.About "about" "/about" ])
       ]
 ;;
 
@@ -76,7 +81,7 @@ let nav_links ~version ~here =
    the same seed number on two builds is two unrelated dungeons, and a seed
    quoted without its build is the most common way a shared seed becomes a wrong
    answer. *)
-let masthead ~version ~builds ~here =
+let masthead ~version ~builds ~here ~community =
   let home =
     match version with
     | None -> "/"
@@ -144,36 +149,50 @@ let masthead ~version ~builds ~here =
     (div
        ~a:[ a_class [ "masthead-bar" ] ]
        [ a ~a:[ a_href home; a_class [ "site" ] ] [ txt "dcss garden" ]
-       ; nav_links ~version ~here
+       ; nav_links ~version ~here ~community
        ; theme_toggle
        ]
      :: build)
 ;;
 
-let render ?version ?(builds = []) ?(here = Page.Other) ~title:page_title content =
+let render
+      ?version
+      ?(builds = [])
+      ?(here = Page.Other)
+      ?(community = false)
+      ?canonical
+      ~title:page_title
+      content
+  =
   html
     ~a:[ a_lang "en" ]
     (head
        (title (txt page_title))
-       [ meta ~a:[ a_charset "utf-8" ] ()
-       ; meta ~a:[ a_name "viewport"; a_content "width=device-width, initial-scale=1" ] ()
-       ; link ~rel:[ `Icon ] ~href:"/favicon.ico" ~a:[ a_mime_type "image/x-icon" ] ()
-       ; link
-           ~rel:[ `Icon ]
-           ~href:"/static/favicon-32.png"
-           ~a:[ a_mime_type "image/png"; a_sizes (Some [ 32, 32 ]) ]
-           ()
-       ; link
-           ~rel:[ `Icon ]
-           ~href:"/static/favicon-16.png"
-           ~a:[ a_mime_type "image/png"; a_sizes (Some [ 16, 16 ]) ]
-           ()
-       ; link ~rel:[ `Other "apple-touch-icon" ] ~href:"/static/apple-touch-icon.png" ()
-       ; link ~rel:[ `Stylesheet ] ~href:"/static/style.css" ()
-         (* Blocking, in head, before paint: a theme applied afterwards flashes. *)
-       ; script ~a:[ a_src "/static/theme.js" ] (txt "")
-       ; script ~a:[ a_src "/static/htmx.min.js" ] (txt "")
-       ; script ~a:[ a_src "/static/copy.js" ] (txt "")
-       ])
-    (body [ masthead ~version ~builds ~here; main ~a:[ a_id "main" ] content ])
+       ([ meta ~a:[ a_charset "utf-8" ] ()
+        ; meta
+            ~a:[ a_name "viewport"; a_content "width=device-width, initial-scale=1" ]
+            ()
+        ; link ~rel:[ `Icon ] ~href:"/favicon.ico" ~a:[ a_mime_type "image/x-icon" ] ()
+        ; link
+            ~rel:[ `Icon ]
+            ~href:"/static/favicon-32.png"
+            ~a:[ a_mime_type "image/png"; a_sizes (Some [ 32, 32 ]) ]
+            ()
+        ; link
+            ~rel:[ `Icon ]
+            ~href:"/static/favicon-16.png"
+            ~a:[ a_mime_type "image/png"; a_sizes (Some [ 16, 16 ]) ]
+            ()
+        ; link ~rel:[ `Other "apple-touch-icon" ] ~href:"/static/apple-touch-icon.png" ()
+        ; link ~rel:[ `Stylesheet ] ~href:"/static/style.css" ()
+        ]
+        @ (match canonical with
+           | Some href -> [ link ~rel:[ `Canonical ] ~href () ]
+           | None -> [])
+        @ [ (* Blocking, in head, before paint: a theme applied afterwards flashes. *)
+            script ~a:[ a_src "/static/theme.js" ] (txt "")
+          ; script ~a:[ a_src "/static/htmx.min.js" ] (txt "")
+          ; script ~a:[ a_src "/static/copy.js" ] (txt "")
+          ]))
+    (body [ masthead ~version ~builds ~here ~community; main ~a:[ a_id "main" ] content ])
 ;;

@@ -50,6 +50,18 @@ let corpus =
        what makes [name~]'s missing shop form observable rather than asserted:
        a bare [name~] reads the floor and cannot reach it. *)
   ; {|#SEED#((format 4)(version "0.34.1")(seed "21")(level "D:4")(cats (items (((artefact t)(base_type "weapon")(cost 4000)(kind "item")(name "+8 Wyrmbane {holy, slay+4}")(plus 8)(quantity 1)(sub_type "demon blade")(text "+8 Wyrmbane"))))))|}
+    (* The brand fixtures. Seed 46 is the leak [Criterion.Brand] exists to
+       prevent: a plain quick blade on D:6 and a distortion dagger on D:2, so
+       a seed-scoped reading of "quick blade" beside "distortion" would match
+       it and the evidence rendering could not say why that is wrong. Seed 49
+       is the same brand on an artefact, which carries its own name and must
+       still answer. *)
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "45")(level "D:3")(cats (items (((base_type "weapon")(branded t)(ego "distort")(kind "item")(name "quick blade of distortion")(plus 0)(quantity 1)(sub_type "quick blade")(text "quick blade of distortion"))))))|}
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "46")(level "D:2")(cats (items (((base_type "weapon")(branded t)(ego "distort")(kind "item")(name "dagger of distortion")(plus 0)(quantity 1)(sub_type "dagger")(text "dagger of distortion"))))))|}
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "46")(level "D:6")(cats (items (((base_type "weapon")(kind "item")(name "quick blade")(plus 0)(quantity 1)(sub_type "quick blade")(text "quick blade"))))))|}
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "47")(level "D:4")(cats (items (((base_type "weapon")(branded t)(cost 300)(ego "distort")(kind "item")(name "quick blade of distortion")(plus 0)(quantity 1)(sub_type "quick blade")(text "quick blade of distortion"))))))|}
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "48")(level "D:5")(cats (items (((base_type "armour")(branded t)(ego "rF+")(kind "item")(name "robe of fire resistance")(plus 0)(quantity 1)(sub_type "robe")(text "robe of fire resistance"))))))|}
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "49")(level "D:2")(cats (items (((artefact t)(base_type "weapon")(branded t)(ego "distort")(kind "item")(name "+9 quick blade \"Zephyr\" {distort}")(plus 9)(quantity 1)(sub_type "quick blade")(text "+9 quick blade Zephyr"))))))|}
   ]
 ;;
 
@@ -366,6 +378,11 @@ let%expect_test "an empty search lists every seed of the version" =
       33:
       34:
       4:
+      45:
+      46:
+      47:
+      48:
+      49:
       5:
       6:
       7:
@@ -943,6 +960,142 @@ let%expect_test "Props round-trips through the query string" =
     |}]
 ;;
 
+(* {1 Brands} *)
+
+let brand ?(position = Search.Criterion.Floor) base_type sub_type word =
+  Search.Criterion.Brand { base_type; sub_type = Some sub_type; word; position }
+;;
+
+let quick_blade_distortion = brand "weapon" "quick blade" "distortion"
+
+(* The question the criterion exists for, and the leak it must not have: seed 46
+   holds a plain quick blade on D:6 and a distortion dagger on D:2, so a
+   seed-scoped reading would match it. Seed 49 is the same brand on an artefact,
+   which stores its own name and must still answer -- a randart weapon's brand
+   is a fact about the item, not about its name. *)
+let%expect_test "Brand demands the brand and the item on one entry" =
+  let db = fresh_db () in
+  run db [ Search.Term.create quick_blade_distortion ];
+  [%expect
+    {|
+    seeds on 0.34.1 with quick blade with distortion
+      45: +0 quick blade of distortion x1 on D:3
+      49: +9 quick blade "Zephyr" {distort} x1 on D:2
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* A base type alone bounds the term: any weapon with the brand, so the dagger
+   on seed 46 answers as well as the quick blades. *)
+let%expect_test "a Brand with no sub type matches any item of the base type" =
+  let db = fresh_db () in
+  run
+    db
+    [ Search.Term.create
+        (Search.Criterion.Brand
+           { base_type = "weapon"
+           ; sub_type = None
+           ; word = "distortion"
+           ; position = Search.Criterion.Floor
+           })
+    ];
+  [%expect
+    {|
+    seeds on 0.34.1 with weapon with distortion
+      45: +0 quick blade of distortion x1 on D:3
+      46: +0 dagger of distortion x1 on D:2
+      49: +9 quick blade "Zephyr" {distort} x1 on D:2
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* Position is a field, as on every other criterion: a branded item behind a
+   counter is a different question from one on the floor, and the two partition
+   the rows. *)
+let%expect_test "a shop Brand reaches only shop stock" =
+  let db = fresh_db () in
+  run
+    db
+    [ Search.Term.create
+        (brand ~position:Search.Criterion.Shop "weapon" "quick blade" "distortion")
+    ];
+  [%expect
+    {|
+    seeds on 0.34.1 with quick blade with distortion in a shop
+      47: +0 quick blade of distortion x1 on D:4
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* The word, not the code: the criterion stores what a reader types and the
+   rendered name shows. *)
+let%expect_test "an armour brand is found by its word" =
+  let db = fresh_db () in
+  run db [ Search.Term.create (brand "armour" "robe" "fire resistance") ];
+  [%expect
+    {|
+    seeds on 0.34.1 with robe with fire resistance
+      48: +0 robe of fire resistance x1 on D:5
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* A term round-trips through a link, as every other criterion does. The word is
+   emitted, not the code: the code is a spelling per build. *)
+let%expect_test "Brand round-trips through the query string" =
+  List.iter
+    ~f:(fun c -> print_endline (Search.Term.to_query_string (Search.Term.create c)))
+    [ quick_blade_distortion
+    ; brand ~position:Search.Criterion.Shop "weapon" "quick blade" "distortion"
+    ; brand "armour" "robe" "fire resistance"
+    ];
+  [%expect
+    {|
+    weapon:quick blade ego:distortion
+    shop weapon:quick blade ego:distortion
+    armour:robe ego:fire resistance
+    |}]
+;;
+
+(* A word no table knows matches nothing rather than binding itself as a code:
+   half the codes equal a word ("chaos", "speed", "venom"), so binding the
+   string would accidentally answer a question the vocabulary refused. The
+   parse boundary never builds this, but the constructor is public. *)
+let%expect_test "a Brand whose word is not in the vocabulary matches nothing" =
+  let db = fresh_db () in
+  run db [ Search.Term.create (brand "weapon" "quick blade" "no such brand") ];
+  [%expect
+    {|
+    seeds on 0.34.1 with quick blade with no such brand
+      [end]
+    |}];
+  (* And a base type with no brand vocabulary, which the parser refuses. *)
+  run db [ Search.Term.create (brand "jewellery" "ring" "slaying") ];
+  [%expect
+    {|
+    seeds on 0.34.1 with ring with slaying
+      [end]
+    |}];
+  Db.close db
+;;
+
+(* A count on a brand term is meaningful -- a seed can hold several of one
+   branded weapon -- and unlike [props:] it is not refused. *)
+let%expect_test "a Brand term takes a count" =
+  let db = fresh_db () in
+  run db [ Search.Term.create ~min_count:2 quick_blade_distortion ];
+  [%expect
+    {|
+    seeds on 0.34.1 with 2+ quick blade with distortion
+      [end]
+    |}];
+  Db.close db
+;;
+
 (* Query-shape equivalence.
 
    [search_seeds_sql] was rewritten from an [intersect] of [distinct] subqueries
@@ -1406,4 +1559,149 @@ let%expect_test "Name_like as non-driver survives keyset paging" =
     equal to single page: true
     |}];
   Db.close db
+;;
+
+(* {1 The count ceiling} *)
+
+let show_ceiling = function
+  | Error err -> Error.to_string_hum err
+  | Ok ceiling -> Sexp.to_string ([%sexp_of: int option] ceiling)
+;;
+
+let ceiling db criterion = show_ceiling (Db.count_ceiling db ~version criterion)
+let ceiling_sql db criterion = show_ceiling (Db.count_ceiling_sql db ~version criterion)
+
+(* Seed 4's three are on D:1, D:3 and D:6, so a per-level ceiling would say 1.
+   The shop line is what catches a ceiling built as its own predicate: seed 6's
+   counter potion must not lift the floor answer, nor its floor pair the shop
+   one. *)
+let%expect_test "the ceiling is per seed, across levels, and per position" =
+  let db = fresh_db () in
+  List.iter
+    [ "floor haste", floor haste
+    ; "shop haste", shop haste
+    ; "floor digging", floor digging
+    ; "shop digging", shop digging
+    ; "floor acquirement", floor acquirement
+    ]
+    ~f:(fun (label, criterion) -> printf "%-18s %s\n" label (ceiling db criterion));
+  [%expect
+    {|
+    floor haste        (3)
+    shop haste         (1)
+    floor digging      ()
+    shop digging       (1)
+    floor acquirement  ()
+    |}];
+  Db.close db
+;;
+
+(* A [name~] count totals a family of unrelated items, and nobody counts
+   properties. The fixture holds both, so [None] here is the policy and not an
+   absence -- which the SQL branch, consulted directly, shows. *)
+let%expect_test "name~ and props: terms have no ceiling, by policy" =
+  let db = fresh_db () in
+  List.iter
+    [ named "Throatcutter"
+    ; props [ "Conj" ]
+    ; props ~base_type:"staff" [ "Conj"; "Alch" ]
+    ]
+    ~f:(fun criterion ->
+      printf
+        "%-34s has=%b ceiling=%s sql=%s\n"
+        (Search.Criterion.to_string criterion)
+        (Search.Criterion.has_count_ceiling criterion)
+        (ceiling db criterion)
+        (ceiling_sql db criterion));
+  [%expect
+    {|
+    named like "Throatcutter"          has=false ceiling=() sql=(1)
+    an artefact with Conj              has=false ceiling=() sql=(1)
+    staff with Conj and Alch           has=false ceiling=() sql=(1)
+    |}];
+  Db.close db
+;;
+
+(* The contract the explanation rests on: at the ceiling the search finds a
+   seed, one past it finds none. Through the SQL branch, which ignores the
+   policy, so [props_seek]'s predicate is held to the search's too. *)
+let%expect_test "the ceiling is exactly the largest count the search satisfies" =
+  let db = fresh_db () in
+  let finds criterion min_count =
+    let search =
+      Search.create ~version ~terms:[ Search.Term.create ~min_count criterion ] ()
+    in
+    let matches, _ = Or_error.ok_exn (Db.search_seeds db search ~rank:Search.Rank.Seed) in
+    not (List.is_empty matches)
+  in
+  List.iter
+    [ floor haste
+    ; shop haste
+    ; floor digging
+    ; shop digging
+    ; props [ "Conj" ]
+    ; props [ "Conj"; "Alch" ]
+    ; props ~base_type:"armour" [ "rF" ]
+    ; Search.Criterion.Item
+        ({ base_type = "weapon"; sub_type = "long sword" }, Search.Criterion.Floor)
+    ]
+    ~f:(fun criterion ->
+      match Or_error.ok_exn (Db.count_ceiling_sql db ~version criterion) with
+      | None ->
+        printf
+          "%-30s none, finds 1: %b\n"
+          (Search.Criterion.to_string criterion)
+          (finds criterion 1)
+      | Some n ->
+        printf
+          "%-30s %d, finds %d: %b, finds %d: %b\n"
+          (Search.Criterion.to_string criterion)
+          n
+          n
+          (finds criterion n)
+          (n + 1)
+          (finds criterion (n + 1)));
+  [%expect
+    {|
+    potion of haste                3, finds 3: true, finds 4: false
+    potion of haste in a shop      1, finds 1: true, finds 2: false
+    wand of digging                none, finds 1: false
+    wand of digging in a shop      1, finds 1: true, finds 2: false
+    an artefact with Conj          1, finds 1: true, finds 2: false
+    an artefact with Conj and Alch 1, finds 1: true, finds 2: false
+    armour with rF                 1, finds 1: true, finds 2: false
+    long sword                     1, finds 1: true, finds 2: false
+    |}];
+  Db.close db
+;;
+
+let%expect_test "the ceiling term is the one counted term, and only one" =
+  let term ?min_count c = Search.Term.create ?min_count c in
+  List.iter
+    [ "no count", [ term (floor haste) ]
+    ; "one count", [ term ~min_count:4 (floor haste); term (shop digging) ]
+    ; "two counts", [ term ~min_count:4 (floor haste); term ~min_count:2 (shop digging) ]
+    ; "name~ count", [ term ~min_count:2 (named "Throatcutter") ]
+    ; "props: count", [ term ~min_count:2 (props [ "Conj"; "Alch" ]) ]
+    ; ( "name~ count beside a count"
+      , [ term ~min_count:2 (named "Throatcutter"); term ~min_count:4 (floor haste) ] )
+    ]
+    ~f:(fun (label, terms) ->
+      let search = Search.create ~version ~terms () in
+      printf
+        "%-27s %s\n"
+        label
+        (Option.value_map
+           (Search.ceiling_term search)
+           ~default:"-"
+           ~f:Search.Term.to_string));
+  [%expect
+    {|
+    no count                    -
+    one count                   4+ potion of haste
+    two counts                  -
+    name~ count                 -
+    props: count                -
+    name~ count beside a count  -
+    |}]
 ;;

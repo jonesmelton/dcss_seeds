@@ -116,6 +116,29 @@ let bench db ~version ~limit ~depth ~runs query =
       deep)
 ;;
 
+let ceiling db ~version ~runs query =
+  List.iter
+    (Or_error.ok_exn (Seed_web.Params.terms_of_strings [ query ]))
+    ~f:(fun (term : Search.Term.t) ->
+      let time f =
+        let results = List.init runs ~f:(fun _ -> timed f) in
+        let shown =
+          match fst (List.hd_exn results) with
+          | Error e -> "FAIL " ^ String.prefix (Error.to_string_hum e) 40
+          | Ok None -> "declined"
+          | Ok (Some None) -> "none"
+          | Ok (Some (Some n)) -> Int.to_string n
+        in
+        sprintf "%7.3fs %8s" (median (List.map results ~f:snd)) shown
+      in
+      printf
+        "%-40s | store %s | sql %s\n%!"
+        (Search.Criterion.to_string term.criterion)
+        (time (fun () -> Db.count_ceiling_store db ~version term.criterion))
+        (time (fun () ->
+           Db.count_ceiling_sql db ~version term.criterion |> Or_error.map ~f:Option.some)))
+;;
+
 let command =
   Command.basic
     ~summary:"Time the store and the SQL path on first and deep pages"
@@ -137,13 +160,23 @@ let command =
        flag "-depth" (optional_with_default 20 int) ~doc:"N deep page (default 20)"
      and runs =
        flag "-runs" (optional_with_default 3 int) ~doc:"N runs per timing (default 3)"
+     and ceilings =
+       flag
+         "-ceiling"
+         no_arg
+         ~doc:" time Db.count_ceiling's store and SQL branches per term instead"
      in
      fun () ->
        let queries = if List.is_empty queries then default_queries else queries in
        Db.with_db db_path ~f:(fun db ->
          if not (Db.search_index_is_current db ~version)
          then eprintf "warning: store not current; every store timing will decline\n%!";
-         List.iter queries ~f:(bench db ~version ~limit ~depth ~runs)))
+         List.iter
+           queries
+           ~f:
+             (if ceilings
+              then ceiling db ~version ~runs
+              else bench db ~version ~limit ~depth ~runs)))
 ;;
 
 let () = Command_unix.run command

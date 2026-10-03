@@ -403,3 +403,130 @@ let%expect_test "rescore: sharding changes peak memory, not scores" =
     shards=7: identical
     |}]
 ;;
+
+(* Seed 9 is a reader's: three haste on D:3 like seed 2, and a parchment of
+   Apportation on D:1 that no sample seed holds, so its book term exercises the
+   surprise fallback. *)
+let submitted_levels ~seed =
+  List.init 8 ~f:(fun i ->
+    let level = sprintf "D:%d" (i + 1) in
+    match level with
+    | "D:1" ->
+      book_level_named
+        ~seed
+        ~version:"0.34.1"
+        ~level
+        ~name:"parchment of Apportation"
+        ~sub_type:"parchment of Apportation"
+    | "D:3" -> haste_level ~seed ~version:"0.34.1" ~level ~n:3
+    | level -> empty_level ~seed ~version:"0.34.1" ~level)
+;;
+
+let write_requested db lines =
+  let records =
+    List.map lines ~f:(fun line -> Reader.parse_line line |> Or_error.ok_exn)
+  in
+  ignore (Db.write_batch ~requested:true db records : Db.Counts.t)
+;;
+
+let rescore_all db =
+  Db.recompute_surprise db ~version ~cap:8;
+  Db.rescore db ~version ~cap:8
+;;
+
+let%expect_test "a submitted seed is scored but does not move the population" =
+  let db = setup () in
+  write_requested db (submitted_levels ~seed:"9");
+  rescore_all db;
+  show
+    db
+    "select s_sub.val, sp.count, printf('%.6f', sp.tail_p) from surprise sp join strings \
+     s_sub on s_sub.id = sp.sub_type_id order by s_sub.val, sp.count";
+  [%expect
+    {|
+    #early-spells|0|1.000000
+    haste|1|0.666667
+    haste|3|0.333333
+    |}];
+  show db "select band, printf('%.4f', min_score) from heat_bands order by band";
+  [%expect
+    {|
+    0|0.0000
+    1|5.2827
+    2|12.5244
+    3|12.5244
+    |}];
+  show db "select cap, seeds from heat_cohorts";
+  [%expect {| 8|3 |}];
+  show db "select seed, printf('%.4f', score), band from seed_scores order by seed";
+  [%expect
+    {|
+    1|5.2827|1
+    2|12.5244|2
+    3|0.0000|0
+    9|12.5244|2
+    |}];
+  Db.close db
+;;
+
+(* Seeds 5 and 6 give the sample one and two early spells, so each count has
+   its own tail; seed 9 reaching D:15 with Blink on D:10 is the second spell
+   the cap filter has to leave out at cap 8. *)
+let%expect_test "a seed scored alone gets what rescore would give it" =
+  let db = setup () in
+  write
+    db
+    (List.init 8 ~f:(fun i ->
+       let level = sprintf "D:%d" (i + 1) in
+       if String.equal level "D:1"
+       then
+         book_level_named
+           ~seed:"5"
+           ~version:"0.34.1"
+           ~level
+           ~name:"parchment of Apportation"
+           ~sub_type:"parchment of Apportation"
+       else empty_level ~seed:"5" ~version:"0.34.1" ~level));
+  write
+    db
+    (List.init 8 ~f:(fun i ->
+       let level = sprintf "D:%d" (i + 1) in
+       match level with
+       | "D:1" | "D:2" ->
+         let spell = if String.equal level "D:1" then "Apportation" else "Blink" in
+         book_level_named
+           ~seed:"6"
+           ~version:"0.34.1"
+           ~level
+           ~name:("parchment of " ^ spell)
+           ~sub_type:("parchment of " ^ spell)
+       | level -> empty_level ~seed:"6" ~version:"0.34.1" ~level));
+  printf
+    !"before any rescore: %{sexp: int list}\n"
+    (Db.score_seed db ~version ~seed:"1" |> Or_error.ok_exn);
+  rescore_all db;
+  write_requested
+    db
+    (List.map (swamp4_two_spells ~seed:"9") ~f:(fun line ->
+       if String.is_substring line ~substring:{|(level "D:3")|}
+       then haste_level ~seed:"9" ~version:"0.34.1" ~level:"D:3" ~n:3
+       else line));
+  printf
+    !"scored at caps: %{sexp: int list}\n"
+    (Db.score_seed db ~version ~seed:"9" |> Or_error.ok_exn);
+  let alone =
+    Db.query db "select printf('%.6f', score), band from seed_scores where seed = '9'"
+  in
+  rescore_all db;
+  let together =
+    Db.query db "select printf('%.6f', score), band from seed_scores where seed = '9'"
+  in
+  printf !"alone %{sexp: string list}, in a rescore %{sexp: string list}\n" alone together;
+  [%expect
+    {|
+    before any rescore: ()
+    scored at caps: (8)
+    alone (23.123243|2), in a rescore (23.123243|2)
+    |}];
+  Db.close db
+;;

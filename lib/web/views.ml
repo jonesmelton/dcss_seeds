@@ -22,6 +22,8 @@ let version_path version =
   "/" ^ Dream.to_percent_encoded (Query.Version.to_string version)
 ;;
 
+let community_path version = version_path version ^ "/community"
+
 let seed_href ~version ~seed =
   sprintf "%s/seed/%s" (version_path version) (Dream.to_percent_encoded seed)
 ;;
@@ -114,7 +116,28 @@ let tile_of path =
 let tile feat = tile_of (Option.bind feat ~f:Tile.of_feat)
 let entry_tile e = tile_of (Tile.of_entry e)
 
-let seed_list ~version ~(page : Query.Page.t) summaries =
+let seed_list ?(community = false) ~more ~version ~(page : Query.Page.t) summaries =
+  (* The community garden is the same table over a different seed set, so it
+     keeps this function and changes only where "more" points and what the
+     caption claims the set is.
+
+     The trailing slash is on the front page's base path because its route is
+     [/:version/] and the garden's is [/:version/community]. A slash before the
+     query string belongs to the path, so the two cannot share one spelling:
+     [/community/?limit=50] matched no route and 404'd (2026-10-02). *)
+  let base_path =
+    if community then community_path version else version_path version ^ "/"
+  in
+  let source =
+    if community
+    then "Seeds flagged as interesting by other players, in no particular order."
+    else "A random sample of seeds from this build."
+  in
+  let empty =
+    if community
+    then "No seeds have been marked good on this build yet."
+    else "No seeds for this build yet."
+  in
   (* Em dash, not empty: every seed has a Temple; blank would read as "none". *)
   let unknown = span ~a:[ a_class [ "unknown" ] ] [ txt "—" ] in
   (* Four-tick gauge plus band word. Total match so a new band is a compile
@@ -194,13 +217,11 @@ let seed_list ~version ~(page : Query.Page.t) summaries =
   in
   (* Not rel=next: re-samples, not an ordered set. *)
   let next =
-    if List.is_empty summaries
+    if not more
     then []
     else
       [ p
-          [ a
-              ~a:[ a_href (sprintf "%s/?limit=%d" (version_path version) page.limit) ]
-              [ txt "More →" ]
+          [ a ~a:[ a_href (sprintf "%s?limit=%d" base_path page.limit) ] [ txt "More →" ]
           ]
       ]
   in
@@ -223,7 +244,7 @@ let seed_list ~version ~(page : Query.Page.t) summaries =
   in
   [ jump ]
   @ (if List.is_empty summaries
-     then [ p [ txt "No seeds for this build yet." ] ]
+     then [ p [ txt empty ] ]
      else
        [ div
            ~a:[ a_class [ "table-scroll"; "table-scroll--wide" ] ]
@@ -231,33 +252,25 @@ let seed_list ~version ~(page : Query.Page.t) summaries =
                ~a:[ a_class [ "seed-list" ] ]
                ~caption:
                  (caption
-                    [ help_note
-                        ~label:"How to read this table"
-                        [ p
-                            [ txt
-                                "A random sample of seeds from this build. Use search to \
-                                 find seeds by what they contain."
-                            ]
-                        ; p
-                            [ txt "Every column covers "
-                            ; level_name "D:1"
-                            ; txt " to "
-                            ; level_name "D:8"
-                            ; txt
-                                ". Heat roughly ranks a seed against the others at that \
-                                 depth. A dash means none found by "
-                            ; level_name "D:8"
-                            ; txt "."
-                            ]
-                        ; p
-                            [ txt "In "
-                            ; em [ txt "others" ]
-                            ; txt
-                                ", \"acq\" is a scroll of acquirement and \"xp\" a \
-                                 potion of experience, both on the floor."
-                            ]
-                        ]
-                    ])
+                    (if community
+                     then [ p [ txt source ] ]
+                     else
+                       [ help_note
+                           ~label:"Info"
+                           [ p [ txt source ]
+                           ; p
+                               [ txt "Every column covers "
+                               ; level_name "D:1"
+                               ; txt " to "
+                               ; level_name "D:8"
+                               ; txt
+                                   ". Heat roughly ranks a seed against the others at \
+                                    that depth. A dash means none found by "
+                               ; level_name "D:8"
+                               ; txt "."
+                               ]
+                           ]
+                       ]))
                ~thead:
                  (thead
                     [ tr
@@ -721,12 +734,162 @@ let refusal ~seed ~version message =
   ]
 ;;
 
-let seed_detail ~version ~seed ~job ~position ~csrf ~filling levels =
+let submission_id = "submission"
+
+let submission_polling ~seed ~version =
+  [ Tyxml_htmx.hx_get (seed_href ~version ~seed ^ "/submission")
+  ; Tyxml_htmx.hx_trigger "every 5s"
+  ; Tyxml_htmx.hx_swap_raw "outerHTML"
+  ]
+;;
+
+let submit_button ~version ~seed ~csrf =
+  form
+    ~a:
+      [ a_method `Post
+      ; a_action (seed_href ~version ~seed ^ "/submit")
+      ; a_class [ "deepen" ]
+      ; Tyxml_htmx.hx_post (seed_href ~version ~seed ^ "/submit")
+      ; Tyxml_htmx.hx_target ("#" ^ submission_id)
+      ; Tyxml_htmx.hx_swap_raw "outerHTML"
+      ]
+    [ input ~a:[ a_input_type `Hidden; a_name "dream.csrf"; a_value csrf ] ()
+    ; button ~a:[ a_button_type `Submit ] [ txt "Generate this seed" ]
+    ]
+;;
+
+(* The levels decide readiness, not the job row, for the reason [depth_note]
+   gives: ingest can commit and the generator die before it records the
+   finish. *)
+let submission_note ~version ~seed ~job ~position ~csrf ~paused =
+  let wrap ?(extra = []) children =
+    [ div ~a:(a_id submission_id :: a_class [ "depth-note" ] :: extra) children ]
+  in
+  match (job : Job.t option) with
+  | Some job when Job.State.equal (Job.state job) Job.State.Running ->
+    wrap
+      ~extra:(submission_polling ~seed ~version)
+      [ p
+          [ txt "Generating to "
+          ; level_name Fill_depth.deep_cap
+          ; txt ". This takes a few seconds."
+          ]
+      ]
+  | Some job when Job.State.equal (Job.state job) Job.State.Queued ->
+    wrap
+      ~extra:(submission_polling ~seed ~version)
+      [ p ([ txt "Queued to generate." ] @ queue_place position) ]
+  | Some { error = Some error; _ } ->
+    wrap [ p ~a:[ a_class [ "failed" ] ] [ txt "Generating it failed: "; txt error ] ]
+  | Some _ ->
+    wrap [ p ~a:[ a_class [ "failed" ] ] [ txt "Generating it produced no levels." ] ]
+  | None ->
+    (match paused, csrf with
+     | true, _ | _, None ->
+       wrap
+         [ p [ txt "Generating seeds is paused while new seeds are added to this build." ]
+         ]
+     | false, Some csrf ->
+       wrap
+         [ p
+             [ txt "Generating it searches it to "
+             ; level_name Fill_depth.deep_cap
+             ; txt
+                 ". The seed is kept and later becomes searchable, but it is not part of \
+                  the random sample the listings and heat are drawn from."
+             ]
+         ; submit_button ~version ~seed ~csrf
+         ])
+;;
+
+let submission_refusal ~seed ~version message =
+  [ div
+      ~a:[ a_id submission_id; a_class [ "depth-note" ] ]
+      [ p [ txt message ]
+      ; p [ a ~a:[ a_href (seed_href ~version ~seed) ] [ txt "Reload this seed" ] ]
+      ]
+  ]
+;;
+
+let seed_missing ~version ~seed ~job ~position ~csrf ~paused =
+  [ h1 [ span ~a:[ a_class [ "seed" ] ] [ txt seed ]; copy_seed seed ]
+  ; p [ a ~a:[ a_href (version_path version ^ "/") ] [ txt "← All seeds" ] ]
+  ; p [ txt "This seed has not been generated yet." ]
+  ; div
+      ~a:[ a_aria "live" [ "polite" ] ]
+      (submission_note ~version ~seed ~job ~position ~csrf ~paused)
+  ]
+;;
+
+let seed_path = seed_href
+let flag_region_id = "flag"
+
+type flag =
+  { csrf : string
+  ; from : string option
+  ; flagged : bool
+  }
+
+let flag_region children =
+  [ div
+      ~a:[ a_id flag_region_id; a_class [ "seed-flag" ]; a_aria "live" [ "polite" ] ]
+      children
+  ]
+;;
+
+let flag_href ~version ~seed = seed_href ~version ~seed ^ "/flag"
+
+let flag_form ~version ~seed { csrf; from; flagged = _ } =
+  [ form
+      ~a:
+        [ a_method `Post
+        ; a_action (flag_href ~version ~seed)
+        ; Tyxml_htmx.hx_post (flag_href ~version ~seed)
+        ; Tyxml_htmx.hx_target ("#" ^ flag_region_id)
+        ; Tyxml_htmx.hx_swap_raw "innerHTML"
+        ]
+      ((input ~a:[ a_input_type `Hidden; a_name "dream.csrf"; a_value csrf ] ()
+        ::
+        (match from with
+         | Some from ->
+           [ input ~a:[ a_input_type `Hidden; a_name "from"; a_value from ] () ]
+         | None -> []))
+       @ [ button
+             ~a:[ a_button_type `Submit ]
+             [ txt "Mark as an interesting seed (private feedback)" ]
+         ])
+  ]
+;;
+
+let flag_button ~version ~seed flag =
+  flag_region
+    (if flag.flagged
+     then [ p [ txt "Noted — thanks" ] ]
+     else flag_form ~version ~seed flag)
+;;
+
+let flag_noted =
+  [ p
+      ~a:[ a_tabindex (-1); Unsafe.string_attrib "autofocus" "autofocus" ]
+      [ txt "Noted — thanks" ]
+  ]
+;;
+
+let flag_refusal ~version ~seed message =
+  [ p [ txt message ]
+  ; p [ a ~a:[ a_href (seed_href ~version ~seed) ] [ txt "Reload this seed" ] ]
+  ]
+;;
+
+let seed_detail ~version ~seed ~job ~position ~csrf ~flag ~filling levels =
   let depth = Fill_depth.of_levels (List.map levels ~f:(fun (l : Level.t) -> l.level)) in
   [ h1 [ span ~a:[ a_class [ "seed" ] ] [ txt seed ]; copy_seed seed ]
   ; p [ a ~a:[ a_href (version_path version ^ "/") ] [ txt "← All seeds" ] ]
   ]
   @ depth_note ~version ~seed ~depth ~job ~position ~csrf ~filling
+  @ (match flag with
+     | Some flag -> flag_button ~version ~seed flag
+     | None -> [])
   @ [ h2 [ txt "Branches and portals" ] ]
   @ branch_index (Floor.entrances levels)
   @ [ h2 [ txt "Exclusive draws" ]
@@ -833,7 +996,7 @@ let search_form
      it. Unkeyed and valueless, both halves bite: the new blank box soft-matches
      the old blank the reader just typed the submitted term into. *)
   (* Placeheld only on an empty form, where it is the sole box. The suggestion
-     list is ~580 options the browser filters by prefix, so a reader who has
+     list is ~640 options the browser filters by prefix, so a reader who has
      typed nothing sees its head (armour:...) and no properties at all -- those
      sit past option 400 and cannot be reached without already knowing the word.
      The placeholder is the only surface that shows before the first keystroke,
@@ -932,15 +1095,19 @@ let search_form
   in
   let action = version_path version ^ "/search" in
   (* A datalist filters by prefix, so a reader who has not typed the word
-     "props" never sees a property: they sit past option 400 of ~580 behind the
+     "props" never sees a property: they sit past option 400 of ~640 behind the
      item pairs. Labelling them says what the entry is at the moment it is
      finally visible, which is the only help a datalist can give -- the ordering
      is the browser's, not ours. *)
   let suggestion_option v =
     let label =
-      match String.chop_prefix v ~prefix:"props:" with
-      | Some prop -> [ a_label (sprintf "%s — artefact property" prop) ]
-      | None -> []
+      match String.chop_prefix v ~prefix:"props:", String.lsplit2 v ~on:' ' with
+      | Some prop, _ -> [ a_label (sprintf "%s — artefact property" prop) ]
+      | None, Some (base_type, rest) ->
+        (match String.chop_prefix rest ~prefix:"ego:" with
+         | Some word -> [ a_label (sprintf "%s — %s brand" word base_type) ]
+         | None -> [])
+      | None, None -> []
     in
     option ~a:(a_value v :: label) (txt "")
   in
@@ -984,36 +1151,9 @@ let search_form
       :: suggestion_list)
      @ summary
      @ [ ul ~a:[ a_class [ "terms" ] ] (existing @ [ blank ])
-         (* Grouped by what each form asks rather than run together as one list.
-            Seven comma-separated examples read as undifferentiated grey and put
-            the newest form last, where it looks like an afterthought; naming the
-            three kinds makes properties a peer of items rather than a footnote.
-            Ligatures are off here -- see the note on name~. *)
        ; p
            ~a:[ a_id "search-help"; a_class [ "subtitle" ] ]
-           [ txt "One term per box. Terms search the floor unless prefixed with "
-           ; code [ txt "shop " ]
-           ; txt ". Items: "
-           ; code [ txt "potion:haste" ]
-           ; txt ", "
-           ; code [ txt "3x potion:haste" ]
-           ; txt ", "
-           ; code [ txt "shop potion:haste" ]
-           ; txt ". Artefact properties: "
-           ; code [ txt "props:Conj" ]
-           ; txt ", "
-           ; code [ txt "staff props:Conj,Alch" ]
-           ; txt ". Also "
-           ; code [ txt "scroll:acquirement" ]
-           ; txt " and "
-           ; code [ txt "name~Throatcutter" ]
-           ; txt ". A bare word like "
-           ; code [ txt "haste" ]
-           ; txt " is looked up for you. "
-           ; a
-               ~a:[ a_href (search_help_path version) ]
-               [ txt "Full syntax, with examples" ]
-           ]
+           [ a ~a:[ a_href (search_help_path version) ] [ txt "Search guide" ] ]
        ; div
            ~a:[ a_class [ "search-controls" ] ]
            [ button ~a:[ a_button_type `Submit ] [ txt "Search" ]
@@ -1057,11 +1197,94 @@ let hit_line (h : Search.Match.hit) =
 (* A term-less search is an unasked question, not a request for the corpus.
    Rendering the first page of it lists seeds in string order -- 1, 10, 100 --
    which answers nothing and costs an unfiltered scan to produce. *)
-let search_prompt = [ p [ txt "Enter a term to find seeds. Results match every term." ] ]
+let example_search ~version terms =
+  let query =
+    List.map terms ~f:(fun t -> sprintf "has=%s" (Dream.to_percent_encoded t))
+    |> String.concat ~sep:"&"
+  in
+  version_path version ^ "/search?" ^ query
+;;
 
-let search_results ~(search : Search.t) ~rank ~more matches =
+let canned_searches =
+  [ [ "name~robe of Vines"; "props:Regen" ]
+  ; [ "name~Singing Sword"; "name~shield of the Gong" ]
+  ; [ "name~gauntlets of War"; "weapon:quick blade" ]
+  ; [ "name~heavy crossbow \"Sniper\""; "name~hat of Pondering" ]
+  ; [ "name~Elemental Staff"; "3x scroll:acquirement" ]
+  ; [ "name~crystal ball of Wucad Mu"; "book:parchment of Chain Lightning" ]
+  ; [ "name~scales of the Dragon King"; "jewellery:ring of wizardry" ]
+  ; [ "name~lance \"Wyrmbane\""; "armour:golden dragon scales" ]
+  ; [ "name~autumn katana"; "armour:crystal plate armour" ]
+  ; [ "name~demon trident \"Rift\""; "armour:crystal plate armour" ]
+  ; [ "name~Storm Queen's Shield"; "name~Throatcutter" ]
+  ; [ "jewellery:amulet of wildshape"; "talisman:storm talisman" ]
+  ; [ "name~storm bow"; "armour ego:archery" ]
+  ; [ "name~amulet of Vitality"
+    ; "talisman:granite talisman"
+    ; "jewellery:ring of slaying"
+    ]
+  ; [ "talisman:talisman of death"; "name~scythe of Curses" ]
+  ; [ "weapon:demon whip"; "armour:golden dragon scales" ]
+  ; [ "weapon:demon trident"; "armour:shadow dragon scales" ]
+  ; [ "weapon:triple sword"; "armour:storm dragon scales" ]
+  ; [ "weapon:eveningstar"; "armour:crystal plate armour" ]
+  ]
+;;
+
+let canned_shown = 3
+let canned_rng = lazy (Random.State.make_self_init ())
+let canned_order = ref (fun l -> List.permute l ~random_state:(force canned_rng))
+let canned_picks () = List.take (!canned_order canned_searches) canned_shown
+
+let search_prompt ~version =
+  [ p [ txt "Enter a term to find seeds. Results match every term." ]
+  ; p [ txt "Or try one of these:" ]
+  ; ul
+      ~a:[ a_class [ "offers" ] ]
+      (List.map (canned_picks ()) ~f:(fun terms ->
+         li
+           [ a
+               ~a:[ a_href (example_search ~version terms) ]
+               [ txt (String.concat terms ~sep:" + ") ]
+           ]))
+  ]
+;;
+
+(* The link is the term alone, at the ceiling, which makes it non-empty by
+   construction; the reader's other terms could empty it again. [Seed] rank
+   because it is the one rank [Rank.sort_limit] cannot refuse. *)
+let ceiling_note ~(search : Search.t) ((term : Search.Term.t), most) =
+  let reachable = { term with min_count = most } in
+  let target = { search with terms = [ reachable ]; page = Query.Page.first } in
+  p
+    ~a:[ a_class [ "ceiling" ] ]
+    [ strong [ txt "The count is out of reach on its own." ]
+    ; txt
+        (sprintf
+           " For %s, the most any seed in this build holds is "
+           (Search.Criterion.to_string term.criterion))
+    ; strong [ span ~a:[ a_class [ "num" ] ] [ txt (Int.to_string most) ] ]
+    ; txt ", short of the "
+    ; span ~a:[ a_class [ "num" ] ] [ txt (Int.to_string term.min_count) ]
+    ; txt " asked for. "
+    ; a
+        ~a:
+          [ a_href
+              (sprintf
+                 "%s/search?%s"
+                 (version_path search.version)
+                 (search_query_string target ~rank:Search.Rank.Seed ~after:None))
+          ]
+        [ txt "Search for "
+        ; code [ txt (Search.Term.to_query_string reachable) ]
+        ; txt " →"
+        ]
+    ]
+;;
+
+let search_results ?ceiling ~(search : Search.t) ~rank ~more matches =
   if Search.is_empty search
-  then search_prompt
+  then search_prompt ~version:search.version
   else (
     let heading = h2 [ txt (Search.to_string search) ] in
     let row (m : Search.Match.t) =
@@ -1069,7 +1292,12 @@ let search_results ~(search : Search.t) ~rank ~more matches =
         [ td
             [ a
                 ~a:
-                  [ a_href (seed_href ~version:search.version ~seed:m.seed)
+                  [ a_href
+                      (sprintf
+                         "%s?from=%s"
+                         (seed_href ~version:search.version ~seed:m.seed)
+                         (Dream.to_percent_encoded
+                            (search_query_string search ~rank ~after:None)))
                   ; a_class [ "seed" ]
                   ]
                 [ txt m.seed ]
@@ -1127,7 +1355,9 @@ let search_results ~(search : Search.t) ~rank ~more matches =
     ([ heading ] @ tally)
     @
     if List.is_empty matches
-    then [ p [ txt "No matching seeds." ] ]
+    then
+      p [ txt "No matching seeds." ]
+      :: Option.value_map ceiling ~default:[] ~f:(fun c -> [ ceiling_note ~search c ])
     else
       [ div
           ~a:[ a_class [ "table-scroll"; "table-scroll--wide" ] ]
@@ -1161,7 +1391,15 @@ let resolution_note resolved =
       ])
 ;;
 
-let search_page ?(resolved = []) ~(search : Search.t) ~suggestions ~rank ~more matches =
+let search_page
+      ?(resolved = [])
+      ?ceiling
+      ~(search : Search.t)
+      ~suggestions
+      ~rank
+      ~more
+      matches
+  =
   [ search_form
       ~version:search.version
       ~rank
@@ -1170,16 +1408,23 @@ let search_page ?(resolved = []) ~(search : Search.t) ~suggestions ~rank ~more m
       ()
   ; div
       ~a:[ a_id results_id ]
-      (resolution_note resolved @ search_results ~search ~rank ~more matches)
+      (resolution_note resolved @ search_results ?ceiling ~search ~rank ~more matches)
   ]
 ;;
 
 (* Swap targets results; form travels out of band so scripted readers get new
    term boxes. *)
-let search_fragment ?(resolved = []) ~(search : Search.t) ~suggestions ~rank ~more matches
+let search_fragment
+      ?(resolved = [])
+      ?ceiling
+      ~(search : Search.t)
+      ~suggestions
+      ~rank
+      ~more
+      matches
   =
   resolution_note resolved
-  @ search_results ~search ~rank ~more matches
+  @ search_results ?ceiling ~search ~rank ~more matches
   @ [ search_form
         ~oob:true
         ~version:search.version
@@ -1208,14 +1453,6 @@ let search_rejected_fragment ~version ~rank ~boxes ~problems ~suggestions =
 (* Examples are live links, not inert syntax. Version-scoped: a parchment
    example is real on 0.34.1 and empty on 0.33.1. *)
 
-let example_search ~version terms =
-  let query =
-    List.map terms ~f:(fun t -> sprintf "has=%s" (Dream.to_percent_encoded t))
-    |> String.concat ~sep:"&"
-  in
-  version_path version ^ "/search?" ^ query
-;;
-
 (* Term is the link; a second column of identical link text is noise. *)
 let example_row ~version (terms, gloss) =
   tr
@@ -1231,211 +1468,120 @@ let example_row ~version (terms, gloss) =
 let example_table ~version rows =
   div
     ~a:[ a_class [ "table-scroll" ] ]
-    [ table
-        ~thead:(thead [ tr [ th_col "term"; th_col "what it asks" ] ])
-        (List.map rows ~f:(example_row ~version))
-    ]
+    [ table (List.map rows ~f:(example_row ~version)) ]
 ;;
 
 let search_help ~version =
   let examples = example_table ~version in
-  [ h1 [ txt "How to search" ]
+  [ h1 [ txt "Search syntax" ]
   ; p
       ~a:[ a_class [ "subtitle" ] ]
-      [ txt
-          "One term per box; results match every term. Each example below links to its \
-           search on this build."
-      ]
-  ; h2 [ txt "Items" ]
-  ; p
-      [ txt "Items are searched by type, written base:sub, as in "
-      ; code [ txt "potion:haste" ]
-      ; txt "."
-      ]
+      [ txt "Seeds where every term matches. Click examples for live search." ]
+  ; h2 [ txt "Type" ]
+  ; p [ code [ txt "base:sub" ] ]
   ; examples
-      [ [ "potion:haste" ], "a potion of haste"
-      ; [ "wand:digging" ], "a wand of digging"
-      ; [ "scroll:acquirement" ], "a scroll of acquirement"
-      ; ( [ "weapon:executioner's axe" ]
-        , "an executioner's axe; spaces and apostrophes are fine" )
+      [ [ "weapon:demon trident" ], ""
+      ; [ "armour:golden dragon scales" ], ""
+      ; [ "jewellery:ring of wizardry" ], ""
+      ; [ "book:parchment of Chain Lightning" ], ""
+      ; [ "talisman:storm talisman" ], ""
       ]
-  ; h2 [ txt "A bare word" ]
+  ; h2 [ txt "Bare word" ]
   ; p
       [ txt
-          "A word without a colon is matched against item types and properties. If \
-           exactly one matches, that is what gets searched, and the page says so. \
-           Otherwise you get a list of candidates, or a "
-      ; code [ txt "name~" ]
-      ; txt " search to try."
+          "Resolves to a type or property if exactly one matches; otherwise lists \
+           candidates."
       ]
   ; examples
-      [ [ "haste" ], "read as potion:haste"
-      ; [ "flight" ], "read as jewellery:ring of flight"
-      ; [ "Shatter" ], "read as the parchment of Shatter"
-      ; [ "conj" ], "read as props:Conj"
-      ; [ "axe" ], "several axes to choose from"
-      ; [ "Throatcutter" ], "offers name~Throatcutter"
+      [ [ "haste" ], "potion:haste"
+      ; [ "flight" ], "jewellery:ring of flight"
+      ; [ "conj" ], "props:Conj"
+      ; [ "axe" ], "candidates"
       ]
-  ; p
-      [ txt "Counts and "
-      ; code [ txt "shop " ]
-      ; txt " still work: "
-      ; code [ txt "3x shop haste" ]
-      ; txt " becomes "
-      ; code [ txt "3x shop potion:haste" ]
-      ; txt "."
-      ]
-  ; h2 [ txt "Floor and shop" ]
-  ; p
-      [ txt "Terms search floor items by default. Put "
-      ; code [ txt "shop " ]
-      ; txt " at the start of a term to search shop stock instead. "
-      ; code [ txt "floor " ]
-      ; txt " is also accepted and changes nothing."
-      ]
-  ; examples
-      [ [ "potion:haste" ], "on the floor"
-      ; [ "shop potion:haste" ], "in a shop"
-      ; [ "floor potion:haste" ], "same as potion:haste"
-      ; [ "shop staff props:Conj" ], "a staff enhancing Conjurations, in a shop"
-      ]
-  ; p
-      [ txt
-          "A term can't search both, and counts don't combine across them: two potions \
-           of haste on the floor and one in a shop match neither "
-      ; code [ txt "3x potion:haste" ]
-      ; txt " nor "
-      ; code [ txt "3x shop potion:haste" ]
-      ; txt ". "
-      ; code [ txt "name~" ]
-      ; txt " only searches the floor."
-      ]
-  ; h2 [ txt "How many" ]
-  ; p
-      [ txt "Put "
-      ; code [ txt "3x " ]
-      ; txt " in front of an item or "
-      ; code [ txt "name~" ]
-      ; txt " term to require at least that many, counted across the whole seed. "
-      ; code [ txt "props:" ]
-      ; txt " terms don't take a count."
-      ]
-  ; examples
-      [ [ "3x potion:haste" ], "at least three potions of haste on the floor"
-      ; [ "3x shop potion:haste" ], "at least three in shops"
-      ]
-  ; h2 [ txt "Artefact names" ]
+  ; h2 [ txt "Name" ]
   ; p
       [ code [ txt "name~" ]
-      ; txt
-          " matches part of an artefact's name, at least three characters. Use it for \
-           unrands; for anything else, search the type."
+      ; txt " substring of an artefact's name, three characters or more."
       ]
   ; examples
-      [ [ "name~Throatcutter" ], "Throatcutter, on the floor"
-      ; [ "name~demon trident \"Rift\"" ], "the demon trident Rift"
-      ; [ "name~hat of the Alchemist" ], "the hat of the Alchemist"
-      ; [ "name~+9 hand cannon" ], "an artefact hand cannon at +9"
-      ; [ "name~+20" ], "any artefact at exactly +20, whatever it is"
+      [ [ "name~Throatcutter" ], ""
+      ; [ "name~demon blade \"Leech\"" ], ""
+      ; [ "name~+9 hand cannon" ], ""
+      ; [ "name~+20" ], "anything at +20 enchantment"
       ]
-  ; help_note
-      ~label:"Why a result shows one item and a different count"
-      [ p
-          [ txt
-              "When a term matches several different items, the result shows the \
-               shallowest one and the total. "
-          ; code [ txt "props:rF" ]
-          ; txt " might show "
-          ; code [ txt "+2 ring mail of Gudd {rElec rF+} on D:2 · 2 artefacts" ]
-          ; txt
-              ": that ring mail and one other artefact. A term matching one kind of item \
-               shows a count instead ("
-          ; code [ txt "potion of haste ×3" ]
-          ; txt ")."
-          ]
-      ]
-  ; help_note
-      ~label:"Why name~ does not find a potion of haste"
-      [ p
-          [ code [ txt "name~" ]
-          ; txt " only matches artefact names. For anything else, search the type: "
-          ; code [ txt "potion:haste" ]
-          ; txt ", not "
-          ; code [ txt "name~potion of haste" ]
-          ; txt "."
-          ]
-      ]
-  ; h2 [ txt "Artefact properties" ]
+  ; h2 [ txt "Properties" ]
   ; p
       [ code [ txt "props:" ]
       ; txt
-          " searches artefact properties. List several with commas; they must all be on \
-           the same artefact. Put a base type in front to restrict the item: "
-      ; code [ txt "staff props:Conj,Alch" ]
-      ; txt ". Property names are case-insensitive."
+          " comma-separated, all on one artefact. Optional base type before it. \
+           Case-insensitive. "
+      ; code [ txt "rF" ]
+      ; txt " matches "
+      ; code [ txt "rF+" ]
+      ; txt " and "
+      ; code [ txt "rF++" ]
+      ; txt ", not "
+      ; code [ txt "rF-" ]
+      ; txt ". No counts. Drawbacks are not searchable except "
+      ; code [ txt "*Rage" ]
+      ; txt ", because it's hilarious."
       ]
   ; examples
-      [ [ "props:Alch" ], "any artefact enhancing Alchemy"
-      ; [ "props:rF,rC" ], "one artefact with rF and rC"
-      ; [ "props:rF,rC,rN" ], "one artefact with rF, rC and rN"
-      ; [ "staff props:Alch" ], "a staff enhancing Alchemy"
-      ; [ "staff props:Conj,Alch" ], "a staff enhancing Conjurations and Alchemy"
-      ; [ "staff props:Conj,Alch,rC" ], "the same, plus rC (rare)"
-      ; [ "weapon props:rF" ], "a weapon with rF"
-      ; [ "weapon props:rF,rC" ], "a weapon with rF and rC"
-      ; [ "weapon props:rF,rC,Will" ], "a weapon with rF, rC and Will"
+      [ [ "props:Alch" ], ""
+      ; [ "props:rN,Fly" ], ""
+      ; [ "staff props:Necro,Earth" ], ""
+      ; [ "weapon props:Str,Dex,Int" ], ""
       ]
-  ; help_note
-      ~label:"Why some combinations return nothing"
-      [ p
-          [ txt "Some properties never roll on some item types. School enhancers ("
-          ; code [ txt "Conj" ]
-          ; txt ", "
-          ; code [ txt "Alch" ]
-          ; txt ", "
-          ; code [ txt "Fire" ]
-          ; txt ") never appear on weapons, and "
-          ; code [ txt "Slay" ]
-          ; txt " never appears on staves."
-          ]
-      ]
-  ; help_note
-      ~label:"Property strength and drawbacks"
-      [ p
-          [ code [ txt "props:rF" ]
-          ; txt " matches "
-          ; code [ txt "rF+" ]
-          ; txt " and "
-          ; code [ txt "rF++" ]
-          ; txt ", but not "
-          ; code [ txt "rF-" ]
-          ; txt "."
-          ]
-      ; p
-          [ txt "Drawbacks are not searchable at all. "
-          ; code [ txt "*Rage" ]
-          ; txt " is the exception and can be searched, because it's hilarious."
-          ]
-      ]
-  ; h2 [ txt "Combining terms" ]
+  ; h2 [ txt "Brand" ]
   ; p
-      [ txt
-          "Every box is another condition the seed must meet. There is no OR, you just \
-           have to search twice and compare."
+      [ code [ txt "ego:" ]
+      ; txt " or "
+      ; code [ txt "brand:" ]
+      ; txt " after a weapon or armour type, or "
+      ; code [ txt "of <brand>" ]
+      ; txt " in the name. One brand per term, on the same item. Type optional after "
+      ; code [ txt "weapon:" ]
+      ; txt " and "
+      ; code [ txt "armour:" ]
+      ; txt ". Not for jewellery (search the ring or amulet) or artefact brands ("
+      ; code [ txt "name~" ]
+      ; txt ")."
       ]
   ; examples
-      [ ( [ "scroll:acquirement"; "armour:crystal plate armour" ]
-        , "a scroll of acquirement and a crystal plate armour, on one seed" )
-      ; ( [ "shop wand:digging"; "scroll:acquirement" ]
-        , "a wand of digging in a shop, and a scroll of acquirement on the floor" )
+      [ [ "weapon:demon whip ego:pain" ], ""
+      ; [ "weapon:great sword of holy wrath" ], ""
+      ; [ "weapon:speed" ], ""
+      ; [ "armour brand:fire resistance" ], ""
+      ; [ "shop weapon:war axe ego:flaming" ], ""
+      ]
+  ; h2 [ txt "Shop" ]
+  ; p
+      [ txt "Floor by default. "
+      ; code [ txt "shop " ]
+      ; txt " prefix for shop stock. A term is one or the other; "
+      ; code [ txt "name~" ]
+      ; txt " is floor only."
+      ]
+  ; examples [ [ "potion:might" ], "floor"; [ "shop potion:might" ], "shop" ]
+  ; h2 [ txt "Count" ]
+  ; p
+      [ code [ txt "Nx " ]
+      ; txt " before an item or "
+      ; code [ txt "name~" ]
+      ; txt " term. Summed across the seed's floors. Not on "
+      ; code [ txt "props:" ]
+      ; txt "."
+      ]
+  ; examples [ [ "3x potion:resistance" ], ""; [ "3x shop scroll:enchant armour" ], "" ]
+  ; h2 [ txt "Combining" ]
+  ; p [ txt "AND only." ]
+  ; examples
+      [ [ "book:Necronomicon"; "staff:necromancy" ], ""
+      ; [ "shop wand:digging"; "scroll:acquirement" ], ""
       ]
   ; h2 [ txt "Depth" ]
-  ; p
-      [ txt "Most seeds are only searched to "
-      ; level_name "D:8"
-      ; txt ", so a seed that doesn't match may still have the item deeper down."
-      ]
-  ; p [ a ~a:[ a_href (version_path version ^ "/search") ] [ txt "← Back to search" ] ]
+  ; p [ txt "Seeds are read to "; level_name "D:8"; txt " unless deepened." ]
+  ; p [ a ~a:[ a_href (version_path version ^ "/search") ] [ txt "← Search" ] ]
   ]
 ;;
 
@@ -1468,6 +1614,8 @@ let about ~version =
           "The same seed generates a different dungeon on each version of crawl, so \
            every page here is for the one build named at the top."
       ]
+  ; h2 [ txt "Cookies" ]
+  ; p [ txt "Seed pages set one cookie, to limit heavy requests. There is no tracking." ]
   ; h2 [ txt "How much of the seed space is here" ]
   ; p
       [ txt

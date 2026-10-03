@@ -22,8 +22,17 @@ let serving db ~now versions =
   Or_error.ok_exn (Db.heartbeat db ~generator_id:"g1" ~versions ~now)
 ;;
 
-let enqueue db ~seed ?(cap = 10) ?(now = 1000) version =
-  Db.enqueue db ~version ~seed ~cap ~servable_since:(now - 60) |> Or_error.ok_exn
+let enqueue
+      db
+      ~seed
+      ?(cap = 10)
+      ?(now = 1000)
+      ?(origin = Job.Origin.Deepen)
+      ?daily
+      version
+  =
+  Db.enqueue db ~version ~seed ~origin ~cap ?daily ~servable_since:(now - 60)
+  |> Or_error.ok_exn
 ;;
 
 let show_outcome = function
@@ -31,6 +40,7 @@ let show_outcome = function
   | `Already_queued (j : Job.t) ->
     printf "already queued (%s)\n" (Job.State.to_string (Job.state j))
   | `Queue_full -> print_endline "queue full"
+  | `Daily_cap -> print_endline "daily cap"
   | `No_generator -> print_endline "no generator"
   | `Filling -> print_endline "filling"
   | `Failed err -> printf "failed (%s)\n" (Error.to_string_hum err)
@@ -643,4 +653,69 @@ let%expect_test "the same request is queued once no fill holds the lock" =
       [%expect {| queued |}];
       printf "job: %s\n" (state db ~seed:"300" v);
       [%expect {| job: queued |}])
+;;
+
+(* {1 Submissions}
+
+   One queue, two origins. Deepens are claimed first so a flood of submissions
+   cannot starve them, and each origin is capped on its own so neither can fill
+   the other's room. *)
+
+let submit db ~seed ?cap ?daily version =
+  enqueue db ~seed ?cap ?daily ~origin:Job.Origin.Submit version
+;;
+
+let%expect_test "deepens are claimed ahead of older submissions" =
+  let path, db = corpus () in
+  serving db ~now:1000 [ v ];
+  ignore (submit db ~seed:"1" v : _);
+  ignore (submit db ~seed:"2" v : _);
+  ignore (enqueue db ~seed:"3" v : _);
+  List.iter [ "1"; "2"; "3" ] ~f:(fun seed ->
+    printf "%s ahead:%s\n" seed (position db ~seed v));
+  List.iter [ 1001; 1002; 1003 ] ~f:(fun now ->
+    match Or_error.ok_exn (Db.claim_job db ~version:v ~now) with
+    | None -> print_endline "nothing"
+    | Some (j : Job.t) ->
+      printf "claimed %s (%s)\n" j.seed (Job.Origin.to_string j.origin));
+  [%expect
+    {|
+    1 ahead:1
+    2 ahead:2
+    3 ahead:0
+    claimed 3 (deepen)
+    claimed 1 (submit)
+    claimed 2 (submit)
+    |}];
+  cleanup path [ db ]
+;;
+
+let%expect_test "each origin is capped on its own, and submissions per day" =
+  let path, db = corpus () in
+  serving db ~now:1000 [ v ];
+  show_outcome (submit db ~seed:"1" ~cap:1 v);
+  show_outcome (submit db ~seed:"2" ~cap:1 v);
+  show_outcome (enqueue db ~seed:"3" ~cap:1 v);
+  [%expect
+    {|
+    queued
+    queue full
+    queued
+    |}];
+  (* Finished submissions still count against the day: the cap is how much of
+     the generator is given away, not how much is waiting. *)
+  ignore (Or_error.ok_exn (Db.claim_job db ~version:v ~now:1001) : Job.t option);
+  ignore (Or_error.ok_exn (Db.claim_job db ~version:v ~now:1002) : Job.t option);
+  ignore (finish db ~seed:"1" ~started_at:1002 ~now:1003 v : _);
+  show_outcome (submit db ~seed:"4" ~daily:(1, 0) v);
+  show_outcome (submit db ~seed:"4" ~daily:(2, 0) v);
+  (* Yesterday's submissions are not today's. *)
+  show_outcome (submit db ~seed:"5" ~daily:(1, Int.max_value) v);
+  [%expect
+    {|
+    daily cap
+    queued
+    queued
+    |}];
+  cleanup path [ db ]
 ;;

@@ -23,6 +23,7 @@
    (>= 5.5.0))
   core
   core_unix
+  digestif
   ppx_jane
   parsexp
   sexplib

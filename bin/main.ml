@@ -48,6 +48,9 @@ let () =
   (match Sys.getenv_opt "SEED_DISABLE_DEEPEN" with
    | Some ("1" | "true" | "yes") -> Seed_web.Params.deepen_disabled := true
    | _ -> ());
+  (match Sys.getenv_opt "SEED_DISABLE_SUBMIT" with
+   | Some ("1" | "true" | "yes") -> Seed_web.Params.submit_disabled := true
+   | _ -> ());
   if not (Sys.file_exists db_path)
   then (
     Printf.eprintf
@@ -69,8 +72,8 @@ let () =
   Lwt_preemptive.set_bounds (0, pool_size);
   let pool = Seed_corpus.Pool.create db_path ~size:pool_size in
   (* Sessions exist for one reason: Dream's CSRF token is bound to one, and the
-     deepen button is the app's only mutation. Cookie-backed, so there is no
-     server-side store.
+     deepen and flag buttons are the app's only mutations. Cookie-backed, so
+     there is no server-side store.
 
      Without SEED_SECRET Dream generates one per process, which invalidates
      every open page's token on restart. The secret stays global while
@@ -81,7 +84,7 @@ let () =
     | Some secret when secret <> "" -> [ Dream.set_secret secret ]
     | _ -> []
   in
-  (* [Dream.cookie_sessions] is scoped onto the three seed routes in the router,
+  (* [Dream.cookie_sessions] is scoped onto the seed routes in the router,
      not applied here -- global, it Set-Cookie'd every response including the
      ones no session is ever read from. *)
   (* [head_as_get] wraps the header middleware rather than the reverse: it
@@ -89,6 +92,26 @@ let () =
      headers has to have already run when it drops the body. *)
   let middlewares =
     [ Dream.logger; Seed_web.head_as_get ] @ secret @ [ Seed_web.security_headers ]
+  in
+  (* Defaults to a file beside the corpus, never inside it; "off" withdraws
+     the button and makes its POST a 404, the way SEED_DISABLE_DEEPEN withdraws
+     deepen. The HMAC key is SEED_SECRET when set; otherwise per-process, which
+     loses dedupe across a restart -- exactly as the session cookie it hashes
+     does without a secret. *)
+  let feedback =
+    match
+      env
+        "SEED_FEEDBACK_DB"
+        ~default:(Filename.concat (Filename.dirname db_path) "feedback.db")
+    with
+    | "off" -> None
+    | path ->
+      let key =
+        match Sys.getenv_opt "SEED_SECRET" with
+        | Some secret when secret <> "" -> secret
+        | _ -> Dream.to_base64url (Dream.random 32)
+      in
+      Some (Seed_corpus.Feedback.open_ ~key path)
   in
   (* Probe the port before Dream takes it. Catching [Dream.run]'s failure is too
      late: Dream's logger has already printed the Lwt backtrace by then.
@@ -124,6 +147,7 @@ let () =
   Dream.run ~interface ~port ~error_handler:Seed_web.error_page
   @@ List.fold_right (fun m rest -> m rest) middlewares
   @@ Seed_web.router
+       ~feedback
        ~reader
        ~writer
        ~pool

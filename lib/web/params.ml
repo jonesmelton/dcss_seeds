@@ -27,6 +27,7 @@ let search_disabled = ref false
 (* Mirrors [search_disabled]: set once at process start from
    SEED_DISABLE_DEEPEN, read by every deepen call site. *)
 let deepen_disabled = ref false
+let submit_disabled = ref false
 
 (* Wall clock on the search path, not a query cancellation: sqlite3-ocaml 5.4.2
    binds neither [sqlite3_interrupt] nor a progress handler, so an expired
@@ -40,6 +41,7 @@ let search_timeout = ref 60.
    there is nothing to gain by making the client wait out the whole query
    budget for it. Set from SEED_POOL_TIMEOUT in {!Main}. *)
 let pool_timeout = ref 5.
+let ceiling_timeout = ref 5.
 
 (* "3x " is an affix on a criterion rather than a criterion of its own, so it is
    peeled off before the prefix dispatch below.
@@ -104,7 +106,19 @@ let props_of_string ?base_type ~position rest =
               "no property named %S. Separate properties with commas, as in \
                \"props:Conj,Alch\"."
               prop
-          else Or_error.errorf "no property named %S" prop
+          else (
+            (* The commonest misfire in the access log: a brand typed as a
+               property ("props:speed" and kin, 32 requests over 15 spellings,
+               access log 2026-09-12..10-01). Name the spelling rather than
+               only refusing. *)
+            match Search.Brand.canonical_any prop with
+            | Some word ->
+              Or_error.errorf
+                "%S is a brand, not a property. A brand goes after the item with ego:, \
+                 as in \"weapon:quick blade ego:%s\"."
+                prop
+                word
+            | None -> Or_error.errorf "no property named %S" prop)
         | Some canonical ->
           (* Named rather than counted: a reader who typed a drawback wants to
              know which one we will not search for, not that "one term was
@@ -116,6 +130,46 @@ let props_of_string ?base_type ~position rest =
       |> Or_error.all
     in
     return (Search.Criterion.Props { base_type; props; position })
+;;
+
+(* "weapon:quick blade ego:distortion". The item leads and the brand trails,
+   the shape "staff props:Conj" established; the item is the whole base:sub,
+   not a base type, because the criterion has to carry the item to keep the
+   brand attached to it (see [Search.Criterion.Brand]). The sub type may be
+   left off ("weapon:distortion"): the base type alone still bounds the term,
+   where a bare brand would match nearly every seed.
+
+   One brand per term. An item carries one ego, so a set has no meaning here --
+   unlike [props:], where two properties really can sit on one artefact. *)
+let brand_of_string ~position ~base_type ~sub_type word =
+  if not (List.mem Search.Brand.base_types base_type ~equal:String.equal)
+  then
+    Or_error.errorf
+      "ego: is for weapons and armour. Jewellery carries it in the item name, as in \
+       \"jewellery:ring of protection from fire\"."
+  else if String.is_empty word
+  then Or_error.errorf "ego: needs a brand, as in \"weapon:quick blade ego:distortion\""
+  else if String.mem word ','
+  then Or_error.errorf "a term takes one brand, not a list: %S" word
+  else (
+    match Search.Brand.canonical ~base_type word with
+    | Some canonical ->
+      (match Search.Brand.why_excluded ~base_type canonical with
+       | Some why ->
+         Or_error.errorf
+           "%S is %s and can't be searched. Those artefacts are found by name, as in \
+            \"name~Zephyr\"."
+           canonical
+           why
+       | None ->
+         Ok (Search.Criterion.Brand { base_type; sub_type; word = canonical; position }))
+    | None ->
+      (* A reader who typed the terse code -- "ego:distort", "ego:rF+" -- is
+         told the word rather than that no such brand exists. *)
+      (match Search.Brand.word_of_code ~base_type word with
+       | Some spelled ->
+         Or_error.errorf "no %s brand named %S. It is spelled %S." base_type word spelled
+       | None -> Or_error.errorf "no %s brand named %S" base_type word))
 ;;
 
 (* The two position words, and the one source both the prefix parse and the
@@ -169,10 +223,31 @@ let name_like ~position rest =
       Ok (Search.Criterion.Name_like (rest, Search.Criterion.Floor)))
 ;;
 
+(* "quick blade of distortion" -> ("quick blade", "distortion"): the first
+   " of " with a word on each side. For a weapon or armour sub type that is the
+   brand, never part of the type. *)
+let brand_suffix sub_type =
+  let rec go acc = function
+    | "of" :: (_ :: _ as rest) when not (List.is_empty acc) ->
+      Some (String.concat (List.rev acc) ~sep:" ", String.concat rest ~sep:" ")
+    | word :: rest -> go (word :: acc) rest
+    | [] -> None
+  in
+  go [] (String.split sub_type ~on:' ')
+;;
+
 (* The body every term reaches once its position is peeled off. [position] is
    [None] for a term that named none; everywhere else it settles to [Floor]. *)
 let criterion_at ~position s =
   let at = Option.value position ~default:Search.Criterion.Floor in
+  (* Players use brand and ego interchangeably. *)
+  let s =
+    if String.is_prefix s ~prefix:"brand:"
+    then "ego:" ^ String.drop_prefix s (String.length "brand:")
+    else
+      String.substr_replace_first s ~pattern:" brand:" ~with_:" ego:"
+      |> String.substr_replace_first ~pattern:":brand:" ~with_:":ego:"
+  in
   if List.mem [ "artefact"; "artifact" ] (String.lowercase s) ~equal:String.equal
   then
     Or_error.errorf
@@ -183,11 +258,31 @@ let criterion_at ~position s =
   else if String.is_prefix s ~prefix:"name~"
   then name_like ~position (String.drop_prefix s (String.length "name~"))
   else if String.is_prefix s ~prefix:"props:"
+  then props_of_string ~position:at (String.drop_prefix s (String.length "props:"))
+  else if String.is_prefix s ~prefix:"ego:"
   then
-    props_of_string ~position:at (String.drop_prefix s (String.length "props:"))
-    (* "staff props:Conj,Alch". The base type leads rather than following a
+    Or_error.errorf
+      "ego: needs a weapon or armour in front of it, as in \"weapon ego:distortion\" or \
+       \"weapon:quick blade ego:distortion\""
+  else if String.is_substring s ~substring:" ego:"
+  then (
+    match String.substr_index s ~pattern:" ego:" with
+    | None -> Or_error.errorf "not a brand search: %S" s
+    | Some i ->
+      let left = String.strip (String.prefix s i) in
+      let word = String.strip (String.drop_prefix s (i + String.length " ego:")) in
+      (match item_type left with
+       | Ok { base_type; sub_type } ->
+         brand_of_string ~position:at ~base_type ~sub_type:(Some sub_type) word
+       | Error _ when List.mem Search.Brand.base_types left ~equal:String.equal ->
+         brand_of_string ~position:at ~base_type:left ~sub_type:None word
+       | Error _ ->
+         Or_error.errorf
+           "an ego: term takes an item, as in \"weapon:quick blade ego:distortion\", or \
+            a base type, as in \"weapon ego:distortion\"")
+      (* "staff props:Conj,Alch". The base type leads rather than following a
          fixed prefix, so it must be tried before the [<base>:<sub>] parse below,
-         which would otherwise read "staff props" as a base type. *)
+         which would otherwise read "staff props" as a base type. *))
   else if String.is_substring s ~substring:" props:"
   then (
     match String.substr_index s ~pattern:" props:" with
@@ -199,7 +294,42 @@ let criterion_at ~position s =
       then props_of_string ~position:at rest
       else props_of_string ~base_type ~position:at rest)
   else if String.mem s ':'
-  then Or_error.map (item_type s) ~f:(fun item -> Search.Criterion.Item (item, at))
+  then (
+    match item_type s with
+    (* "weapon:quick blade of distortion" is the rendered name, and the way
+       readers type a branded item (field log: "weapon:quick blade of chaos",
+       "weapon:executioner's axe of speed"). No weapon or armour sub type
+       contains " of " (checked against the corpus), so a trailing " of <word>"
+       is always the brand, never part of the type -- which is what makes this
+       a fold rather than a guess. Without it the term would parse as an item
+       whose sub type is "quick blade of distortion", match nothing, and report
+       that the build holds no such thing. *)
+    | Ok ({ base_type; sub_type } as item)
+      when List.mem Search.Brand.base_types base_type ~equal:String.equal ->
+      (match brand_suffix sub_type with
+       | Some (sub_type, word) ->
+         brand_of_string ~position:at ~base_type ~sub_type:(Some sub_type) word
+       | None when String.is_prefix sub_type ~prefix:"ego:" ->
+         brand_of_string
+           ~position:at
+           ~base_type
+           ~sub_type:None
+           (String.strip (String.drop_prefix sub_type (String.length "ego:")))
+       | None when String.equal sub_type "ego" ->
+         Or_error.errorf
+           "%s:ego would match nearly every seed. Name the brand, as in \
+            \"%s:distortion\"."
+           base_type
+           base_type
+       | None ->
+         (* "weapon:distortion": a brand word where the sub type goes. No
+            weapon or armour sub type is also a brand word (checked against
+            the corpus), so the reading cannot shadow an item. *)
+         (match Search.Brand.canonical ~base_type sub_type with
+          | Some _ -> brand_of_string ~position:at ~base_type ~sub_type:None sub_type
+          | None -> Ok (Search.Criterion.Item (item, at))))
+    | Ok item -> Ok (Search.Criterion.Item (item, at))
+    | Error _ as err -> err)
   else if String.is_empty s
   then
     Or_error.errorf "empty search term"
@@ -476,7 +606,22 @@ let box ~vocabulary typed =
                 |> readings
                 |> valid
               with
-              | [] -> rejected ?offer:name_offer (sprintf "Nothing matches %S." word)
+              | [] ->
+                (* A brand word alone is not a term: the item it brands is
+                   required, so say where the word goes rather than only that
+                   nothing matched. The words a reader is likeliest to type
+                   alone are exactly these -- "distortion", "speed" -- since
+                   the rendered name shows them. *)
+                rejected
+                  ?offer:name_offer
+                  (match Search.Brand.canonical_any word with
+                   | Some brand ->
+                     sprintf
+                       "Nothing matches %S. A brand goes after the item, as in \
+                        \"weapon:quick blade ego:%s\"."
+                       word
+                       brand
+                   | None -> sprintf "Nothing matches %S." word)
               | near ->
                 rejected
                   ~offer:(offering "Did you mean:" (List.map near ~f:fst))
@@ -547,6 +692,13 @@ let empty_search_line (search : Search.t) =
           (String.concat ~sep:"," props)
       | Feature feature -> "feature " ^ feature
       | Unique unique -> "unique " ^ unique
+      | Search.Criterion.Brand { base_type; sub_type; word; position = at } ->
+        sprintf
+          "brand %s%s%s ego:%s"
+          (position at)
+          base_type
+          (Option.value_map sub_type ~default:"" ~f:(fun s -> ":" ^ s))
+          word
     in
     String.escaped (count ^ body)
   in

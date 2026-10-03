@@ -110,6 +110,18 @@ update seed_ordinals
 |}
 ;;
 
+(* In the build's transaction, so a submission landing after it stays
+   pending: it has no ordinal and no postings. *)
+let mark_indexed_sql =
+  {|
+update seed_fills
+   set indexed_at = unixepoch()
+ where version_id = ?
+   and origin = 'submit'
+   and indexed_at is null
+|}
+;;
+
 let seed_ordinals_sql =
   {|
   select seed
@@ -274,6 +286,35 @@ group by p.prop_id
     position
 ;;
 
+(* One list per (base type, ego code), floor and shop. The base types are the
+   two whose ego is orthogonal to the sub type: jewellery's ego is its sub
+   type, so a list for it would never be read. Keyed by the code the corpus
+   stores, which is why a criterion's word resolves to the build's spelling
+   before it reaches a key. *)
+let brand_lists_sql position =
+  sprintf
+    {|
+  select e.base_type_id
+       , e.ego_id
+       , e.seed
+       , min(ld.depth)
+       , sum(coalesce(e.quantity, 1))
+    from entries e
+    join level_depth ld
+      on ld.level_id = e.level_id
+   where e.version_id = ?
+     and e.base_type_id in (select id
+                              from strings
+                             where val in ('weapon', 'armour'))
+     and e.ego_id is not null
+     and e.cost %s
+group by e.base_type_id
+       , e.ego_id
+       , e.seed
+|}
+    position
+;;
+
 let list_queries ~version_id =
   let version = [ int_bind version_id ] in
   let prop = [ int_bind version_id; int_bind Search.Prop.min_value ] in
@@ -283,6 +324,8 @@ let list_queries ~version_id =
   ; Criterion_id.Kind.Floor_prop, bare_prop_lists_sql "is null", prop
   ; Criterion_id.Kind.Shop_prop, typed_prop_lists_sql "is not null", prop
   ; Criterion_id.Kind.Shop_prop, bare_prop_lists_sql "is not null", prop
+  ; Criterion_id.Kind.Floor_brand, brand_lists_sql "is null", version
+  ; Criterion_id.Kind.Shop_brand, brand_lists_sql "is not null", version
   ]
 ;;
 
@@ -425,6 +468,7 @@ let build db ~version =
              ; int_bind version_id
              ]);
       ok (exec_bound db record_built_depth_sql ~bind:[ int_bind version_id ]);
+      ok (exec_bound db mark_indexed_sql ~bind:[ int_bind version_id ]);
       ok (fill_level_depth db ~version_id);
       ok (exec_bound db drop_postings_sql ~bind:[ int_bind version_id ]);
       ok (exec_bound db drop_criteria_sql ~bind:[ int_bind version_id ]);
@@ -774,7 +818,8 @@ let declines ~ids =
     | Search.Criterion.Item _
     | Search.Criterion.Feature _
     | Search.Criterion.Unique _
-    | Search.Criterion.Props _ -> List.is_empty (Criterion_id.keys id))
+    | Search.Criterion.Props _
+    | Search.Criterion.Brand _ -> List.is_empty (Criterion_id.keys id))
 ;;
 
 (* {1 [name~] as a posting list} *)
@@ -858,7 +903,8 @@ let resolve_names db ~version_id ~criterion_where ~cap ids =
        | Search.Criterion.Item _
        | Search.Criterion.Feature _
        | Search.Criterion.Unique _
-       | Search.Criterion.Props _ -> Ok (Some ((term, Catalog id) :: acc))))
+       | Search.Criterion.Props _
+       | Search.Criterion.Brand _ -> Ok (Some ((term, Catalog id) :: acc))))
   |> Or_error.map ~f:(Option.map ~f:List.rev)
 ;;
 
@@ -880,16 +926,17 @@ let max_overlay_cohort = 5_000
 
 let cohort_sql =
   {|
-  select f.seed
-       , o.ord
-    from seed_fills f
-    left join seed_ordinals o
-      on o.version_id = f.version_id
-     and o.seed = f.seed
-   where f.version_id = ?
-     and f.depth > ?
-     and (o.built_depth is null or f.depth > o.built_depth)
-   limit ?
+   select f.seed
+        , o.ord
+     from seed_fills f
+left join seed_ordinals o
+       on o.version_id = f.version_id
+      and o.seed = f.seed
+    where f.version_id = ?
+      and f.depth > ?
+      and (o.built_depth is null or f.depth > o.built_depth)
+      and not (f.origin = 'submit' and f.indexed_at is null)
+    limit ?
 |}
 ;;
 
@@ -1012,6 +1059,41 @@ let catalog_item_pairs db ~version =
     |> Or_error.map ~f:Option.some)
 ;;
 
+let catalog_brands_sql =
+  sprintf
+    {|
+  select distinct b.val
+       , g.val
+    from search_criteria c
+    join strings b
+      on b.id = c.a_id
+    join strings g
+      on g.id = c.b_id
+   where c.version_id = ?
+     and c.kind in (%d, %d)
+|}
+    (Criterion_id.Kind.to_int Floor_brand)
+    (Criterion_id.Kind.to_int Shop_brand)
+;;
+
+let catalog_brands db ~version =
+  if not (is_current db ~version)
+  then Ok None
+  else (
+    let%bind.Or_error version_id = version_id_of db ~version in
+    Sql.with_stmt
+      db
+      catalog_brands_sql
+      ~bind:[ int_bind version_id ]
+      ~f:(fun stmt ->
+        Sql.fold_rows stmt ~init:[] ~f:(fun acc row ->
+          let open Or_error.Let_syntax in
+          let%bind base_type = Sql.required row 0 ~field:"base_type" in
+          let%map code = Sql.required row 1 ~field:"ego" in
+          (base_type, code) :: acc))
+    |> Or_error.map ~f:Option.some)
+;;
+
 let resolve_overlay ~cohort ~terms ~cohort_matches =
   match cohort with
   | [] -> Ok no_overlay
@@ -1048,75 +1130,79 @@ let stored_candidates db { resolved; driver } ~dirty ~start ~init ~f =
       | Some depth -> f acc ~ord:posting.ord ~depth ~driver_posting:posting))
 ;;
 
-let ranked_page db ~store ~overlay ~version_id ~(search : Search.t) ~verify_depth =
+let ranked_page
+      db
+      ~(store : store)
+      ~overlay
+      ~version_id
+      ~(search : Search.t)
+      ~verify_depth
+  =
   let open Or_error.Let_syntax in
   let%bind matched =
-    match store with
-    | None -> Ok []
-    | Some ({ resolved; driver; _ } as store) ->
-      (match List.filter resolved ~f:(fun r -> not r.exact) with
-       | [] ->
-         stored_candidates
-           db
-           store
-           ~dirty:overlay.dirty
-           ~start:0
-           ~init:[]
-           ~f:(fun acc ~ord ~depth ~driver_posting:_ ->
-             Ok ((depth, ord) :: acc, `Continue))
-       | narrowing ->
-         let exact = List.filter resolved ~f:(fun r -> r.exact) in
-         let narrowing_terms = List.map narrowing ~f:(fun r -> r.term) in
-         (* [Db.overlay_batch]'s own budget for a SQL [in]-list, not
-            [Posting.block_size] -- an unrelated codec constant that happened
-            to be close. *)
-         let batch_size = 500 in
-         let pending = ref [] in
-         let pending_n = ref 0 in
-         let acc = ref [] in
-         let flush () =
-           let batch = List.rev !pending in
-           pending := [];
-           pending_n := 0;
-           if List.is_empty batch
-           then Ok ()
-           else (
-             let ords = List.map batch ~f:fst in
-             let%bind seeds = seeds_of_ords db ~version_id ords in
-             let%map depths =
-               verify_depth ~seeds ~terms:narrowing_terms
-               |> Or_error.map ~f:String.Map.of_alist_exn
-             in
-             List.iter (List.zip_exn batch seeds) ~f:(fun ((ord, exact_depth), seed) ->
-               match Map.find depths seed with
-               | None -> ()
-               | Some narrowing_depth ->
-                 acc := (Int.min exact_depth narrowing_depth, ord) :: !acc))
-         in
-         let%bind () =
-           stored_candidates
-             db
-             store
-             ~dirty:overlay.dirty
-             ~start:0
-             ~init:()
-             ~f:(fun () ~ord ~depth:_ ~driver_posting ->
-               let%bind exact_depth =
-                 candidate_depth db exact ~driver ~driver_posting ~ord
-               in
-               match exact_depth with
-               | None -> Ok ((), `Continue)
-               | Some exact_depth ->
-                 pending := (ord, exact_depth) :: !pending;
-                 incr pending_n;
-                 if !pending_n < batch_size
-                 then Ok ((), `Continue)
-                 else (
-                   let%map () = flush () in
-                   (), `Continue))
-         in
-         let%map () = flush () in
-         !acc)
+    let { resolved; driver; _ } = store in
+    match List.filter resolved ~f:(fun r -> not r.exact) with
+    | [] ->
+      stored_candidates
+        db
+        store
+        ~dirty:overlay.dirty
+        ~start:0
+        ~init:[]
+        ~f:(fun acc ~ord ~depth ~driver_posting:_ -> Ok ((depth, ord) :: acc, `Continue))
+    | narrowing ->
+      let exact = List.filter resolved ~f:(fun r -> r.exact) in
+      let narrowing_terms = List.map narrowing ~f:(fun r -> r.term) in
+      (* [Db.overlay_batch]'s own budget for a SQL [in]-list, not
+          [Posting.block_size] -- an unrelated codec constant that happened
+          to be close. *)
+      let batch_size = 500 in
+      let pending = ref [] in
+      let pending_n = ref 0 in
+      let acc = ref [] in
+      let flush () =
+        let batch = List.rev !pending in
+        pending := [];
+        pending_n := 0;
+        if List.is_empty batch
+        then Ok ()
+        else (
+          let ords = List.map batch ~f:fst in
+          let%bind seeds = seeds_of_ords db ~version_id ords in
+          let%map depths =
+            verify_depth ~seeds ~terms:narrowing_terms
+            |> Or_error.map ~f:String.Map.of_alist_exn
+          in
+          List.iter (List.zip_exn batch seeds) ~f:(fun ((ord, exact_depth), seed) ->
+            match Map.find depths seed with
+            | None -> ()
+            | Some narrowing_depth ->
+              acc := (Int.min exact_depth narrowing_depth, ord) :: !acc))
+      in
+      let%bind () =
+        stored_candidates
+          db
+          store
+          ~dirty:overlay.dirty
+          ~start:0
+          ~init:()
+          ~f:(fun () ~ord ~depth:_ ~driver_posting ->
+            let%bind exact_depth =
+              candidate_depth db exact ~driver ~driver_posting ~ord
+            in
+            match exact_depth with
+            | None -> Ok ((), `Continue)
+            | Some exact_depth ->
+              pending := (ord, exact_depth) :: !pending;
+              incr pending_n;
+              if !pending_n < batch_size
+              then Ok ((), `Continue)
+              else (
+                let%map () = flush () in
+                (), `Continue))
+      in
+      let%map () = flush () in
+      !acc
   in
   let sorted =
     List.map overlay.matched ~f:(fun (ord, _, depth) -> depth, ord) @ matched
@@ -1145,13 +1231,11 @@ let ranked_page db ~store ~overlay ~version_id ~(search : Search.t) ~verify_dept
    batch's candidates come off the driver ascending, so draining per candidate
    at flush time is enough to keep the whole page ordinal-sorted -- which is
    what a keyset cursor over it needs to neither repeat nor skip. *)
-let seed_page db ~store ~overlay ~version_id ~(search : Search.t) ~start ~verify =
+let seed_page db ~(store : store) ~overlay ~version_id ~(search : Search.t) ~start ~verify
+  =
   let open Or_error.Let_syntax in
   let verify_terms =
-    match store with
-    | None -> []
-    | Some { resolved; _ } ->
-      List.filter_map resolved ~f:(fun r -> Option.some_if (not r.exact) r.term)
+    List.filter_map store.resolved ~f:(fun r -> Option.some_if (not r.exact) r.term)
   in
   let batch_size = Int.max search.page.limit 32 in
   let want = search.page.limit + 1 in
@@ -1190,23 +1274,20 @@ let seed_page db ~store ~overlay ~version_id ~(search : Search.t) ~start ~verify
       keep seed)
   in
   let%bind () =
-    match store with
-    | None -> Ok ()
-    | Some store ->
-      stored_candidates
-        db
-        store
-        ~dirty:overlay.dirty
-        ~start
-        ~init:()
-        ~f:(fun () ~ord ~depth:_ ~driver_posting:_ ->
-          pending := ord :: !pending;
-          incr pending_n;
-          if !pending_n < batch_size
-          then Ok ((), `Continue)
-          else (
-            let%map () = flush () in
-            (), if !kept_n >= want then `Stop else `Continue))
+    stored_candidates
+      db
+      store
+      ~dirty:overlay.dirty
+      ~start
+      ~init:()
+      ~f:(fun () ~ord ~depth:_ ~driver_posting:_ ->
+        pending := ord :: !pending;
+        incr pending_n;
+        if !pending_n < batch_size
+        then Ok ((), `Continue)
+        else (
+          let%map () = flush () in
+          (), if !kept_n >= want then `Stop else `Continue))
   in
   let%map () = if !pending_n > 0 then flush () else Ok () in
   (* Whatever the queue still holds outranks every candidate the driver
@@ -1260,6 +1341,50 @@ let resolve_store db ~version_id terms =
     |> Option.map ~f:(fun driver -> { resolved; driver }))
 ;;
 
+let ceiling db ~version criterion ~cohort_ceiling =
+  let open Or_error.Let_syntax in
+  match Criterion_id.of_criterion ~version criterion with
+  | Criterion_id.Narrowing _ | Criterion_id.Unindexed
+  | Criterion_id.Exact ([] | _ :: _ :: _) -> Ok None
+  | Criterion_id.Exact [ key ] ->
+    if not (is_current db ~version)
+    then Ok None
+    else (
+      let%bind version_id = version_id_of db ~version in
+      match%bind load_cohort db ~version_id with
+      | None -> Ok None
+      | Some cohort ->
+        let%bind stored =
+          match%bind resolve_key db ~version_id key with
+          | None -> Ok None
+          | Some (criterion_id, card) ->
+            walk_driver
+              db
+              { source = Stored criterion_id
+              ; card
+              ; lo = Int.max_value
+              ; hi = Int.min_value
+              ; block = [||]
+              }
+              ~start:0
+              ~init:None
+              ~f:(fun acc (posting : Posting.t) ->
+                Ok
+                  ( Some
+                      (Option.value_map
+                         acc
+                         ~default:posting.count
+                         ~f:(Int.max posting.count))
+                  , `Continue ))
+        in
+        let%map deep =
+          match cohort with
+          | [] -> Ok None
+          | cohort -> cohort_ceiling ~seeds:(List.map cohort ~f:snd)
+        in
+        Some (Option.merge stored deep ~f:Int.max))
+;;
+
 let page
       ?(name_cap = max_name_seeds)
       db
@@ -1273,7 +1398,7 @@ let page
   let open Or_error.Let_syntax in
   let ids =
     List.map search.terms ~f:(fun term ->
-      term, Criterion_id.of_criterion term.Search.Term.criterion)
+      term, Criterion_id.of_criterion ~version:search.version term.Search.Term.criterion)
   in
   if
     List.is_empty search.terms
@@ -1288,36 +1413,48 @@ let page
       (match%bind resolve_names db ~version_id ~criterion_where ~cap:name_cap ids with
        | None -> Ok None
        | Some terms ->
-         let%bind overlay = resolve_overlay ~cohort ~terms:search.terms ~cohort_matches in
-         let%bind store = resolve_store db ~version_id terms in
-         (* A key with no catalog row is a true answer about the *build*, which is
-         no longer a true answer about the corpus: a deepened level can mint a
-         criterion the build never saw. So the store contributing nothing is a
-         page of overlay, not a page of nothing. *)
-         (match (rank : Search.Rank.t) with
-          | Search.Rank.Shallowest ->
-            let%map page =
-              ranked_page db ~store ~overlay ~version_id ~search ~verify_depth
+         (* A key with no catalog row declines the search, and the SQL path
+            decides. Silence is ambiguous -- it means "this build holds none of
+            the criterion", which is a true answer only when the store's
+            vocabulary is this binary's; a store that predates a criterion kind
+            (a brand search against a store built before brand lists existed)
+            or that predates a spelling would otherwise answer a page of
+            nothing -- or worse, a page of only the deep cohort -- over a
+            corpus that holds the thing. The deepened-seed case is covered too:
+            SQL searches the whole corpus, so the answer is never narrower than
+            the overlay's. The cost of the decline is bounded: a missing key
+            under a current store means the term matches nothing, and SQL
+            confirms that with an empty seek. *)
+         (match%bind resolve_store db ~version_id terms with
+          | None -> Ok None
+          | Some store ->
+            let%bind overlay =
+              resolve_overlay ~cohort ~terms:search.terms ~cohort_matches
             in
-            Some page
-          | Search.Rank.Seed ->
-            let%bind start =
-              match search.page.after with
-              | None -> Ok (Some 0)
-              | Some seed ->
-                let%map ord =
-                  scalar_int
-                    db
-                    ordinal_of_seed_sql
-                    ~bind:[ int_bind version_id; Sqlite3.Data.TEXT seed ]
-                in
-                Option.map ord ~f:(fun ord -> ord + 1)
-            in
-            (match start with
-             | None -> Ok None
-             | Some start ->
+            (match (rank : Search.Rank.t) with
+             | Search.Rank.Shallowest ->
                let%map page =
-                 seed_page db ~store ~overlay ~version_id ~search ~start ~verify
+                 ranked_page db ~store ~overlay ~version_id ~search ~verify_depth
                in
-               Some page))))
+               Some page
+             | Search.Rank.Seed ->
+               let%bind start =
+                 match search.page.after with
+                 | None -> Ok (Some 0)
+                 | Some seed ->
+                   let%map ord =
+                     scalar_int
+                       db
+                       ordinal_of_seed_sql
+                       ~bind:[ int_bind version_id; Sqlite3.Data.TEXT seed ]
+                   in
+                   Option.map ord ~f:(fun ord -> ord + 1)
+               in
+               (match start with
+                | None -> Ok None
+                | Some start ->
+                  let%map page =
+                    seed_page db ~store ~overlay ~version_id ~search ~start ~verify
+                  in
+                  Some page)))))
 ;;

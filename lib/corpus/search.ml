@@ -155,6 +155,210 @@ module Prop = struct
   let min_value = 1
 end
 
+module Brand = struct
+  (* An item's ego is the identity of its enchantment: a weapon's brand or an
+     armour's ego, "quick blade of distortion" or "robe of fire resistance".
+     Crawl stores a terse code ("distort", "rF+") no reader types, so the
+     searchable vocabulary is the *display word* -- what the rendered name
+     shows, and therefore what a reader has in mind when they ask. A bare code
+     would also be hostile to type: mixed case, pluses, a space in "rC+ rF+".
+
+     The item is not optional, unlike [Props]' base type: the criterion has to
+     carry it so the brand stays attached to one object (two terms leak; see
+     [Criterion.Brand]). Nor is there a general brand search -- 9,971 of 10,000
+     seeds hold *some* ego'd weapon or armour (10k, 0.34.1, D:8, local,
+     2026-10-01, fossil ticket 6e121f4c44), so the unqualified form answers
+     nothing anyone wants, and the parser refuses one by name. One brand per
+     term: an item carries exactly one ego, so a set is not a meaning here. *)
+
+  (* The base types whose ego is orthogonal to the sub type. Jewellery's ego
+     is already spelled by its sub type ("ring of protection from fire"), so
+     an ego term there would answer the item term's own question. *)
+  let base_types = [ "weapon"; "armour" ]
+
+  (* word, code -- the code is crawl's terse string, spelled as 0.34.1 stores
+     it. The pairs mirror [Display_name.Ego], whose words are what a rendered
+     name shows; the expect test tying the two together is what forces a rekey
+     here when crawl renames one. *)
+  let weapon_codes =
+    [ "antimagic", "antimagic"
+    ; "chaos", "chaos"
+    ; "concussion", "concuss"
+    ; "devious", "devious"
+    ; "distortion", "distort"
+    ; "draining", "drain"
+    ; "electrocution", "elec"
+    ; "entangling", "entangle"
+    ; "flaming", "flame"
+    ; "freezing", "freeze"
+    ; "heavy", "heavy"
+    ; "holy wrath", "holy"
+    ; "pain", "pain"
+    ; "protection", "protect"
+    ; "rebuke", "rebuke"
+    ; "spectral", "spect"
+    ; "speed", "speed"
+    ; "sundering", "sunder"
+    ; "valour", "valour"
+    ; "vampiric", "vamp"
+    ; "venom", "venom"
+    ; (* Never on a non-artefact weapon; the words come from crawl's verbose
+       names, since [Display_name.Ego] has no word for them. *)
+      "penetration", "penet"
+    ; "reaping", "reap"
+    ; "acid", "acid"
+    ; "foul flame", "foul flame"
+    ]
+  ;;
+
+  let armour_codes =
+    [ "air", "Air"
+    ; "archery", "Archery"
+    ; "attunement", "Attunement"
+    ; "command", "Command"
+    ; "death", "Death"
+    ; "dexterity", "Dex+3"
+    ; "earth", "Earth"
+    ; "energy", "Energy"
+    ; "fire", "Fire"
+    ; "flying", "Fly"
+    ; "glass", "Glass"
+    ; "guile", "Guile"
+    ; "harm", "Harm"
+    ; "hurling", "Hurl"
+    ; "ice", "Ice"
+    ; "infusion", "Infuse"
+    ; "intelligence", "Int+3"
+    ; "light", "Light"
+    ; "mayhem", "Mayhem"
+    ; "mesmerism", "Mesmerism"
+    ; "parrying", "Parrying"
+    ; "ponderousness", "Ponderous"
+    ; "pyromania", "Pyromania"
+    ; "rampaging", "Rampage"
+    ; "reflection", "Reflect"
+    ; "repulsion", "Repulsion"
+    ; "resonance", "Resonance"
+    ; "see invisible", "SInv"
+    ; "shadows", "Shadows"
+    ; "sniping", "Snipe"
+    ; "stardust", "Stardust"
+    ; "stealth", "Stlth+"
+    ; "strength", "Str+3"
+    ; "willpower", "Will+"
+    ; "cold resistance", "rC+"
+    ; "resistance", "rC+ rF+"
+    ; "corrosion resistance", "rCorr"
+    ; "fire resistance", "rF+"
+    ; "positive energy", "rN+"
+    ; "poison resistance", "rPois"
+    ; "invisibility", "+Inv"
+    ; "protection", "AC+3"
+    ; (* Randart-only, as on weapons. *)
+      "spirit shield", "Spirit"
+    ; "the Archmagi", "Archmagi"
+    ]
+  ;;
+
+  (* Crawl capitalised eleven armour ego codes in 0.34.1 (docs/plans/
+     crawl-renames.md); the same brand on an earlier build is stored under the
+     lowercase spelling. The word a reader types is the same either way, which
+     is the whole point of keying on words: resolution is per version, not per
+     spelling. The one version-aware thing in this module, and the first
+     consumer of the release order Rename will generalise. *)
+  let capitalised_since = Or_error.ok_exn (Query.Version.of_string "0.34.1")
+
+  let recoded =
+    [ "Harm"
+    ; "Guile"
+    ; "Mayhem"
+    ; "Infuse"
+    ; "Light"
+    ; "Hurl"
+    ; "Repulsion"
+    ; "Reflect"
+    ; "Ponderous"
+    ; "Rampage"
+    ; "Shadows"
+    ]
+  ;;
+
+  (* [] for a base type that carries no brand vocabulary: the criterion is
+     public, so one can be constructed for jewellery, and it should match
+     nothing rather than silently resolving through the weapon table. *)
+  let codes base_type =
+    if String.equal base_type "weapon"
+    then weapon_codes
+    else if String.equal base_type "armour"
+    then armour_codes
+    else []
+  ;;
+
+  (* Case-insensitive, as [Prop.canonical] is: no reader should have to
+     reproduce crawl's exact capitalisation from memory. Returns the canonical
+     word, which is what the criterion stores and echoes back. *)
+  let canonical ~base_type word =
+    List.find_map (codes base_type) ~f:(fun (w, _) ->
+      Option.some_if (String.Caseless.equal w word) w)
+  ;;
+
+  (* Any base type's word: for messages, where naming the thing matters more
+     than which of the two tables it lives in. *)
+  let canonical_any word =
+    List.find_map [ "weapon"; "armour" ] ~f:(fun base_type -> canonical ~base_type word)
+  ;;
+
+  (* The inverse, code to word -- for the reader who typed the code ("ego:distort")
+     and should be told the word rather than a bare "no brand named". *)
+  let word_of_code ~base_type code =
+    List.find_map (codes base_type) ~f:(fun (w, c) ->
+      Option.some_if (String.equal c code) w)
+  ;;
+
+  let words ~base_type = List.map (codes base_type) ~f:fst
+
+  (* Codes that never roll on a non-artefact item: crawl generates them only
+     through [ARTP_BRAND] (crawl-ref source, shopping.cc calls penetration
+     "Unrand-only", artefact.cc sets reaping), and every row carrying one is an
+     artefact (10k, 0.34.1, D:8, local, 2026-10-01), so no rendered name a
+     reader could type carries one. *)
+  let randart_only = [ "penet"; "reap"; "acid"; "foul flame"; "Spirit"; "Archmagi" ]
+
+  (* Why a brand is not searchable, or [None] if it is. One reason exists: a
+     code in [randart_only] has no word in a rendered name, and an artefact's
+     brand is part of the name [name~] searches. *)
+  let why_excluded ~base_type word =
+    match
+      List.find_map (codes base_type) ~f:(fun (w, c) ->
+        Option.some_if (String.Caseless.equal w word) c)
+    with
+    | Some code when List.mem randart_only code ~equal:String.equal ->
+      Some "only ever on artefacts"
+    | _ -> None
+  ;;
+
+  (* The code a given build stores for a word. [None] for a word neither table
+     knows -- the criterion is public-API-constructible, so an unvalidated word
+     can reach storage, and "no code" has to be distinguishable from a code. *)
+  let code ~base_type ~version word =
+    match
+      List.find_map (codes base_type) ~f:(fun (w, c) ->
+        Option.some_if (String.Caseless.equal w word) c)
+    with
+    | None -> None
+    | Some code ->
+      let code =
+        if
+          String.equal base_type "armour"
+          && List.mem recoded code ~equal:String.equal
+          && Query.Version.release_compare version capitalised_since < 0
+        then String.lowercase code
+        else code
+      in
+      Some code
+  ;;
+end
+
 module Criterion = struct
   type position =
     | Floor
@@ -169,6 +373,12 @@ module Criterion = struct
     | Props of
         { base_type : string option
         ; props : string list
+        ; position : position
+        }
+    | Brand of
+        { base_type : string
+        ; sub_type : string option
+        ; word : string
         ; position : position
         }
   [@@deriving compare, sexp_of]
@@ -229,6 +439,15 @@ module Criterion = struct
     | Unique name -> name
     | Props { base_type; props; position } ->
       props_to_string ~base_type ~props ^ position_to_string position
+    (* "quick blade with distortion", the [props_to_string] shape: the brand
+       joins to the item, because it is a fact about the item rather than a
+       second criterion. The rendered name's own "of" is skipped -- a prefix
+       brand ("vampiric dagger") would read wrong in it. *)
+    | Brand { base_type; sub_type = Some sub_type; word; position } ->
+      sprintf "%s with %s" (Item_type.to_string { base_type; sub_type }) word
+      ^ position_to_string position
+    | Brand { base_type; sub_type = None; word; position } ->
+      sprintf "%s with %s" base_type word ^ position_to_string position
   ;;
 
   (* The noun for counting several of what this criterion matches. An item
@@ -237,7 +456,7 @@ module Criterion = struct
      every match is an artefact whatever base type it sits on. *)
   let plural_noun = function
     | Props _ -> Some "artefacts"
-    | Item _ | Name_like _ | Feature _ | Unique _ -> None
+    | Brand _ | Item _ | Name_like _ | Feature _ | Unique _ -> None
   ;;
 
   (* Constantly true since interning: a substring match runs over the string
@@ -245,7 +464,7 @@ module Criterion = struct
      lookup there rather than a scan. Kept, with [partition_terms], because a
      future criterion no index serves would need exactly this. *)
   let is_indexed = function
-    | Name_like _ | Item _ | Feature _ | Unique _ | Props _ -> true
+    | Name_like _ | Item _ | Feature _ | Unique _ | Props _ | Brand _ -> true
   ;;
 
   (* Three characters is a hard precondition, not a tuning knob: the substring
@@ -279,7 +498,12 @@ module Criterion = struct
        page size (measured: full scan of the version at 10k, plan unchanged
        under the keyset shape), so it belongs off the scheduler thread. *)
     | Props { base_type; props = _; position = _ } -> Option.is_some base_type
-    | Item _ | Feature _ | Unique _ -> true
+    | Item _ | Feature _ | Unique _ | Brand _ -> true
+  ;;
+
+  let has_count_ceiling = function
+    | Name_like _ | Props _ -> false
+    | Item _ | Feature _ | Unique _ | Brand _ -> true
   ;;
 end
 
@@ -319,6 +543,16 @@ module Term = struct
         (match base_type with
          | None -> sprintf "%sprops:%s" position props
          | Some base_type -> sprintf "%s%s props:%s" position base_type props)
+      (* The word, not the code: a link carries what a reader can re-type, and
+         the code is a spelling per build besides (see [Brand.code]). *)
+      | Criterion.Brand { base_type; sub_type; word; position } ->
+        sprintf
+          "%s%s ego:%s"
+          (Criterion.position_to_query_string position)
+          (match sub_type with
+           | Some sub_type -> base_type ^ ":" ^ sub_type
+           | None -> base_type)
+          word
     in
     if min_count > 1 then sprintf "%dx %s" min_count criterion else criterion
   ;;
@@ -339,6 +573,12 @@ type t =
 
 let create ~version ?(terms = []) ?(page = Query.Page.first) () = { version; terms; page }
 let is_empty t = List.is_empty t.terms
+
+let ceiling_term t =
+  match List.filter t.terms ~f:(fun (term : Term.t) -> term.min_count > 1) with
+  | [ term ] when Criterion.has_count_ceiling term.criterion -> Some term
+  | _ -> None
+;;
 
 let partition_terms t =
   List.partition_tf t.terms ~f:(fun (term : Term.t) ->

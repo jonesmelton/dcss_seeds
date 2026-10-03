@@ -18,7 +18,29 @@ module Version : sig
       was checked out when a seed was filled. *)
   val is_released : t -> bool
 
+  (** Release order over the numeric prefix, for questions like "did this
+      build have the capitalised armour ego codes" (see {!Search.Brand}).
+      [compare] is plain string order, which sorts ["0.10.1"] before
+      ["0.9.1"]; this parses the dotted numbers instead. An unreleased build
+      (trunk) compares as later than every release, since trunk carries
+      changes no release has taken. Equal for two strings that name the same
+      release by different spellings of the numeric prefix.
+
+      Generalised by the [Rename] module the renames plan calls for; this is
+      its smallest consumer. *)
+  val release_compare : t -> t -> int
+
   val to_string : t -> string
+end
+
+(** A seed as the corpus keys it: the decimal text of an unsigned 64-bit
+    integer, with no sign, no leading zero, and not [0]. Crawl either rolls a random
+    game for [0] or would file one under a label naming none; which was not
+    worth finding out. A leading zero would make [007] a second key for [7]. Text rather than an integer because a seed can
+    exceed SQLite's signed range. *)
+module Seed : sig
+  (** The text unchanged, or an error a reader can act on. *)
+  val of_string : string -> string Or_error.t
 end
 
 module Page : sig

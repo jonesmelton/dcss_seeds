@@ -5,26 +5,47 @@ open! Core
     by full page load or by htmx swap. *)
 
 (** The front page: a random sample of seeds, plus the box for going straight to
-    a seed you already know. Takes no [more] flag because a sample has no end to
-    reach. *)
+    a seed you already know.
+
+    [more] is whether the pool holds more than one page -- a fact about the
+    pool, not about [summaries], and false withdraws the link rather than
+    offering one with nothing behind it.
+
+    [community] renders the same table over the seeds readers flagged as good,
+    which is the community garden: only the caption, the "more" link and the
+    empty-state sentence differ. *)
 val seed_list
-  :  version:Seed_corpus.Query.Version.t
+  :  ?community:bool
+  -> more:bool
+  -> version:Seed_corpus.Query.Version.t
   -> page:Seed_corpus.Query.Page.t
   -> Seed_corpus.Level.Summary.t list
   -> [> Html_types.flow5 ] Tyxml.Html.elt list
+
+(** What the seed page needs to offer the private "good seed" flag: the CSRF
+    token, the search string the reader arrived from, if any, carried back
+    verbatim in a hidden field, and whether this session already pressed it, in
+    which case the acknowledgement stands where the button was. *)
+type flag =
+  { csrf : string
+  ; from : string option
+  ; flagged : bool
+  }
 
 (** One seed's catalog, prefaced by how deep it was searched.
 
     [job] is the outstanding deepen request, [position] how many are ahead of
     it, [csrf] the token Dream's form check requires -- [None] suppresses
     the button, which is what a deep seed gets. [filling] withdraws it for a
-    different reason; see [depth_note]. *)
+    different reason; see [depth_note]. [flag] is [None] when the feedback file
+    is not configured, which withdraws the button entirely. *)
 val seed_detail
   :  version:Seed_corpus.Query.Version.t
   -> seed:string
   -> job:Seed_corpus.Job.t option
   -> position:int option
   -> csrf:string option
+  -> flag:flag option
   -> filling:bool
   -> Seed_corpus.Level.t list
   -> [> Html_types.flow5 ] Tyxml.Html.elt list
@@ -66,6 +87,59 @@ val refusal
   -> string
   -> [> Html_types.flow5 ] Tyxml.Html.elt list
 
+(** A submitted seed's state, in the slot the page for a seed the corpus does
+    not hold puts it in -- also what the button and the poll swap in. A
+    seed the corpus now holds has no note: the caller redirects to its page, and
+    the levels decide that, not the job row. Polls while the job is queued or running and stops
+    otherwise. [csrf = None] or [paused] withdraws the button with the reason,
+    as [depth_note] does for a fill. *)
+val submission_note
+  :  version:Seed_corpus.Query.Version.t
+  -> seed:string
+  -> job:Seed_corpus.Job.t option
+  -> position:int option
+  -> csrf:string option
+  -> paused:bool
+  -> [> Html_types.flow5 ] Tyxml.Html.elt list
+
+(** A refused submission, in the same slot. *)
+val submission_refusal
+  :  seed:string
+  -> version:Seed_corpus.Query.Version.t
+  -> string
+  -> [> Html_types.flow5 ] Tyxml.Html.elt list
+
+(** The page for a well-formed seed the corpus does not hold. Its
+    {!submission_note} sits in a live region that stays put while the note
+    inside it is swapped, so a screen reader hears the job move and finish. *)
+val seed_missing
+  :  version:Seed_corpus.Query.Version.t
+  -> seed:string
+  -> job:Seed_corpus.Job.t option
+  -> position:int option
+  -> csrf:string option
+  -> paused:bool
+  -> [> Html_types.flow5 ] Tyxml.Html.elt list
+
+(** The seed page's address, which the flag's no-script answer links back to. *)
+val seed_path : version:Seed_corpus.Query.Version.t -> seed:string -> string
+
+(** [D:n], the level at reach depth [n]: how a fill depth is spelled to a
+    reader and in the feedback file. *)
+val depth_as_level : Seed_corpus.Fill_depth.t -> string
+
+(** The flag's slot after a press, and after a refusal. These are the inside of
+    the [aria-live] region the button sits in, which stays put across the swap so
+    the change is announced; the confirmation takes focus, since the button it
+    replaces had it. *)
+val flag_noted : [> Html_types.flow5 ] Tyxml.Html.elt list
+
+val flag_refusal
+  :  version:Seed_corpus.Query.Version.t
+  -> seed:string
+  -> string
+  -> [> Html_types.flow5 ] Tyxml.Html.elt list
+
 val search_unavailable : [> Html_types.flow5 ] Tyxml.Html.elt list
 
 (** The search surface: the form prefilled with the search being shown, and the
@@ -75,12 +149,17 @@ val search_unavailable : [> Html_types.flow5 ] Tyxml.Html.elt list
     bare word with the term it was read as, echoed above the results. *)
 val search_page
   :  ?resolved:(string * Seed_corpus.Search.Term.t) list
+  -> ?ceiling:Seed_corpus.Search.Term.t * int
   -> search:Seed_corpus.Search.t
   -> suggestions:string list option
   -> rank:Seed_corpus.Search.Rank.t
   -> more:[ `More | `End ]
   -> Seed_corpus.Search.Match.t list
   -> [> Html_types.flow5 ] Tyxml.Html.elt list
+
+(** How the empty search page orders its canned searches before showing the
+    first few. Shuffled by default; a test replaces it to pin the output. *)
+val canned_order : (string list list -> string list list) ref
 
 (** The document title of the search page.
 
@@ -97,6 +176,7 @@ val search_title : string
     reason as in {!search_title}. *)
 val search_fragment
   :  ?resolved:(string * Seed_corpus.Search.Term.t) list
+  -> ?ceiling:Seed_corpus.Search.Term.t * int
   -> search:Seed_corpus.Search.t
   -> suggestions:string list option
   -> rank:Seed_corpus.Search.Rank.t
@@ -145,8 +225,13 @@ val search_rejected_fragment
   -> suggestions:string list option
   -> [> Html_types.flow5 ] Tyxml.Html.elt list
 
+(** [ceiling] is a counted term and the most any seed holds of it, below that
+    term's count: rendered under an empty result as the number to search for
+    instead, with a link to that search. A record over this corpus at its fill
+    depth, so the copy says "in this build", not "in the game". *)
 val search_results
-  :  search:Seed_corpus.Search.t
+  :  ?ceiling:Seed_corpus.Search.Term.t * int
+  -> search:Seed_corpus.Search.t
   -> rank:Seed_corpus.Search.Rank.t
   -> more:[ `More | `End ]
   -> Seed_corpus.Search.Match.t list

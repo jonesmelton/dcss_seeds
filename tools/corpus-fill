@@ -88,10 +88,12 @@ trap 'rm -f "$seeds_tmp" "$seeds_tmp".part.*' EXIT
 
 seq "$start" "$((start + count - 1))" > "$seeds_tmp"
 
+# A submitted seed is re-extracted, not skipped: the fill reaching it is what
+# takes it into the sample, and skipping it leaves a hole a reader chose.
 if [ "$skip_done" -eq 1 ]; then
     done_tmp="$(mktemp)"
     sqlite3 -init /dev/null -noheader "$db" \
-        "select distinct sl.seed from seed_levels sl join versions v on v.id = sl.version_id where v.version = '$version';" \
+        "select distinct sl.seed from seed_levels sl join versions v on v.id = sl.version_id where v.version = '$version' and not exists (select 1 from seed_fills f where f.seed = sl.seed and f.version_id = sl.version_id and f.origin = 'submit');" \
         | LC_ALL=C sort > "$done_tmp"
     LC_ALL=C sort "$seeds_tmp" > "$seeds_tmp.all"
     LC_ALL=C comm -23 "$seeds_tmp.all" "$done_tmp" | LC_ALL=C sort -n > "$seeds_tmp.todo"

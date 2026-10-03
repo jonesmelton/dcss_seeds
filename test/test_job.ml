@@ -13,6 +13,7 @@ let job ?started_at ?finished_at ?error ?(attempts = 0) () =
   ; finished_at
   ; attempts
   ; error
+  ; origin = Job.Origin.Deepen
   }
 ;;
 
@@ -73,4 +74,19 @@ let%expect_test "the fill lock sits beside the database it guards" =
     /corpus/corpus       -> /corpus/corpus-write.lock
     rel.db               -> rel-write.lock
     |}]
+;;
+
+(* Every job is a reader's request, so its ingest must never add a seed to the
+   random sample or take one out. *)
+let%expect_test "a job's extraction writes as a request" =
+  let build = Seed_corpus.Deepen.Build.of_version ~root:"/r" ~version:v in
+  print_endline
+    (Seed_corpus.Deepen.extract_command
+       build
+       ~seed:"300"
+       ~depth:"Swamp:4"
+       ~db_path:"/r/corpus.db"
+       ~ingest:"/r/ingest.exe");
+  [%expect
+    {| cd '/r/builds/0.34.1/crawl-ref/source' && util/fake_pty ./crawl -dir '/r/sandboxes/0.34.1' -script seed_dump_sexp.lua -seed '300' -depth 'Swamp:4' 2>&1 | grep '^#SEED#' | '/r/ingest.exe' -db '/r/corpus.db' -quiet -requested |}]
 ;;

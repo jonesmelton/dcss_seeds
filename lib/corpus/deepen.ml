@@ -60,7 +60,7 @@ let kill_grace = Time_float.Span.of_sec 10.
 let extract_command (build : Build.t) ~seed ~depth ~db_path ~ingest =
   sprintf
     "cd %s && util/fake_pty ./crawl -dir %s -script seed_dump_sexp.lua -seed %s -depth \
-     %s 2>&1 | grep '^#SEED#' | %s -db %s -quiet"
+     %s 2>&1 | grep '^#SEED#' | %s -db %s -quiet -requested"
     (Filename.quote build.source)
     (Filename.quote build.sandbox)
     (Filename.quote seed)

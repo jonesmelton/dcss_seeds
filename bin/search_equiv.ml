@@ -19,6 +19,8 @@ let default_queries =
   ; "staff props:Conj,Alch"
   ; "props:rF,rC"
   ; "armour props:rF,Str"
+  ; "weapon:quick blade ego:distortion"
+  ; "shop armour:robe ego:fire resistance"
   ; "name~hood of the Assassin"
   ; "jewellery props:rMut; name~hood of the Assassin"
   ; "name~robe of Vines; props:Conj"

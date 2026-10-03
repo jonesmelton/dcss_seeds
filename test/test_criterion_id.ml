@@ -2,8 +2,10 @@ open! Core
 module Criterion_id = Seed_corpus.Criterion_id
 module Search = Seed_corpus.Search
 
-let show criterion =
-  match (Criterion_id.of_criterion criterion : Criterion_id.t) with
+let version = Or_error.ok_exn (Seed_corpus.Query.Version.of_string "0.34.1")
+
+let show ?(version = version) criterion =
+  match (Criterion_id.of_criterion ~version criterion : Criterion_id.t) with
   | Exact keys -> print_s [%message "Exact" (keys : Criterion_id.key list)]
   | Narrowing keys -> print_s [%message "Narrowing" (keys : Criterion_id.key list)]
   | Unindexed -> print_s [%message "Unindexed"]
@@ -98,6 +100,8 @@ let%expect_test "Kind.to_int and of_int round-trip over Kind.all" =
     ((kind Shop_item) (round_trip (Shop_item)))
     ((kind Floor_prop) (round_trip (Floor_prop)))
     ((kind Shop_prop) (round_trip (Shop_prop)))
+    ((kind Floor_brand) (round_trip (Floor_brand)))
+    ((kind Shop_brand) (round_trip (Shop_brand)))
     |}]
 ;;
 
@@ -111,6 +115,76 @@ let%expect_test "Kind.of_int leaves the removed artefact kind unassigned" =
 let%expect_test "Kind.of_int is None out of range" =
   print_s [%sexp (Criterion_id.Kind.of_int (-1) : Criterion_id.Kind.t option)];
   [%expect {| () |}];
-  print_s [%sexp (Criterion_id.Kind.of_int 5 : Criterion_id.Kind.t option)];
+  print_s [%sexp (Criterion_id.Kind.of_int 7 : Criterion_id.Kind.t option)];
   [%expect {| () |}]
+;;
+
+let brand ?(position = Search.Criterion.Floor) base_type sub_type word =
+  Search.Criterion.Brand { base_type; sub_type = Some sub_type; word; position }
+;;
+
+(* The brand and the item are two keys: intersecting them is a superset, and
+   [verify] re-checks that one entry carries both. The item key comes first so
+   the shape is stable to read; the merge itself orders by list length. *)
+let%expect_test "Brand is Narrowing, with the item key and the build's brand key" =
+  show (brand "weapon" "quick blade" "distortion");
+  [%expect
+    {|
+    (Narrowing
+     (keys
+      (((kind Floor_item) (a (weapon)) (b ("quick blade")))
+       ((kind Floor_brand) (a (weapon)) (b (distort))))))
+    |}]
+;;
+
+let%expect_test "a shop Brand narrows through the shop lists" =
+  show (brand ~position:Search.Criterion.Shop "weapon" "quick blade" "distortion");
+  [%expect
+    {|
+    (Narrowing
+     (keys
+      (((kind Shop_item) (a (weapon)) (b ("quick blade")))
+       ((kind Shop_brand) (a (weapon)) (b (distort))))))
+    |}]
+;;
+
+(* The word is the criterion's, the code is the build's: 0.34.1 capitalised
+   eleven armour ego codes, and a key spelled the newer way would find no row
+   in a 0.33.1 store and answer "no seeds" over a corpus that holds them. *)
+let%expect_test "an armour brand's key is spelled as the build stores it" =
+  let older = Or_error.ok_exn (Seed_corpus.Query.Version.of_string "0.33.1") in
+  show ~version:older (brand "armour" "robe" "harm");
+  [%expect
+    {|
+    (Narrowing
+     (keys
+      (((kind Floor_item) (a (armour)) (b (robe)))
+       ((kind Floor_brand) (a (armour)) (b (harm))))))
+    |}];
+  show (brand "armour" "robe" "harm");
+  [%expect
+    {|
+    (Narrowing
+     (keys
+      (((kind Floor_item) (a (armour)) (b (robe)))
+       ((kind Floor_brand) (a (armour)) (b (Harm))))))
+    |}]
+;;
+
+(* An unknown word is refused at the parse boundary; a directly constructed one
+   narrows nothing, because there is no code to key a row by. *)
+let%expect_test "a Brand whose word no table knows is unindexed" =
+  show (brand "weapon" "quick blade" "no such brand");
+  [%expect {| Unindexed |}]
+;;
+
+let%expect_test "a Brand with no sub type is exactly its brand list" =
+  show
+    (Search.Criterion.Brand
+       { base_type = "weapon"
+       ; sub_type = None
+       ; word = "distortion"
+       ; position = Search.Criterion.Floor
+       });
+  [%expect {| (Exact (keys (((kind Floor_brand) (a (weapon)) (b (distort)))))) |}]
 ;;

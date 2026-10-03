@@ -201,9 +201,12 @@ let one_pass db ~builds ~db_path ~ingest ~generator_id ~on_context ~on_pass_star
       on_context
         { Seed_corpus.Deepen.Context.version = build.version; seed = Some job.seed };
       printf
-        "%s %s: deepening to %s\n%!"
+        "%s %s: %s to %s\n%!"
         (Seed_corpus.Query.Version.to_string build.version)
         job.seed
+        (match job.origin with
+         | Deepen -> "deepening"
+         | Submit -> "filling a submitted seed")
         job.depth;
       let outcome, claim =
         run_job
@@ -245,6 +248,15 @@ let one_pass db ~builds ~db_path ~ingest ~generator_id ~on_context ~on_pass_star
              eprintf "finish failed: %s\n%!" (Error.to_string_hum err);
              outcome)
       in
+      (* A submitted seed is scored once, here, against the cohort the last
+         rescore stored. Logged, not fatal: unscored is an honest state, and
+         the next rescore scores it anyway. *)
+      (match recorded, job.origin with
+       | Finished, Submit ->
+         (match Seed_corpus.Db.score_seed db ~version:build.version ~seed:job.seed with
+          | Ok _ -> ()
+          | Error err -> eprintf "scoring failed: %s\n%!" (Error.to_string_hum err))
+       | (Finished | Timed_out | Exited _ | Claim_lost), (Deepen | Submit) -> ());
       (match recorded with
        | Finished -> printf "%s: %s\n%!" job.seed (Outcome.to_string recorded)
        | Timed_out | Exited _ | Claim_lost ->

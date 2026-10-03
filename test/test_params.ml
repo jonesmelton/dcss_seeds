@@ -444,6 +444,168 @@ let%expect_test "property terms round-trip through the query string" =
     |}]
 ;;
 
+(* {1 Brands}
+
+   The item leads and the brand trails, the shape "staff props:Conj" set: the
+   criterion has to carry the whole item so the brand stays attached to it. One
+   brand per term, because an item carries one ego. *)
+let%expect_test "brand: is ego:, and a base type alone is enough" =
+  List.iter
+    ~f:show
+    [ "weapon:quick blade brand:distortion"
+    ; "weapon brand:distortion"
+    ; "brand:distortion"
+    ; "shop armour brand:fire resistance"
+    ; "weapon:distortion"
+    ; "armour:fire resistance"
+    ; "weapon:ego"
+    ; "armour:ego"
+    ; "weapon:ego:distortion"
+    ; "jewellery:distortion"
+    ];
+  [%expect
+    {|
+    weapon:quick blade brand:distortion -> quick blade with distortion
+    weapon brand:distortion      -> weapon with distortion
+    brand:distortion             -> error: ego: needs a weapon or armour in front of it, as in "weapon ego:distortion" or "weapon:quick blade ego:distortion"
+    shop armour brand:fire resistance -> armour with fire resistance in a shop
+    weapon:distortion            -> weapon with distortion
+    armour:fire resistance       -> armour with fire resistance
+    weapon:ego                   -> error: weapon:ego would match nearly every seed. Name the brand, as in "weapon:distortion".
+    armour:ego                   -> error: armour:ego would match nearly every seed. Name the brand, as in "armour:distortion".
+    weapon:ego:distortion        -> weapon with distortion
+    jewellery:distortion         -> distortion
+    |}]
+;;
+
+let%expect_test "brand search syntax" =
+  List.iter
+    ~f:show
+    [ "weapon:quick blade ego:distortion"
+    ; "shop weapon:quick blade ego:distortion"
+    ; "floor weapon:quick blade ego:distortion"
+    ; "armour:robe ego:fire resistance"
+    ; "armour:robe ego:Fire Resistance"
+    ; "3x weapon:quick blade ego:distortion"
+    ; "weapon:quick blade ego:"
+    ; "ego:distortion"
+    ; "weapon ego:distortion"
+    ; "jewellery:ring of slaying ego:fire resistance"
+    ; "weapon:quick blade ego:distortion,vampiric"
+    ; "weapon:quick blade ego:no such brand"
+    ];
+  [%expect
+    {|
+    weapon:quick blade ego:distortion -> quick blade with distortion
+    shop weapon:quick blade ego:distortion -> quick blade with distortion in a shop
+    floor weapon:quick blade ego:distortion -> quick blade with distortion
+    armour:robe ego:fire resistance -> robe with fire resistance
+    armour:robe ego:Fire Resistance -> robe with fire resistance
+    3x weapon:quick blade ego:distortion -> 3+ quick blade with distortion
+    weapon:quick blade ego:      -> error: ego: needs a brand, as in "weapon:quick blade ego:distortion"
+    ego:distortion               -> error: ego: needs a weapon or armour in front of it, as in "weapon ego:distortion" or "weapon:quick blade ego:distortion"
+    weapon ego:distortion        -> weapon with distortion
+    jewellery:ring of slaying ego:fire resistance -> error: ego: is for weapons and armour. Jewellery carries it in the item name, as in "jewellery:ring of protection from fire".
+    weapon:quick blade ego:distortion,vampiric -> error: a term takes one brand, not a list: "distortion,vampiric"
+    weapon:quick blade ego:no such brand -> error: no weapon brand named "no such brand"
+    |}]
+;;
+
+(* The rendered name, which is how readers actually type it (field log:
+   "weapon:quick blade of chaos", "weapon:executioner's axe of speed"). No
+   weapon or armour sub type contains " of ", so the fold is not a guess: the
+   suffix is always the brand, and without the fold the term would parse as an
+   item whose sub type is "quick blade of distortion" and silently match
+   nothing. *)
+let%expect_test "the rendered name folds into a brand term" =
+  List.iter
+    ~f:show
+    [ "weapon:quick blade of distortion"
+    ; "weapon:executioner's axe of speed"
+    ; "weapon:axe of holy wrath"
+    ; "shop armour:robe of fire resistance"
+    ; "armour:cloak of resistance" (* No " of ": an ordinary item term, untouched. *)
+    ; "weapon:quick blade"
+    ; "armour:robe"
+      (* Jewellery's sub type really does contain " of ", and jewellery is not
+         a brand base type, so it parses as the item it names. *)
+    ; "jewellery:ring of protection from fire"
+    ];
+  [%expect
+    {|
+    weapon:quick blade of distortion -> quick blade with distortion
+    weapon:executioner's axe of speed -> executioner's axe with speed
+    weapon:axe of holy wrath     -> axe with holy wrath
+    shop armour:robe of fire resistance -> robe with fire resistance in a shop
+    armour:cloak of resistance   -> cloak with resistance
+    weapon:quick blade           -> quick blade
+    armour:robe                  -> robe
+    jewellery:ring of protection from fire -> ring of protection from fire
+    |}]
+;;
+
+(* A reader who typed the terse code -- the thing the corpus stores, and which
+   appears in the {…} suffix of a randart's name -- is told the word. *)
+let%expect_test "a code typed as a word is corrected, not refused" =
+  List.iter ~f:show [ "weapon:dagger ego:distort"; "armour:robe ego:rF+" ];
+  [%expect
+    {|
+    weapon:dagger ego:distort    -> error: no weapon brand named "distort". It is spelled "distortion".
+    armour:robe ego:rF+          -> error: no armour brand named "rF+". It is spelled "fire resistance".
+    |}]
+;;
+
+(* Artefact-only brands: real brands, never on an item whose name is derived,
+   so there is no word for them and the artefact's brand is part of its name. *)
+let%expect_test "artefact-only brands are refused by name" =
+  List.iter
+    ~f:show
+    [ "weapon:dagger ego:reaping"
+    ; "weapon:dagger ego:penetration"
+    ; "armour:robe ego:the Archmagi"
+    ];
+  [%expect
+    {|
+    weapon:dagger ego:reaping    -> error: "reaping" is only ever on artefacts and can't be searched. Those artefacts are found by name, as in "name~Zephyr".
+    weapon:dagger ego:penetration -> error: "penetration" is only ever on artefacts and can't be searched. Those artefacts are found by name, as in "name~Zephyr".
+    armour:robe ego:the Archmagi -> error: "the Archmagi" is only ever on artefacts and can't be searched. Those artefacts are found by name, as in "name~Zephyr".
+    |}]
+;;
+
+(* The commonest misfire in the access log: a brand typed as a property
+   ("props:speed", 25 attempts over 30 days). Name the spelling. *)
+let%expect_test "a brand typed as a property is told where it goes" =
+  List.iter ~f:show [ "props:speed"; "weapon:halberd props:speed"; "staff props:flaming" ];
+  [%expect
+    {|
+    props:speed                  -> error: "speed" is a brand, not a property. A brand goes after the item with ego:, as in "weapon:quick blade ego:speed".
+    weapon:halberd props:speed   -> error: "speed" is a brand, not a property. A brand goes after the item with ego:, as in "weapon:quick blade ego:speed".
+    staff props:flaming          -> error: "flaming" is a brand, not a property. A brand goes after the item with ego:, as in "weapon:quick blade ego:flaming".
+    |}]
+;;
+
+(* A term round-trips through a link, as every other criterion does. The word is
+   emitted, not the code: the code is a spelling per build. *)
+let%expect_test "brand terms round-trip through the query string" =
+  List.iter
+    ~f:(fun s ->
+      match Seed_web.Params.term_of_string s with
+      | Error err -> printf "%-32s -> error: %s\n" s (Error.to_string_hum err)
+      | Ok term -> printf "%-32s -> %s\n" s (Search.Term.to_query_string term))
+    [ "weapon:quick blade ego:distortion"
+    ; "shop weapon:quick blade ego:distortion"
+    ; "weapon:quick blade of distortion"
+    ; "armour:robe ego:Fire Resistance"
+    ];
+  [%expect
+    {|
+    weapon:quick blade ego:distortion -> weapon:quick blade ego:distortion
+    shop weapon:quick blade ego:distortion -> shop weapon:quick blade ego:distortion
+    weapon:quick blade of distortion -> weapon:quick blade ego:distortion
+    armour:robe ego:Fire Resistance  -> armour:robe ego:fire resistance
+    |}]
+;;
+
 (* Every example on the help page is a live link, so each one must parse. The
    page teaches the grammar; an example that errors teaches the wrong one. These
    were checked by hand when search narrowed in 2026-09-10 -- pinned here so the
@@ -474,6 +636,11 @@ let%expect_test "help page examples parse" =
     ; "weapon props:rF,rC,Will"
     ; "3x scroll:acquirement"
     ; "armour:crystal plate armour"
+    ; "weapon:quick blade ego:distortion"
+    ; "weapon:quick blade of distortion"
+    ; "weapon:axe of holy wrath"
+    ; "armour:robe ego:fire resistance"
+    ; "shop weapon:quick blade ego:distortion"
     ];
   [%expect {| |}]
 ;;
@@ -628,13 +795,32 @@ let%expect_test "an ambiguous or misspelled word offers, and does not run" =
 
 (* [name~] is offered, never run: it is the one criterion whose cost the
    vocabulary does not bound. *)
+(* A brand word typed alone: the item is required, so the message says where
+   the word goes rather than only that nothing matched. *)
+let%expect_test "a bare brand word is told where it goes" =
+  let vocabulary = lazy (Some [ "weapon:quick blade"; "potion:haste" ]) in
+  List.iter
+    ~f:(fun word ->
+      match Seed_web.Params.box ~vocabulary word with
+      | { Seed_web.Params.Box.outcome = Rejected { message; _ }; _ } ->
+        printf "%-14s -> %s\n" word message
+      | { outcome = Parsed _ | Resolved _; _ } -> printf "%-14s -> ran\n" word)
+    [ "distortion"; "speed"; "fire resistance" ];
+  [%expect
+    {|
+    distortion     -> Nothing matches "distortion". A brand goes after the item, as in "weapon:quick blade ego:distortion".
+    speed          -> Nothing matches "speed". A brand goes after the item, as in "weapon:quick blade ego:speed".
+    fire resistance -> Nothing matches "fire resistance". A brand goes after the item, as in "weapon:quick blade ego:fire resistance".
+    |}]
+;;
+
 let%expect_test "an unknown word offers a name search" =
   List.iter ~f:show_box [ "spectral"; "3x spectral"; "shop spectral"; "xy"; "altar_trog" ];
   [%expect
     {|
-    spectral           -> rejected: Nothing matches "spectral". Search artefact names instead: [name~spectral]
-    3x spectral        -> rejected: Nothing matches "spectral". Search artefact names instead: [3x name~spectral]
-    shop spectral      -> rejected: Nothing matches "spectral". Search artefact names instead: [name~spectral]
+    spectral           -> rejected: Nothing matches "spectral". A brand goes after the item, as in "weapon:quick blade ego:spectral". Search artefact names instead: [name~spectral]
+    3x spectral        -> rejected: Nothing matches "spectral". A brand goes after the item, as in "weapon:quick blade ego:spectral". Search artefact names instead: [3x name~spectral]
+    shop spectral      -> rejected: Nothing matches "spectral". A brand goes after the item, as in "weapon:quick blade ego:spectral". Search artefact names instead: [name~spectral]
     xy                 -> rejected: Nothing matches "xy".
     altar_trog         -> rejected: search covers items, not features: "altar_trog"
     |}]

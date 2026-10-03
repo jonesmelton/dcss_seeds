@@ -350,7 +350,7 @@ let%expect_test "the empty search agrees" =
   ignore
     (agree ~label:"empty search" sql_db idx_db []
      : Search.Match.t list * Search.Match.t list);
-  [%expect {| empty search: agree (14 seeds) |}];
+  [%expect {| empty search: agree (19 seeds) |}];
   Db.close sql_db;
   Db.close idx_db
 ;;
@@ -853,22 +853,60 @@ let string_of_id db id_str =
   | _ -> failwith (sprintf "strings id %s not found" id_str)
 ;;
 
-let criterion_of_row (kind : Criterion_id.Kind.t) a b : Search.Criterion.t =
+(* A brand row is a (base type, ego) superset list, not a criterion: the
+   criterion always carries the item, so no single criterion has this row's
+   member set. Its card is checked against a direct SQL count instead. *)
+let criterion_of_row (kind : Criterion_id.Kind.t) a b : Search.Criterion.t option =
   match kind with
   | Criterion_id.Kind.Floor_item ->
-    Search.Criterion.Item
-      ( { Search.Item_type.base_type = Option.value_exn a; sub_type = Option.value_exn b }
-      , Search.Criterion.Floor )
+    Some
+      (Search.Criterion.Item
+         ( { Search.Item_type.base_type = Option.value_exn a
+           ; sub_type = Option.value_exn b
+           }
+         , Search.Criterion.Floor ))
   | Criterion_id.Kind.Shop_item ->
-    Search.Criterion.Item
-      ( { Search.Item_type.base_type = Option.value_exn a; sub_type = Option.value_exn b }
-      , Search.Criterion.Shop )
+    Some
+      (Search.Criterion.Item
+         ( { Search.Item_type.base_type = Option.value_exn a
+           ; sub_type = Option.value_exn b
+           }
+         , Search.Criterion.Shop ))
   | Criterion_id.Kind.Floor_prop ->
-    Search.Criterion.Props
-      { base_type = a; props = [ Option.value_exn b ]; position = Search.Criterion.Floor }
+    Some
+      (Search.Criterion.Props
+         { base_type = a
+         ; props = [ Option.value_exn b ]
+         ; position = Search.Criterion.Floor
+         })
   | Criterion_id.Kind.Shop_prop ->
-    Search.Criterion.Props
-      { base_type = a; props = [ Option.value_exn b ]; position = Search.Criterion.Shop }
+    Some
+      (Search.Criterion.Props
+         { base_type = a
+         ; props = [ Option.value_exn b ]
+         ; position = Search.Criterion.Shop
+         })
+  | Criterion_id.Kind.Floor_brand | Criterion_id.Kind.Shop_brand -> None
+;;
+
+let brand_seed_count db ~version_id kind a b =
+  let position =
+    match kind with
+    | Criterion_id.Kind.Floor_brand -> "is null"
+    | Criterion_id.Kind.Shop_brand -> "is not null"
+    | _ -> failwith "not a brand kind"
+  in
+  sprintf
+    "select count(distinct e.seed) from entries e where e.version_id = %s and \
+     e.base_type_id = (select id from strings where val = '%s') and e.ego_id = (select \
+     id from strings where val = '%s') and e.cost %s"
+    version_id
+    (Option.value_exn a)
+    (Option.value_exn b)
+    position
+  |> Db.query db
+  |> List.hd_exn
+  |> Int.of_string
 ;;
 
 let%expect_test "card, postings, and an independent SQL count agree for every catalog row"
@@ -905,21 +943,26 @@ let%expect_test "card, postings, and an independent SQL count agree for every ca
           |> List.hd_exn
           |> Int.of_string
         in
-        let criterion = criterion_of_row kind a b in
-        let search =
-          Search.create
-            ~version
-            ~terms:[ Search.Term.create criterion ]
-            ~page:(Query.Page.create ~limit:1000 ())
-            ()
-        in
-        let independent =
-          match
-            Or_error.ok_exn (Db.search_seeds sql_db search ~rank:Search.Rank.Seed)
-          with
-          | matches, `End -> List.length matches
-          | _, `More ->
-            failwith "fixture too large for a single page; raise the test limit"
+        let label, independent =
+          match criterion_of_row kind a b with
+          | None ->
+            ( Sexp.to_string_hum (Criterion_id.Kind.sexp_of_t kind)
+            , brand_seed_count idx_db ~version_id kind a b )
+          | Some criterion ->
+            let search =
+              Search.create
+                ~version
+                ~terms:[ Search.Term.create criterion ]
+                ~page:(Query.Page.create ~limit:1000 ())
+                ()
+            in
+            ( Search.Criterion.to_string criterion
+            , (match
+                 Or_error.ok_exn (Db.search_seeds sql_db search ~rank:Search.Rank.Seed)
+               with
+               | matches, `End -> List.length matches
+               | _, `More ->
+                 failwith "fixture too large for a single page; raise the test limit") )
         in
         if card = posting_n && card = independent
         then None
@@ -927,7 +970,7 @@ let%expect_test "card, postings, and an independent SQL count agree for every ca
           Some
             (sprintf
                "%s: card=%d postings=%d independent=%d"
-               (Search.Criterion.to_string criterion)
+               label
                card
                posting_n
                independent)
@@ -939,11 +982,137 @@ let%expect_test "card, postings, and an independent SQL count agree for every ca
   else List.iter mismatches ~f:print_endline;
   [%expect
     {|
-    checked 25 catalog rows
+    checked 31 catalog rows
     0 mismatches
     |}];
   Db.close sql_db;
   Db.close idx_db
+;;
+
+(* {1 Brands}
+
+   A brand term is the second [Narrowing] criterion: the item's own list and the
+   brand's, intersected, then re-checked against SQL. The leak case is seed 41
+   (a plain quick blade and a distortion dagger, on different levels) -- the
+   store's intersection admits it, and [verify] is what removes it. *)
+
+let%expect_test "a Brand agrees between the two paths, leak case included" =
+  let sql_db, idx_db = corpus_pair () in
+  let _, idx_matches =
+    agree
+      ~label:"weapon:quick blade ego:distortion"
+      sql_db
+      idx_db
+      [ Search.Term.create (Test_search.brand "weapon" "quick blade" "distortion") ]
+  in
+  Test_search.expect_same
+    ~label:"store: quick blade of distortion"
+    (Int.Set.of_list [ 45; 49 ])
+    (Int.Set.of_list
+       (List.map idx_matches ~f:(fun (m : Search.Match.t) -> Int.of_string m.seed)));
+  Db.close sql_db;
+  Db.close idx_db;
+  [%expect
+    {|
+    weapon:quick blade ego:distortion: agree (2 seeds)
+    store: quick blade of distortion: match (2 seeds)
+    |}]
+;;
+
+let%expect_test "a Brand with no sub type agrees between the two paths" =
+  let sql_db, idx_db = corpus_pair () in
+  ignore
+    (agree
+       ~label:"weapon ego:distortion"
+       sql_db
+       idx_db
+       [ Search.Term.create
+           (Search.Criterion.Brand
+              { base_type = "weapon"
+              ; sub_type = None
+              ; word = "distortion"
+              ; position = Search.Criterion.Floor
+              })
+       ]);
+  Db.close sql_db;
+  Db.close idx_db;
+  [%expect {| weapon ego:distortion: agree (3 seeds) |}]
+;;
+
+let%expect_test "a shop Brand agrees between the two paths" =
+  let sql_db, idx_db = corpus_pair () in
+  ignore
+    (agree
+       ~label:"shop weapon:quick blade ego:distortion"
+       sql_db
+       idx_db
+       [ Search.Term.create
+           (Test_search.brand
+              ~position:Search.Criterion.Shop
+              "weapon"
+              "quick blade"
+              "distortion")
+       ]
+     : Search.Match.t list * Search.Match.t list);
+  [%expect {| shop weapon:quick blade ego:distortion: agree (1 seeds) |}];
+  Db.close sql_db;
+  Db.close idx_db
+;;
+
+let%expect_test "an armour Brand agrees between the two paths" =
+  let sql_db, idx_db = corpus_pair () in
+  ignore
+    (agree
+       ~label:"armour:robe ego:fire resistance"
+       sql_db
+       idx_db
+       [ Search.Term.create (Test_search.brand "armour" "robe" "fire resistance") ]
+     : Search.Match.t list * Search.Match.t list);
+  [%expect {| armour:robe ego:fire resistance: agree (1 seeds) |}];
+  Db.close sql_db;
+  Db.close idx_db
+;;
+
+(* The store built before brand lists existed. Its currency mark is a seed
+   count, which a vocabulary addition does not move, so it reports current
+   while holding no row for the new kind -- and a missing row used to mean
+   "the build holds none", which would answer a page of nothing (or of only
+   the deep cohort) over a corpus that holds the blades. The store declines
+   instead, and the SQL path answers. *)
+let%expect_test "a store with no brand rows declines rather than answering from absence" =
+  let sql_db, idx_db = corpus_pair () in
+  Db.exec_script
+    idx_db
+    "delete from search_postings where criterion_id in (select id from search_criteria \
+     where kind in (5, 6))";
+  Db.exec_script idx_db "delete from search_criteria where kind in (5, 6)";
+  printf "store current: %b\n" (Db.search_index_is_current idx_db ~version);
+  let search =
+    Search.create
+      ~version
+      ~terms:
+        [ Search.Term.create (Test_search.brand "weapon" "quick blade" "distortion") ]
+      ()
+  in
+  printf
+    "store path declined: %b\n"
+    (Or_error.ok_exn (Db.search_seeds_store idx_db search ~rank:Search.Rank.Seed)
+     |> Option.is_none);
+  ignore
+    (agree
+       ~label:"weapon:quick blade ego:distortion, no brand rows"
+       sql_db
+       idx_db
+       [ Search.Term.create (Test_search.brand "weapon" "quick blade" "distortion") ]
+     : Search.Match.t list * Search.Match.t list);
+  Db.close sql_db;
+  Db.close idx_db;
+  [%expect
+    {|
+    store current: true
+    store path declined: true
+    weapon:quick blade ego:distortion, no brand rows: agree (2 seeds)
+    |}]
 ;;
 
 (* {1 Staleness and fallback} *)
@@ -1160,9 +1329,9 @@ let%expect_test "the seed counter tracks a fill, a deepen and a drop" =
   printf !"after a drop: %{sexp: string list}\n" (counted_and_actual idx_db);
   [%expect
     {|
-    after the fill: ("14 14")
-    after a deepen: ("14 14")
-    after a drop: ("13 13")
+    after the fill: ("19 19")
+    after a deepen: ("19 19")
+    after a drop: ("18 18")
     |}];
   Db.close idx_db
 ;;
@@ -1455,7 +1624,7 @@ let%expect_test "every query shape agrees over a corpus with a deep cohort" =
     wand:digging & potion:haste: agree (1 seeds)
     weapon:long sword & potion:haste: agree (2 seeds)
     weapon:long sword ranked: agree (3 seeds)
-    empty search: agree (14 seeds)
+    empty search: agree (19 seeds)
     scroll:teleportation: agree (0 seeds)
     |}];
   Db.close sql_db;
@@ -1479,9 +1648,9 @@ let%expect_test "the datalist agrees between the catalog and the scan" =
       Db.close idx_db);
   [%expect
     {|
-    corpus: agree (17 options)
+    corpus: agree (21 options)
     synth: agree (3 options)
-    deepened: agree (17 options)
+    deepened: agree (21 options)
     |}]
 ;;
 
@@ -1505,6 +1674,74 @@ let%expect_test "a current store answers the datalist from its catalog" =
     store current: true
     wand:digging offered: true
     |}];
+  Db.close idx_db
+;;
+
+(* Reaping is randart-only, so a build holding it still offers no word for it.
+   0.33.1 stores armour's harm as "harm", 0.34.1 as "Harm"; each build's own
+   spelling must resolve to the one word. *)
+let%expect_test "the datalist offers the brands each build holds, as words" =
+  let brand_record ~version ~seed ~base_type ~sub_type ~ego ~artefact =
+    sprintf
+      {|#SEED#((format 4)(version "%s")(seed "%s")(level "D:2")(cats (items ((%s(base_type "%s")(branded t)(ego "%s")(kind "item")(name "x")(plus 0)(quantity 1)(sub_type "%s")(text "x"))))))|}
+      version
+      seed
+      (if artefact then "(artefact t)" else "")
+      base_type
+      ego
+      sub_type
+  in
+  let records =
+    parse_records
+      [ brand_record
+          ~version:"0.34.1"
+          ~seed:"1"
+          ~base_type:"weapon"
+          ~sub_type:"dagger"
+          ~ego:"distort"
+          ~artefact:false
+      ; brand_record
+          ~version:"0.34.1"
+          ~seed:"2"
+          ~base_type:"weapon"
+          ~sub_type:"scythe"
+          ~ego:"reap"
+          ~artefact:true
+      ; brand_record
+          ~version:"0.34.1"
+          ~seed:"3"
+          ~base_type:"armour"
+          ~sub_type:"robe"
+          ~ego:"Harm"
+          ~artefact:false
+      ; brand_record
+          ~version:"0.33.1"
+          ~seed:"1"
+          ~base_type:"armour"
+          ~sub_type:"robe"
+          ~ego:"harm"
+          ~artefact:false
+      ]
+  in
+  let old = Or_error.ok_exn (Query.Version.of_string "0.33.1") in
+  let sql_db, idx_db = fresh_pair records in
+  Or_error.ok_exn (Db.build_search_index idx_db ~version:old);
+  List.iter
+    [ "sql", sql_db; "store", idx_db ]
+    ~f:(fun (label, db) ->
+      List.iter [ version; old ] ~f:(fun version ->
+        Or_error.ok_exn (Db.distinct_criteria db ~version)
+        |> List.filter ~f:(String.is_substring ~substring:" ego:")
+        |> String.concat ~sep:", "
+        |> printf "%s %s: %s\n" label (Query.Version.to_string version)));
+  [%expect
+    {|
+    sql 0.34.1: weapon ego:distortion, armour ego:harm
+    sql 0.33.1: armour ego:harm
+    store 0.34.1: weapon ego:distortion, armour ego:harm
+    store 0.33.1: armour ego:harm
+    |}];
+  Db.close sql_db;
   Db.close idx_db
 ;;
 
@@ -1811,5 +2048,184 @@ let%expect_test "name~ reaches a deepened seed through a deep-only name" =
       depths agree: true
     |}];
   Db.close sql_db;
+  Db.close idx_db
+;;
+
+(* {1 The count ceiling}
+
+   [Db.count_ceiling_store] is [None] when the store declines, which is how
+   these tests tell the store branch from the SQL fallback. *)
+
+let store_ceiling db criterion =
+  Or_error.ok_exn (Db.count_ceiling_store db ~version criterion)
+  |> [%sexp_of: int option option]
+  |> Sexp.to_string
+;;
+
+let%expect_test "the store's ceiling agrees with SQL's, and declines what it cannot say" =
+  let sql_db, idx_db = corpus_pair () in
+  List.iter
+    [ "floor haste", Test_search.floor Test_search.haste
+    ; "shop haste", Test_search.shop Test_search.haste
+    ; "floor digging", Test_search.floor Test_search.digging
+    ; "props:Conj", Test_search.props [ "Conj" ]
+    ; "props:Conj,Alch", Test_search.props [ "Conj"; "Alch" ]
+    ]
+    ~f:(fun (label, criterion) ->
+      printf
+        "%-16s sql=%s store=%s stale=%s\n"
+        label
+        (Test_search.ceiling_sql sql_db criterion)
+        (store_ceiling idx_db criterion)
+        (store_ceiling sql_db criterion));
+  [%expect
+    {|
+    floor haste      sql=(3) store=((3)) stale=()
+    shop haste       sql=(1) store=((1)) stale=()
+    floor digging    sql=() store=(()) stale=()
+    props:Conj       sql=(1) store=((1)) stale=()
+    props:Conj,Alch  sql=(1) store=() stale=()
+    |}];
+  Db.close sql_db;
+  Db.close idx_db
+;;
+
+(* Seed 4's posting still says three; its deepened [Lair:2] potion makes four.
+   Reading the postings alone would tell a reader asking for 4x that none
+   exists -- the one direction a ceiling must never err in. *)
+let%expect_test "a deepened seed raises the store's ceiling above its posting" =
+  let sql_db, idx_db = deepened_pair () in
+  let haste = Test_search.floor Test_search.haste in
+  printf "sql   %s\n" (Test_search.ceiling sql_db haste);
+  printf "store %s\n" (store_ceiling idx_db haste);
+  printf "db    %s\n" (Test_search.ceiling idx_db haste);
+  [%expect
+    {|
+    sql   (4)
+    store ((4))
+    db    (4)
+    |}];
+  Db.close sql_db;
+  Db.close idx_db
+;;
+
+(* {1 Submitted seeds}
+
+   A reader-submitted seed is deep and lands without an ordinal. Until a
+   rebuild takes it in, both paths must hide it -- the SQL path by a filter,
+   the store by its absence -- or the fallback shows it first and the two
+   disagree. Seed 50 would lead every haste search and every ceiling here if
+   either leaked. *)
+
+let submitted_records =
+  [ {|#SEED#((format 4)(version "0.34.1")(seed "50")(level "D:1")(cats (items (((base_type "potion")(kind "item")(name "9 potions of haste")(quantity 9)(sub_type "haste")(text "9 potions of haste"))))))|}
+  ; {|#SEED#((format 4)(version "0.34.1")(seed "50")(level "Swamp:4")(cats (items (((artefact t)(base_type "weapon")(kind "item")(name "+2 Barblade")(plus 2)(quantity 1)(sub_type "long sword")(text "+2 Barblade"))))))|}
+  ]
+;;
+
+let submitted_pair () =
+  let sql_db, idx_db = corpus_pair () in
+  List.iter [ sql_db; idx_db ] ~f:(fun db ->
+    ignore
+      (Db.write_batch ~requested:true db (parse_records submitted_records) : Db.Counts.t);
+    Or_error.ok_exn (Db.rebuild_fts db));
+  sql_db, idx_db
+;;
+
+let path_seeds db ~sql terms ~rank =
+  let search =
+    Search.create ~version ~terms ~page:(Query.Page.create ~limit:1000 ()) ()
+  in
+  let matches, _ =
+    Or_error.ok_exn
+      (if sql
+       then Db.search_seeds_sql db search ~rank
+       else Db.search_seeds db search ~rank)
+  in
+  List.map matches ~f:(fun (m : Search.Match.t) -> m.seed)
+  |> List.sort ~compare:String.compare
+  |> String.concat ~sep:" "
+;;
+
+let%expect_test "a submitted seed is hidden from both paths until a rebuild" =
+  let sql_db, idx_db = submitted_pair () in
+  printf "store current: %b\n" (Db.search_index_is_current idx_db ~version);
+  let haste = [ Search.Term.create (Test_search.floor Test_search.haste) ] in
+  let barblade = [ Search.Term.create (Test_search.named "Barblade") ] in
+  agree_both_ranks ~label:"potion:haste" sql_db idx_db haste;
+  agree_both_ranks ~label:"name~Barblade" sql_db idx_db barblade;
+  let floor_haste = Test_search.floor Test_search.haste in
+  printf
+    "ceiling sql=%s store=%s\n"
+    (Test_search.ceiling sql_db floor_haste)
+    (store_ceiling idx_db floor_haste);
+  [%expect
+    {|
+    store current: true
+    potion:haste [seed]: agree (6 seeds)
+      store answered: true
+    potion:haste [shallowest]: agree (6 seeds)
+      store answered: true
+      depths agree: true
+    name~Barblade [seed]: agree (0 seeds)
+      store answered: true
+    name~Barblade [shallowest]: agree (0 seeds)
+      store answered: true
+      depths agree: true
+    ceiling sql=(3) store=((3))
+    |}];
+  Or_error.ok_exn (Db.build_search_index idx_db ~version);
+  printf
+    "store current after a rebuild: %b\n"
+    (Db.search_index_is_current idx_db ~version);
+  printf !"deep cohort: %{sexp: string list}\n" (overlaid_seeds idx_db);
+  List.iter [ Search.Rank.Seed; Search.Rank.Shallowest ] ~f:(fun rank ->
+    List.iter
+      [ "potion:haste", haste; "name~Barblade", barblade ]
+      ~f:(fun (label, terms) ->
+        printf
+          "%s [%s] store=%s sql=%s\n"
+          label
+          (Search.Rank.to_string rank)
+          (path_seeds idx_db ~sql:false terms ~rank)
+          (path_seeds idx_db ~sql:true terms ~rank)));
+  printf
+    "ceiling store=%s sql=%s\n"
+    (store_ceiling idx_db floor_haste)
+    (Test_search.ceiling_sql idx_db floor_haste);
+  [%expect
+    {|
+    store current after a rebuild: true
+    deep cohort: ()
+    potion:haste [seed] store=1 2 3 4 5 50 6 sql=1 2 3 4 5 50 6
+    name~Barblade [seed] store=50 sql=50
+    potion:haste [shallowest] store=1 2 3 4 5 50 6 sql=1 2 3 4 5 50 6
+    name~Barblade [shallowest] store=50 sql=50
+    ceiling store=((9)) sql=(9)
+    |}];
+  Db.close sql_db;
+  Db.close idx_db
+;;
+
+let%expect_test "submitting a seed does not stale the store; a fill reaching it does" =
+  let _sql_db, idx_db = submitted_pair () in
+  printf "after a submission: %b\n" (Db.search_index_is_current idx_db ~version);
+  ignore
+    (Db.write_batch idx_db (parse_records [ List.hd_exn submitted_records ])
+     : Db.Counts.t);
+  printf "after a fill reaches it: %b\n" (Db.search_index_is_current idx_db ~version);
+  printf
+    "found by the fallback: %s\n"
+    (path_seeds
+       idx_db
+       ~sql:false
+       [ Search.Term.create (Test_search.named "Barblade") ]
+       ~rank:Search.Rank.Seed);
+  [%expect
+    {|
+    after a submission: true
+    after a fill reaches it: false
+    found by the fallback: 50
+    |}];
   Db.close idx_db
 ;;

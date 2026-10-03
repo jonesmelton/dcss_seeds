@@ -70,6 +70,19 @@ val sample_seeds
   -> limit:int
   -> (Level.Summary.t list * [ `More | `End ]) Or_error.t
 
+(** Summaries for exactly [seeds], in the order given, dropping any the corpus
+    does not hold for [version].
+
+    A seed read from outside the corpus -- the feedback file outlives the file a
+    flag was made against -- may not be in the build being served, and
+    {!sample_seeds}'s summary shape would otherwise render it as an empty row
+    linking to a 404. *)
+val summarize_seeds
+  :  t
+  -> version:Query.Version.t
+  -> seeds:string list
+  -> Level.Summary.t list Or_error.t
+
 (** Every level of one seed on one build, ordered by level, entries ordered by
     category then name. An empty list means the seed is not ingested for that
     version; the corpus does not distinguish that from an ingested seed with no
@@ -103,14 +116,20 @@ end
 
     Registers each record's [version] first ([seed_levels] has a foreign key to
     [versions]). Re-ingesting a [(seed, version, level)] replaces it: the
-    [seed_levels] row is deleted and [entries] cascades. *)
-val write_batch : t -> Record.t list -> Counts.t
+    [seed_levels] row is deleted and [entries] cascades.
+
+    [requested] (default false) is a write for a job a reader asked for: a seed
+    it adds is outside the random sample ([seed_fills.origin = 'submit']), and a
+    seed already present keeps the origin it has. A fill, [requested = false],
+    adds sample seeds and takes a submitted seed it reaches into the sample. *)
+val write_batch : ?requested:bool -> t -> Record.t list -> Counts.t
 
 (** Lines that fail to parse are counted in [Counts.rejected] and reported to
     [on_reject] rather than aborting -- a crawl crash mid-level truncates a
     line. *)
 val ingest_channel
-  :  t
+  :  ?requested:bool
+  -> t
   -> In_channel.t
   -> batch_size:int
   -> on_reject:(int -> Error.t -> unit)
@@ -198,6 +217,46 @@ val search_seeds_sql
   -> rank:Search.Rank.t
   -> (Search.Match.t list * [ `More | `End ]) Or_error.t
 
+(** The largest count of [criterion] any one seed of the build holds: the
+    number a [Search.Term.min_count] on it can reach and no higher, or [None]
+    when no seed holds it at all. Explains an empty search; see
+    {!Search.ceiling_term}.
+
+    The same predicate as {!search_seeds} -- [criterion_where], summed per seed
+    across levels with a null quantity as one -- because a ceiling over any
+    other predicate answers a different question. [None] without a query for a
+    criterion {!Search.Criterion.has_count_ceiling} rejects.
+
+    {b Cost.} The store answers when it can ({!Search_index.ceiling}). The SQL
+    fallback is the search's own [group by] over the whole matching range, and
+    the search stops early only once a page of groups {i passes} its
+    [having], so on an empty SQL search it costs about what the search did
+    (1.00-1.11x, 10k, 0.34.1, D:8, local, warm, 2026-09-30). The store is not
+    an optimisation: a store-answered search walks seeds where this walks
+    rows. Never run it speculatively -- a satisfiable count lets the search
+    stop at one page, and this never stops early. *)
+val count_ceiling
+  :  t
+  -> version:Query.Version.t
+  -> Search.Criterion.t
+  -> int option Or_error.t
+
+(** {!count_ceiling} with the store never consulted, for timing the fallback
+    on a corpus where the store is current. Ignores
+    {!Search.Criterion.has_count_ceiling}. *)
+val count_ceiling_sql
+  :  t
+  -> version:Query.Version.t
+  -> Search.Criterion.t
+  -> int option Or_error.t
+
+(** {!count_ceiling} from the store alone: [None] when it declines. *)
+val count_ceiling_store
+  :  t
+  -> version:Query.Version.t
+  -> Search.Criterion.t
+  -> int option option Or_error.t
+
 (** The level names present for a build, in [seed_levels] order. The vocabulary
     depends on the depth the corpus was extracted at. *)
 val version_levels : t -> version:Query.Version.t -> string list Or_error.t
@@ -226,12 +285,14 @@ val distinct_criteria : t -> version:Query.Version.t -> string list Or_error.t
     so this is also how a page learns a deepen was tried and did not work. *)
 val job_for_seed : t -> version:Query.Version.t -> seed:string -> Job.t option Or_error.t
 
-val outstanding_jobs : t -> int Or_error.t
+(** Unfinished, unfailed jobs; of one [origin] when given, which is what each
+    origin's cap counts. *)
+val outstanding_jobs : ?origin:Job.Origin.t -> t -> int Or_error.t
 
 (** How many jobs are ahead of one queued seed, or [None] if it is not waiting.
 
     Counted by exactly the rule [claim_job] works through -- this version only,
-    unclaimed, unfinished, unfailed, oldest first -- because a position shown to
+    unclaimed, unfinished, unfailed, deepens before submissions, oldest first -- because a position shown to
     a reader is only honest if it is the one that will be worked through. A
     generator claims per version, so a job on another build is not ahead.
 
@@ -264,20 +325,29 @@ val servable_versions : t -> since:int -> string list Or_error.t
     corpus grows. *)
 val populated_versions : t -> string list Or_error.t
 
-(** Request a deep fill of one seed.
+(** Request a deep fill of one seed: a deepen of a seed the corpus holds, or a
+    reader's submission of one it does not.
 
     [`Already_queued] returns the existing job, which makes a double submission
-    free. Both refusals are decided inside the write transaction: reading the
-    cap outside it lets two simultaneous requests past a cap of one. *)
+    free. [cap] bounds outstanding jobs of [origin] only. [daily = (n, since)]
+    refuses with [`Daily_cap] once [n] submissions have been queued at or after
+    [since] -- finished ones included, since it bounds how much of the
+    generator is given away rather than how much is waiting. Every refusal is
+    decided inside the write transaction: reading a cap outside it lets two
+    simultaneous requests past a cap of one. *)
 val enqueue
-  :  t
+  :  ?daily:int * int
+  -> t
   -> version:Query.Version.t
   -> seed:string
+  -> origin:Job.Origin.t
   -> cap:int
   -> servable_since:int
-  -> [ `Queued | `Already_queued of Job.t | `Queue_full | `No_generator ] Or_error.t
+  -> [ `Queued | `Already_queued of Job.t | `Queue_full | `Daily_cap | `No_generator ]
+       Or_error.t
 
-(** Take the oldest unclaimed job for [version], sweeping abandoned claims
+(** Take the next unclaimed job for [version] -- the oldest deepen, else the
+    oldest submission -- sweeping abandoned claims
     first.
 
     A claim unrefreshed within [Job.reclaim_after] is presumed dead and cleared
@@ -403,6 +473,16 @@ val recompute_surprise : t -> version:Query.Version.t -> cap:Depth.t -> unit
     else is a bug. Shard bounds must be data-derived and closed at both ends;
     see [docs/corpus-scaling.md] for why either mistake is fatal. *)
 val rescore : ?shards:int -> t -> version:Query.Version.t -> cap:Depth.t -> unit
+
+(** Score one seed at every cap it reaches that a rescore has stored a cohort
+    for -- [heat_bands] and its [n] in [heat_cohorts] -- against that stored
+    population, and return those caps. For a seed a reader submitted, at job
+    finish: it is scored but never counted, so the cohort it is judged against
+    must be the one [rescore] measured, not a count taken now.
+
+    One seed's rows and the per-cap [surprise] table: index-backed, but a
+    write, so it belongs to the generator and never to a Dream handler. *)
+val score_seed : t -> version:Query.Version.t -> seed:string -> int list Or_error.t
 
 (** [seeds]' bands at [(version, cap)] -- a covering seek on [seed_scores]'
     primary key. A seed with no row (unscored, or ineligible at this cap) is

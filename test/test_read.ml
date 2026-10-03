@@ -325,6 +325,36 @@ let%expect_test "a sample draws real seeds of the right build" =
   Db.close db
 ;;
 
+let%expect_test "a submitted seed is not listed, sampled or counted" =
+  let db = corpus () in
+  ignore
+    (Db.write_batch
+       ~requested:true
+       db
+       [ Or_error.ok_exn (Reader.parse_line (line ~seed:"150" ~level:"D:1")) ]
+     : Db.Counts.t);
+  show_page db Query.Page.first;
+  [%expect
+    {|
+    ((100 2) (200 2) (300 2))
+    End
+    |}];
+  let sampled, _ = Or_error.ok_exn (Db.sample_seeds db ~version:v ~limit:50) in
+  List.map sampled ~f:(fun (s : Level.Summary.t) -> s.seed)
+  |> List.sort ~compare:String.compare
+  |> String.concat ~sep:" "
+  |> print_endline;
+  [%expect {| 100 200 300 |}];
+  printf "%d\n" (Or_error.ok_exn (Db.seed_count db ~version:v));
+  [%expect {| 3 |}];
+  (* The seed itself is still there to read. *)
+  printf
+    "%d level(s)\n"
+    (List.length (Or_error.ok_exn (Db.seed_levels db ~version:v ~seed:"150")));
+  [%expect {| 1 level(s) |}];
+  Db.close db
+;;
+
 (* Without sqlite_stat1 the planner sizes every index from built-in defaults
    and underestimates the partial ones badly: on the 10k corpus it chose
    entries_seed over entries_search_artefact, walking every entry of all 200

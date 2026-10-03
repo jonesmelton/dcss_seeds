@@ -413,7 +413,9 @@ build under a gate permit draws 1000 seeds and renders them as whole pages,
 default hits rotate through those strings, and a page older than 60s is
 rebuilt in the background while the old one is still served. The cost is
 staleness — a seed deepened since the last build shows its old summary for up
-to a minute. Every *search* now
+to a minute. The community garden (`/<version>/community`) is the same
+`Front_cache` and the same page shape over a different source: it draws its
+seeds from `Seed_corpus.Feedback` instead of the corpus. Every *search* now
 detaches and goes through the pool, not only the ones a cheapness predicate
 cleared: `Seed_web.search_is_cheap` and its inline shortcut were removed
 2026-09-29, because it asked about the plan when cost is set by the matched set.
@@ -614,10 +616,11 @@ logic, no SQL.
   the partial HTML htmx swaps in; a page handler wraps the same fragment in the
   document chrome. Both call the same view functions, so a seed card renders
   identically whether it arrives by full page load or by swap.
-- Mutations, if any appear, route through a single CSRF-enforcing wrapper — not
-  scattered ad-hoc handlers. Note that this app is mostly *read-only over a
-  corpus*; if the ingest queue (`ingest_jobs`) gets a web trigger, that is the
-  first real mutation and it needs the wrapper.
+- Mutations route through Dream's form check, not scattered ad-hoc handlers. This
+  app is mostly *read-only over a corpus*; its two mutations are the deepen
+  enqueue and the seed flag (see *Writer stance*), and a third needs the same
+  check. The CSRF token is minted once per seed page, in the seed handler, because
+  a deep seed has no deepen offer and still carries the flag.
 
 ### A floor is a ledger sheet, not one table
 
@@ -868,6 +871,49 @@ floor, and `entry_props.value` runs negative on about one row in five of `Str`,
 `rF`, `Slay` and their kin. A resistance you asked for is not answered by a
 vulnerability.
 
+**A brand is the item's, so the criterion carries the item.** `Criterion.Brand`
+is `Props`' shape one level down: `weapon:quick blade ego:distortion` names one
+object, and the two-token spelling is a merge at the parse boundary rather than
+two terms. Two terms would leak the same way `item:staff` beside
+`props:Conj,Alch` does -- a quick blade on D:3 beside a distortion spear on D:9
+satisfies the seed-level reading, and `hit_line` renders name, count and level,
+so the two unrelated items are two indistinguishable lines. The item is
+required, not optional, and a general brand search is refused: 9,971 of 10,000
+seeds hold *some* ego'd weapon or armour (10k, 0.34.1, `D:8`, local,
+2026-10-01), so the unqualified form is nearly unfiltered, and the question is
+always brand x item. One brand per term, because an item carries one ego --
+unlike `props:`, where a set has a meaning.
+
+The vocabulary is the **display word**, not the code the corpus stores
+(`distort`, `rF+`): the word is what a rendered name shows and therefore what a
+reader types, and the codes are hostile to type besides (mixed case, pluses, a
+space in `rC+ rF+`). Resolution runs the other way, per build, because crawl
+renamed eleven armour codes by capitalising them in 0.34.1
+(`docs/plans/crawl-renames.md`) -- the word is stable across builds, the code
+is not, so `Search.Brand.code` is version-aware and is the one place the
+criterion does not compile identically on two builds. `Display_name.Ego` and
+the word tables are tied together by an expect test, which is what forces a
+rekey when crawl renames one.
+
+Two spellings reach the same criterion. `ego:` after the item is the canonical
+one; a trailing `" of <word>"` in the item term is the rendered name, and it
+folds, because no weapon or armour `sub_type` contains `" of "` -- so the fold
+cannot change the meaning of a valid item term, and without it
+`weapon:quick blade of distortion` would parse as an item whose sub type is the
+whole string and silently match nothing. That is the silent-empty direction the
+whole parse boundary exists to close, and the field log shows readers typing
+it (`weapon:quick blade of chaos`, `weapon:executioner's axe of speed`). The
+same log shows the third spelling readers reach for: a brand typed as a
+property (`props:speed` and kin, 32 requests over 15 spellings, access log
+2026-09-12..2026-10-01), which is refused with a message naming the `ego:`
+form.
+
+Artefact-only codes (`reaping`, `penetration`) are listed for the coverage
+check and refused at the parse boundary: an artefact's brand is part of its
+name, so `name~` is that search. Jewellery is refused for a different reason --
+its ego is already its sub type (`jewellery:ring of protection from fire`), so
+an ego term there would answer the item term's own question.
+
 **Drawbacks are excluded on domain grounds, not technical ones.** `*Noise`,
 `^Contam`, `-Tele`, `Bane` and the rest are not searchable because nobody picks
 a seed for a drawback: whether one is worth living with is decided once you hold
@@ -925,8 +971,8 @@ constant rather than configuration because no real question needs an eleventh
 term.
 
 The form's term boxes carry a `<datalist>` of the build's own vocabulary: the
-`base:sub` item pairs and the bare feature names its entries actually hold,
-which is exactly the token shape a term takes. It is version-scoped like every
+`base:sub` item pairs, properties, brands and unrand names its entries actually
+hold, each in exactly the token shape a term takes. It is version-scoped like every
 other question, and `Db.distinct_criteria` is the accessor. The measurement that
 decided the shape: 427 item pairs and 52 feature names on the largest build,
 about 10.5 KB of text (0.34.1, D:8, 2026-09) — small enough that a
@@ -1011,9 +1057,50 @@ Unrand options carry their `name~` prefix, because that is the only criterion
 that reaches them and the prefixed form is what round-trips as a link — a bare
 name would parse as an item and fail.
 
+Brands are observed, not declared, because the set moves more than the word
+tables do: the 0.32.1 and 0.33.1 catalogs hold 30 armour and 19 weapon ego
+codes against 0.34.1's 44 and 25 (prod, 2026-10-02), so a list built from
+`Search.Brand`'s tables would offer about twenty dead terms on the older builds.
+Each code the build holds is offered as its word, in the form the search box
+echoes back (`weapon ego:distortion`), less the randart-only words the parser
+refuses. A current store answers from its brand rows; a stale one falls back to
+the distinct ego codes over `entries_search_ego`, 2.5s at 1.3M, because the
+per-base-type form leaves the covering index and took 4m13s (0.34.1, prod,
+2026-10-02).
+
 The list does not replace the help text. It covers the *nouns*; the affixes
-(`3x`, `shop `, `unique:`) are grammar a datalist cannot express,
-and `name~` is only pre-filled for the unrands.
+(`3x`, `shop `, a base type before `props:`) are grammar a datalist cannot
+express, and `name~` is only pre-filled for the unrands.
+
+### An impossible count names the ceiling
+
+An empty first page whose one counted term (`Search.ceiling_term`) cannot be met
+on its own says what the most is, and links to that count alone:
+`Db.count_ceiling`. Readers were finding the number by walking `10x → 9x → 8x`
+by hand (`docs/slow-queries.md`). The sentence is about the term by itself, so
+it stays true whatever else the search carried, and it is withheld when the
+count is reachable and the emptiness belongs to the conjunction. Not offered for
+`name~`, whose count totals unrelated items, for `props:`, which nobody counts
+(`Params` refuses the count), nor for two counted terms.
+
+It runs only after the search came back empty, never speculatively: a
+satisfiable count stops the search at one page, and the ceiling never stops
+early. It takes a gate permit like a search, under its own budget
+(`Params.ceiling_timeout`, 5s, no env var), and any failure renders the plain
+empty result. The store answers it when current, overlaying the deep cohort
+because a deepened seed's posting count understates; the SQL fallback costs
+about what the empty search did. See `db.mli` and `search_index.mli`.
+
+Measured with `corpus-search-bench -ceiling` (1.3M, 0.34.1, D:8, prod, store
+current, neighbor idle, median of 3, 2026-10-01). Store branch against the empty
+search it follows: `potion:curing` 0.198s after a 0.264s search, `potion:haste`
+0.148s / 0.205s, `scroll:teleportation` 0.203s / 0.266s, `scroll:acquirement`
+0.064s / 0.087s. The SQL branch is 0.54s for the two broadest. A multi-property
+`Props` has no store branch and costs **4.6–4.8s** in SQL for a common pair
+(`props:rF,Str`, `armour props:rF,Str`, `props:rF,Will`), against 0.03s for
+`Conj,Alch`. That is why `has_count_ceiling` refuses `Props` as well as
+`Params` refusing the count: the slow shape sits behind two refusals, so
+allowing `Nx props:` someday does not quietly bring it back.
 
 ### A rejected search hands the form back
 
@@ -1381,10 +1468,37 @@ breakage source. `Db.open_` sets them on every connection, not once at startup:
 
 Ingest is a batch writer holding one transaction per batch; the web layer is a
 reader. That asymmetry is the whole concurrency story — WAL plus `busy_timeout`
-covers it, with no application-level mutex. The web layer writes in exactly one
-place (the deepen enqueue), and it takes
+covers it, with no application-level mutex. The web layer writes in two places,
+to two files. The deepen enqueue goes to the corpus, and it takes
 `begin immediate` so it fails fast or waits, rather than discovering the
-conflict mid-transaction.
+conflict mid-transaction. The "this seed is good" flag goes to a file of its
+own (`SEED_FEEDBACK_DB`, default `feedback.db` beside the corpus), through `Seed_corpus.Feedback`, with a connection of its
+own.
+
+**Flags are not in the corpus, and the reason is that nothing can regenerate
+them.** The corpus is reproducible: every fill lands in a new file swapped in by
+rename (`ops/cutover.sh`), so a flag stored there would need migrating on each
+cutover or be silently dropped. A fill is eight ingest writers, and a flag
+button that said "paused while seeds are added" would be absurd. And the corpus
+(15.7 GB) is not worth backing up while a file of kilobytes of irreplaceable
+data must be. So the flag's `version` is the build *name*, not `versions.id` —
+ids are assigned per corpus file and mean nothing in another, which is the one
+place this schema deliberately departs from the corpus's interning rule. `session`
+is an HMAC of the Dream session id keyed by `SEED_SECRET`, for dedupe only; no
+address is stored. Set to `off`, the button is not rendered and the POST is a
+404, the same withdrawal `SEED_DISABLE_DEEPEN` gives deepen.
+
+**The community garden is the one reader of flags, and it reads them as a set,
+not a score.** `/<version>/community` is a second `Front_cache` wall in the
+shape of the front page, drawing its seeds from `Seed_corpus.Feedback` rather
+than the corpus. Flags are per-session, so the same seed can be flagged many
+times; `Feedback.sample_seeds` is `distinct`, which is what keeps the garden a
+set of seeds. Each drawn seed is then summarised from the corpus, and a flag
+naming a seed the served build does not hold is dropped — the file outlives the
+corpus it was written against, and `sample_seeds`'s summary shape would
+otherwise render an empty row linking to a 404. No count and no ranking: the
+file is still nobody's popularity contest. With the store withdrawn the route
+is a 404 and the nav link is not rendered, so there is no link to a dead page.
 
 **The web process holds a dedicated reader, a dedicated writer, and a pool of
 read-only connections for detached queries.** A single shared handle cannot
@@ -1448,7 +1562,8 @@ drain. `SEED_DISABLE_DEEPEN` (`Params.deepen_disabled`) is the explicit
 counterpart for that case — checked alongside the lock everywhere the lock is,
 so a read-only instance withdraws the offer, refuses the POST, and (see
 `Seed_web.health`) stops treating generator liveness as a health signal, for
-the same reason: no generator will ever heartbeat there.
+the same reason: no generator will ever heartbeat there. Reader submissions (`POST /*/seed/*/submit`) are gated by the same three:
+the lock, `SEED_DISABLE_DEEPEN`, and their own `SEED_DISABLE_SUBMIT`.
 
 The lock is consulted rather than a flag in the corpus because it is
 self-healing: a fill killed mid-run releases it when its fd closes, where a

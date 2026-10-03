@@ -1,5 +1,7 @@
 open! Core
 
+let () = Seed_web.Views.canned_order := Fn.id
+
 (* Format buffers output internally, so a renderer that reads its Buffer
    without flushing loses whatever is still held. Invisible while every render
    was a single element; it surfaced as soon as a fragment returned several and
@@ -50,6 +52,7 @@ let job ?started_at ?finished_at ?error () =
   ; finished_at
   ; attempts = 0
   ; error
+  ; origin = Job.Origin.Deepen
   }
 ;;
 
@@ -233,6 +236,7 @@ let detail ?gold entries =
     ~job:None
     ~position:None
     ~csrf:None
+    ~flag:None
     ~filling:false
     [ { Level.level = "D:5"; parent_level = None; temple_altars = None; gold; entries } ]
   |> List.map ~f:Seed_web.render_fragment
@@ -804,14 +808,14 @@ let%expect_test "the empty form is placeheld; a form with terms is not" =
     |}]
 ;;
 
-(* Property suggestions are labelled, since a bare "props:Conj" in a list of
-   item pairs does not say what kind of thing it is. Item pairs are not: they
-   are the datalist's bulk and a label on every row is noise. *)
-let%expect_test "property suggestions carry a label, item pairs do not" =
+(* Property and brand suggestions are labelled, since a bare "props:Conj" in a
+   list of item pairs does not say what kind of thing it is. Item pairs are
+   not: they are the datalist's bulk and a label on every row is noise. *)
+let%expect_test "property and brand suggestions carry a label, item pairs do not" =
   let html =
     Seed_web.Views.search_page
       ~search:(Search.create ~version:v ())
-      ~suggestions:(Some [ "potion:haste"; "props:Conj" ])
+      ~suggestions:(Some [ "potion:haste"; "props:Conj"; "armour ego:fire resistance" ])
       ~rank:Search.Rank.default
       ~more:`End
       []
@@ -822,11 +826,31 @@ let%expect_test "property suggestions carry a label, item pairs do not" =
     "prop labelled:    %b\n"
     (String.is_substring html ~substring:"Conj — artefact property");
   printf
+    "brand labelled:   %b\n"
+    (String.is_substring html ~substring:"fire resistance — armour brand");
+  printf
     "pair unlabelled:  %b\n"
     (not (String.is_substring html ~substring:"potion:haste\" label"));
   [%expect
     {|
     prop labelled:    true
+    brand labelled:   true
     pair unlabelled:  true
     |}]
+;;
+
+let%expect_test "an empty search offers three canned searches as links" =
+  let html =
+    Seed_web.Views.search_page
+      ~search:(Search.create ~version:v ~terms:[] ())
+      ~suggestions:None
+      ~rank:Search.Rank.default
+      ~more:`End
+      []
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  let offers = String.substr_index_all html ~may_overlap:false ~pattern:"/search?has=" in
+  printf "links: %d\n" (List.length offers);
+  [%expect {| links: 3 |}]
 ;;

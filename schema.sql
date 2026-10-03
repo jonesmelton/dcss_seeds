@@ -182,6 +182,17 @@ create table heat_bands (
     foreign key (version_id) references versions (id)
 ) strict, without rowid;
 
+-- The population size `surprise` and `heat_bands` were computed against, so a
+-- seed scored alone later (a submitted one) uses the same `n` the cohort did. A
+-- count taken at that later moment is a different population.
+create table heat_cohorts (
+    version_id integer not null,
+    cap integer not null,
+    seeds integer not null,
+    primary key (version_id, cap),
+    foreign key (version_id) references versions (id)
+) strict, without rowid;
+
 -- A seed is claimed by setting started_at, so an interrupted run leaves a
 -- reclaimable row rather than a gap. Claims are taken under `begin immediate`
 -- and check changes(), so the loser of a race picks another job. attempts
@@ -201,8 +212,12 @@ create table ingest_jobs (
     finished_at integer,
     attempts integer not null default 0,
     error text,
+    origin text not null default 'deepen' check (origin in ('deepen', 'submit')),
     primary key (seed, version_id)
 ) strict, without rowid;
+
+-- The day's submissions, for the global daily cap.
+create index ingest_jobs_submitted on ingest_jobs (queued_at) where origin = 'submit';
 
 -- Which versions a generator can build. The web process cannot tell on its own:
 -- it has no build tree, and `versions` records what was ingested, not what can
@@ -223,39 +238,60 @@ create index generators_version on generators (version_id, heartbeat_at);
 -- effort as much as dungeon content. `depth` is a Depth.t -- reach order, not a
 -- level name -- derived from the levels a seed holds rather than carried on the
 -- wire, which is what makes it backfillable. See lib/corpus/fill_depth.mli.
+--
+-- `origin` separates the random sample ('fill') from seeds a reader named
+-- ('submit'). A named seed was chosen because something about it caught
+-- someone's interest, so it never counts toward a population statistic, the
+-- seed count, or a listing; a fill that later reaches it makes it 'fill'.
+-- `indexed_at` is set by the search store build that took a submitted seed in;
+-- until then both search paths hide it. Null on every 'fill' row.
 create table seed_fills (
     seed text not null,
     version_id integer not null,
     depth integer not null,
     filled_at integer not null default (unixepoch()),
+    origin text not null default 'fill' check (origin in ('fill', 'submit')),
+    indexed_at integer,
     primary key (seed, version_id),
     foreign key (version_id) references versions (id)
 ) strict, without rowid;
 
 create index seed_fills_cohort on seed_fills (version_id, depth, seed);
 
--- count(*) of seed_fills per version, kept by trigger so the search store's
--- currency check is a primary-key read rather than a covering-index scan (88ms
--- at 1,299,999 seeds, prod, 2026-09-16, on every store-served search). A deepen
--- upserts through `on conflict do update`, which fires neither trigger. An
--- `insert or replace` would count twice, since delete triggers do not fire on a
--- replace; tools/corpus-check compares this with count(*).
+create index seed_fills_pending on seed_fills (version_id, seed) where origin = 'submit' and indexed_at is null;
+
+-- The sample's size per version -- seed_fills rows with origin 'fill' -- kept
+-- by trigger so the search store's currency check is a primary-key read rather
+-- than a covering-index scan (88ms at 1,299,999 seeds, prod, 2026-09-16, on
+-- every store-served search). Submitted seeds are left out so a submission does
+-- not stale the store for the whole build. A deepen upserts through `on conflict
+-- do update`, which fires neither insert nor delete trigger; a fill upgrading a
+-- submitted seed fires the update one. An `insert or replace` would count
+-- twice, since delete triggers do not fire on a replace; tools/corpus-check
+-- compares this with count(*).
 create table seed_fill_counts (
     version_id integer primary key,
     seeds integer not null,
     foreign key (version_id) references versions (id)
 ) strict;
 
-create trigger seed_fills_counted after insert on seed_fills
+create trigger seed_fills_sample_counted after insert on seed_fills when new.origin = 'fill'
 begin
     insert into seed_fill_counts (version_id, seeds)
          values (new.version_id, 1)
     on conflict (version_id) do update set seeds = seeds + 1;
 end;
 
-create trigger seed_fills_uncounted after delete on seed_fills
+create trigger seed_fills_sample_uncounted after delete on seed_fills when old.origin = 'fill'
 begin
     update seed_fill_counts set seeds = seeds - 1 where version_id = old.version_id;
+end;
+
+create trigger seed_fills_sample_joined after update of origin on seed_fills when old.origin = 'submit' and new.origin = 'fill'
+begin
+    insert into seed_fill_counts (version_id, seeds)
+         values (new.version_id, 1)
+    on conflict (version_id) do update set seeds = seeds + 1;
 end;
 
 create index seed_levels_version_seed on seed_levels (version_id, seed);

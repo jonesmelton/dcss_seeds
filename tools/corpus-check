@@ -155,12 +155,12 @@ fi
 
 # The search store's currency check reads this counter instead of counting, so
 # a drift reads as a fill that never happened, or hides one that did.
-if [ "$(q "select count(*) from sqlite_master where type = 'trigger' and name in ('seed_fills_counted', 'seed_fills_uncounted');")" -ne 2 ]; then
+if [ "$(q "select count(*) from sqlite_master where type = 'trigger' and name in ('seed_fills_sample_counted', 'seed_fills_sample_uncounted', 'seed_fills_sample_joined');")" -ne 3 ]; then
     echo "WARN: seed_fill_counts triggers missing -- run: tools/corpus-reindex --db $db"
     status=1
 else
     counted=$(q "select coalesce((select c.seeds from seed_fill_counts c join versions v on v.id = c.version_id where v.version = '$version'), 0);")
-    actual=$(q "select count(*) from seed_fills f join versions v on v.id = f.version_id where v.version = '$version';")
+    actual=$(q "select count(*) from seed_fills f join versions v on v.id = f.version_id where v.version = '$version' and f.origin = 'fill';")
     if [ "$counted" -ne "$actual" ]; then
         echo "FAIL: seed_fill_counts says $counted, seed_fills holds $actual"
         echo "      recount with: tools/corpus-reindex --db $db"
@@ -182,6 +182,12 @@ if [ -n "$range" ]; then
         status=1
     else
         echo "  ok: $start..$end is complete"
+    fi
+    submitted=$(q "select count(*) from seed_fills f join versions v on v.id = f.version_id where v.version = '$version' and f.origin = 'submit' and cast(f.seed as integer) between $start and $end;")
+    if [ "$submitted" -gt 0 ]; then
+        echo "FAIL: $submitted seed(s) in $start..$end were submitted by readers, not filled"
+        echo "      take them into the sample with: tools/corpus-fill $version -s $start -n $want --skip-done"
+        status=1
     fi
 fi
 
@@ -213,6 +219,35 @@ if [ -n "$unknown" ]; then
     status=1
 else
     echo "  ok: property vocabulary matches the corpus"
+fi
+
+# The brand vocabulary is listed in code for the same reason, and a crawl
+# release adding an ego is silent in the same direction: on real items,
+# unsearchable, with no error anywhere. Compare the (base type, ego) codes the
+# corpus holds against Search.Brand's tables. The tables are (word, code) pairs
+# and the corpus stores the code, so every second quoted string is the one to
+# compare.
+code_brands="$(sed -n '/^  let weapon_codes =/,/^  ;;/p; /^  let armour_codes =/,/^  ;;/p' "$root/lib/corpus/search.ml" \
+    | grep -oE '"[^"]+"' | tr -d '"' | awk 'NR % 2 == 0' | sort -u)"
+# Eleven armour codes were capitalised in 0.34.1 (docs/plans/crawl-renames.md),
+# so an earlier build stores the lowercase spelling of each.
+case "$version" in
+    0.32.*|0.33.*)
+        recoded="$(sed -n '/^  let recoded =/,/^  ;;/p' "$root/lib/corpus/search.ml" \
+            | grep -oE '"[^"]+"' | tr -d '"' | tr '[:upper:]' '[:lower:]')"
+        code_brands="$(printf '%s\n%s\n' "$code_brands" "$recoded" | sort -u)"
+        ;;
+esac
+db_brands="$(q "select distinct s.val from entries e join strings b on b.id = e.base_type_id join strings s on s.id = e.ego_id join versions v on v.id = e.version_id where v.version = '$version' and e.ego_id is not null and b.val in ('weapon', 'armour');" | sort -u)"
+unknown_brands="$(comm -13 <(echo "$code_brands") <(echo "$db_brands"))"
+if [ -n "$unknown_brands" ]; then
+    echo "WARN: $(echo "$unknown_brands" | wc -l | tr -d ' ') weapon or armour ego code(s) in the corpus are not in Search.Brand:"
+    echo "$unknown_brands" | sed 's/^/        /'
+    echo "      they cannot be searched for. Add them to lib/corpus/search.ml,"
+    echo "      and to Brand.randart_only if they only roll on artefacts."
+    status=1
+else
+    echo "  ok: brand vocabulary matches the corpus"
 fi
 
 exit $status

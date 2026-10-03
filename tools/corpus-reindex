@@ -83,6 +83,16 @@ add_column search_index_state built_seeds "integer not null default -1"
 # Null reads as deepened, so a store built before this column overlays every
 # deep seed, as it did then, until `just index` rebuilds it.
 add_column seed_ordinals built_depth integer
+# Every seed a corpus held before reader submissions existed was filled, so the
+# default is the truth for all of them.
+add_column seed_fills origin "text not null default 'fill' check (origin in ('fill', 'submit'))"
+add_column seed_fills indexed_at integer
+add_column ingest_jobs origin "text not null default 'deepen' check (origin in ('deepen', 'submit'))"
+
+# The trigger replay below is `if not exists`, so a trigger redefined under its
+# old name would keep its old body. These counted every seed_fills row; their
+# replacements count the sample only.
+sqlite3 -init /dev/null "$db" "drop trigger if exists seed_fills_counted; drop trigger if exists seed_fills_uncounted;"
 
 before=$(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_master where type = 'index' and name not like 'sqlite_%';")
 before_t=$(sqlite3 -init /dev/null -noheader "$db" "select count(*) from sqlite_master where type = 'table' and name not like 'sqlite_%';")
@@ -218,7 +228,7 @@ sqlite3 -init /dev/null "$db" "
 begin immediate;
 delete from seed_fill_counts;
 insert into seed_fill_counts (version_id, seeds)
-select version_id, count(*) from seed_fills group by version_id;
+select version_id, count(*) from seed_fills where origin = 'fill' group by version_id;
 commit;"
 
 # A new index the planner does not know the size of is the same problem as a

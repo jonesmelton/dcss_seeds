@@ -68,7 +68,7 @@ let%expect_test "every emitted link carries the version" =
     }
   in
   let html =
-    Seed_web.Views.seed_list ~version ~page:Query.Page.first [ summary ]
+    Seed_web.Views.seed_list ~more:true ~version ~page:Query.Page.first [ summary ]
     |> List.map ~f:Seed_web.render_fragment
     |> String.concat
   in
@@ -77,6 +77,78 @@ let%expect_test "every emitted link carries the version" =
     {|
     /0.34.1/seed/12345
     /0.34.1/?limit=50
+    |}]
+;;
+
+(* The garden's route is [/:version/community] and the front page's is
+   [/:version/], so only one of the two "more" links carries a slash before the
+   query string. The garden's did, and /<v>/community/?limit=50 matched no route
+   (2026-10-02). *)
+let%expect_test "the garden's more link is the shape of its own route" =
+  let module Query = Seed_corpus.Query in
+  let version = Served.to_version Served.current in
+  let summary : Seed_corpus.Level.Summary.t =
+    { seed = "12345"
+    ; temple = Some "D:5"
+    ; artefacts = 1
+    ; rare_altars = []
+    ; portals = []
+    ; boons = []
+    ; heat = None
+    }
+  in
+  let hrefs ~community =
+    Seed_web.Views.seed_list
+      ~community
+      ~more:true
+      ~version
+      ~page:(Query.Page.create ~limit:1 ())
+      [ summary ]
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+    |> fun html -> attrs html ~pattern:"href=\""
+  in
+  printf "garden:\n";
+  hrefs ~community:true;
+  printf "front:\n";
+  hrefs ~community:false;
+  [%expect
+    {|
+    garden:
+    /0.34.1/seed/12345
+    /0.34.1/community?limit=1
+    front:
+    /0.34.1/seed/12345
+    /0.34.1/?limit=1
+    |}]
+;;
+
+(* A pool of one page or less has nothing behind "More", so the link is not
+   offered. It is the one thing on the page that would do nothing. *)
+let%expect_test "no more link when the pool is a single page" =
+  let module Query = Seed_corpus.Query in
+  let version = Served.to_version Served.current in
+  let summary : Seed_corpus.Level.Summary.t =
+    { seed = "12345"
+    ; temple = Some "D:5"
+    ; artefacts = 1
+    ; rare_altars = []
+    ; portals = []
+    ; boons = []
+    ; heat = None
+    }
+  in
+  let html =
+    Seed_web.Views.seed_list ~more:false ~version ~page:Query.Page.first [ summary ]
+    |> List.map ~f:Seed_web.render_fragment
+    |> String.concat
+  in
+  printf "more link: %b\n" (String.is_substring html ~substring:"limit=");
+  printf "rows:      %b\n" (String.is_substring html ~substring:"seed/12345");
+  [%expect
+    {|
+    more link: false
+    rows:      true
     |}]
 ;;
 
@@ -94,7 +166,7 @@ let%expect_test "list tags carry the tile of the thing they name, boons first" =
     }
   in
   let html =
-    Seed_web.Views.seed_list ~version ~page:Query.Page.first [ summary ]
+    Seed_web.Views.seed_list ~more:true ~version ~page:Query.Page.first [ summary ]
     |> List.map ~f:Seed_web.render_fragment
     |> String.concat
   in
@@ -146,7 +218,8 @@ let%expect_test "the build picker links to every served build with its count" =
       (Seed_web.Index.masthead
          ~version:(Some version)
          ~builds
-         ~here:Seed_web.Index.Page.Seeds)
+         ~here:Seed_web.Index.Page.Seeds
+         ~community:false)
   in
   attrs html ~pattern:"href=\"";
   printf
@@ -177,7 +250,8 @@ let%expect_test "no counts means no picker" =
       (Seed_web.Index.masthead
          ~version:(Some version)
          ~builds:[]
-         ~here:Seed_web.Index.Page.Seeds)
+         ~here:Seed_web.Index.Page.Seeds
+         ~community:false)
   in
   printf "picker present: %b\n" (String.is_substring html ~substring:"build-picker");
   attrs html ~pattern:"href=\"";
@@ -189,6 +263,27 @@ let%expect_test "no counts means no picker" =
     /0.34.1/search
     /0.34.1/about
     /0.34.1/
+    |}]
+;;
+
+(* A link to a page that 404s is worse than no link, so the garden appears in
+   the nav only where the feedback store is configured. *)
+let%expect_test "the community garden link appears only when configured" =
+  let version = Served.to_version Served.current in
+  let nav community =
+    Seed_web.render_fragment
+      (Seed_web.Index.masthead
+         ~version:(Some version)
+         ~builds:[]
+         ~here:Seed_web.Index.Page.Seeds
+         ~community)
+  in
+  printf "absent:  %b\n" (String.is_substring (nav false) ~substring:"/community");
+  printf "present: %b\n" (String.is_substring (nav true) ~substring:"/community");
+  [%expect
+    {|
+    absent:  false
+    present: true
     |}]
 ;;
 
@@ -209,6 +304,7 @@ let%expect_test "the deepen form and the poll carry the version" =
       ~job:None
       ~position:None
       ~csrf:(Some "t")
+      ~flag:None
       ~filling:false
       levels
     |> List.map ~f:Seed_web.render_fragment
@@ -227,6 +323,7 @@ let%expect_test "the deepen form and the poll carry the version" =
     ; finished_at = None
     ; attempts = 0
     ; error = None
+    ; origin = Seed_corpus.Job.Origin.Deepen
     }
   in
   let polling =

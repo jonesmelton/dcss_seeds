@@ -437,6 +437,52 @@ let%expect_test "ingest records a seed's fill depth, and deepening updates it" =
   Db.close db
 ;;
 
+let%expect_test "a requested seed stays out of the sample until a fill reaches it" =
+  let db = fresh_db () in
+  let record ~seed level =
+    Or_error.ok_exn
+      (Reader.parse_line
+         (sample_line
+          |> String.substr_replace_first
+               ~pattern:{|(level "D:2")|}
+               ~with_:(sprintf {|(level "%s")|} level)
+          |> String.substr_replace_first
+               ~pattern:{|(seed "777")|}
+               ~with_:(sprintf {|(seed "%s")|} seed)))
+  in
+  let state () =
+    show
+      db
+      "select f.seed, f.origin, f.depth from seed_fills f order by f.seed; select \
+       'sample ' || seeds from seed_fill_counts"
+  in
+  ignore (Db.write_batch db [ record ~seed:"777" "D:8" ] : Db.Counts.t);
+  ignore
+    (Db.write_batch ~requested:true db [ record ~seed:"778" "Swamp:4" ] : Db.Counts.t);
+  state ();
+  [%expect
+    {|
+    777|fill|8
+    778|submit|14
+    sample 1
+    |}];
+  (* A request for a seed the sample already holds is a deepen: it must not
+     take the seed out of the sample. *)
+  ignore
+    (Db.write_batch ~requested:true db [ record ~seed:"777" "Swamp:4" ] : Db.Counts.t);
+  ignore (Db.write_batch db [ record ~seed:"778" "D:8" ] : Db.Counts.t);
+  state ();
+  [%expect
+    {|
+    777|fill|14
+    778|fill|14
+    sample 2
+    |}];
+  show db "delete from seed_fills where seed = '778'; select seeds from seed_fill_counts";
+  [%expect {| 1 |}];
+  Db.close db
+;;
+
 (* What makes a column list edited apart from its SQL skeleton fail loudly
    instead of reading a shifted row. *)
 let%expect_test "a column list that disagrees with the statement is refused" =

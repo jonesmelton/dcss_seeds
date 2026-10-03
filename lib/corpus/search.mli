@@ -75,6 +75,62 @@ module Prop : sig
   val min_value : int
 end
 
+module Brand : sig
+  (** Which item brands a reader may search for, and how a word becomes the
+      code a given build stores.
+
+      A brand is an item's ego: a weapon's brand ("quick blade of
+      distortion") or an armour's ("robe of fire resistance"). The corpus
+      stores crawl's terse code ([distort], [rF+]) in [entries.ego_id], which
+      no reader types and whose spelling has itself renamed across builds
+      (crawl capitalised eleven armour codes in 0.34.1) -- so the searchable
+      vocabulary is the *display word*, resolved to the build's code at query
+      time. Keying on the word is what lets ["protection"] mean a weapon
+      brand beside an armour ego: the criterion's base type decides which
+      table answers.
+
+      The word tables mirror [Display_name.Ego] and are tied to it by an
+      expect test, so a rename in one forces the rekey in the other. Codes
+      that never roll on a non-artefact item (reaping, penetration) are listed
+      for that test and [tools/corpus-check] but refused at the parse
+      boundary: an artefact's brand is part of the name [name~] searches. *)
+
+  (** ["weapon"; "armour"] -- the base types whose ego is orthogonal to the
+      sub type. Jewellery's ego is already its sub type ("ring of protection
+      from fire"), so an ego term there would answer the item term's own
+      question. *)
+  val base_types : string list
+
+  (** The words this base type accepts, in table order; the union over
+      {!base_types} is the whole vocabulary, artefact-only words included. *)
+  val words : base_type:string -> string list
+
+  (** The canonical spelling of a word named case-insensitively, or [None].
+      Canonicalisation is per base type: ["protection"] is a weapon word and
+      an armour word, and the caller names which. *)
+  val canonical : base_type:string -> string -> string option
+
+  (** [canonical] without a base type, for messages: any table's word. *)
+  val canonical_any : string -> string option
+
+  (** The word a code spells, or [None] -- for telling a reader who typed the
+      code ([ego:distort]) what the word is. *)
+  val word_of_code : base_type:string -> string -> string option
+
+  (** Why a brand is not searchable, phrased for a reader, or [None] if it is.
+      The one reason is artefact-only (see the module doc); unlike properties
+      there are no drawbacks and no engine flags to distinguish. *)
+  val why_excluded : base_type:string -> string -> string option
+
+  (** The code a given build stores for a word, or [None] if the word is
+      unknown. Version-aware for the 0.34.1 armour capitalisation, the one
+      rename in the served set; weapon codes are stable across all three
+      builds. [None] is distinguishable from a code because the criterion is
+      public-API-constructible and storage must not bind a word where a code
+      is expected. *)
+  val code : base_type:string -> version:Query.Version.t -> string -> string option
+end
+
 module Criterion : sig
   (** Where an item sits. [cost] being present is the only thing telling shop
       stock from floor loot, and the two values partition that union totally --
@@ -123,7 +179,19 @@ module Criterion : sig
       ([item:staff] beside [props:Conj,Alch]) reintroduces the leak one level
       up, and it is not a rare case: school enhancers roll off-staff about 45%
       of the time (staff 223, armour 170, jewellery 15 across the ten school
-      properties, 10k local corpus, 0.34.1). [None] means any artefact. *)
+      properties, 10k local corpus, 0.34.1). [None] means any artefact.
+
+      [Brand] is the same shape one level down: the brand and the *whole item*
+      (not just a base type) are one criterion, because [weapon:quick blade]
+      beside [weapon ego:distortion] would match a quick blade on D:3 beside a
+      distortion spear on D:9 -- the [Props] leak again, and [hit_line] cannot
+      show it. The item is required rather than optional, and a general brand
+      search is refused: 9,971 of 10,000 seeds hold *some* ego'd weapon or
+      armour (10k, 0.34.1, D:8, local, 2026-10-01), so the unqualified form is
+      nearly unfiltered. One term carries one brand, because an item carries
+      one ego -- there is no set to spell. [word] is the display word; [Brand.code] resolves it to
+      the build's own code spelling, which is why storage is version-aware
+      here and nowhere else. *)
   type t =
     | Item of Item_type.t * position
     | Name_like of string * position
@@ -132,6 +200,12 @@ module Criterion : sig
     | Props of
         { base_type : string option
         ; props : string list
+        ; position : position
+        }
+    | Brand of
+        { base_type : string
+        ; sub_type : string option
+        ; word : string
         ; position : position
         }
   [@@deriving compare, sexp_of]
@@ -168,6 +242,25 @@ module Criterion : sig
       pair matches too few seeds to fill a page. Everything else is a single
       covering-index seek. *)
   val is_cheap : t -> bool
+
+  (** Whether "the most any seed holds is [n]" answers the question a count on
+      this criterion asks. [false] for two criteria, both on grounds of meaning
+      rather than cost.
+
+      [Name_like]: a fragment's count totals a family of unrelated items
+      ([name~golden] reaches a bow and a ring), so its maximum is a true
+      sentence about a question nobody asked.
+
+      [Props]: counting properties is not a question anyone asks, which is why
+      [Params] refuses the count outright, and this keeps the two in step. It
+      also keeps a slow shape behind that refusal rather than beside it: a
+      multi-property ceiling has no store branch, and its SQL is 4.6-4.8s for a
+      common pair ([props:rF,Str], 1.3M, 0.34.1, prod, 2026-10-01).
+
+      Cost is not otherwise judged here -- a static model of it
+      ([search_is_cheap]) was wrong before, because cost is set by the matched
+      set rather than the plan. *)
+  val has_count_ceiling : t -> bool
 
   (** Minimum fragment length accepted for [Name_like]. Enforced at the parse
       boundary in [Params]; this constant is the source of truth. *)
@@ -227,6 +320,13 @@ val create
   -> t
 
 val is_empty : t -> bool
+
+(** The term an empty result can be explained by: the search's one counted
+    term, when {!Criterion.has_count_ceiling} holds for it. [None] with no
+    counted term, and with two or more -- the summed-scalar shape that would
+    explain a second is the known-slow one, and a reader with two counts out of
+    reach already has the worse problem. See {!Db.count_ceiling}. *)
+val ceiling_term : t -> Term.t option
 
 (** Terms an index can serve, then terms it cannot. Storage evaluates the
     indexed ones first so the rest run against a narrowed set.

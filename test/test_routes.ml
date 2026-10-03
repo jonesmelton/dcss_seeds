@@ -1,4 +1,7 @@
 open! Core
+
+let () = Seed_web.Views.canned_order := Fn.id
+
 module Db = Seed_corpus.Db
 module Pool = Seed_corpus.Pool
 module Reader = Seed_corpus.Reader
@@ -21,7 +24,17 @@ let line ~seed ~level ~version =
    just outside it; [`None] writes no heartbeat row at all. [records] (default
    [true]) skips seeding seeds 100 and 200, for a corpus with the schema but
    nothing in it. *)
-let with_corpus ?(heartbeat = `Fresh) ?(records = true) ~f () =
+(* [extra] appends raw records to the standard two-seed fixture, for a test
+   that needs one thing the fixture does not carry. *)
+let with_corpus
+      ?(heartbeat = `Fresh)
+      ?(records = true)
+      ?(extra = [])
+      ?feedback_path
+      ?flag_limit
+      ~f
+      ()
+  =
   let path = Filename_unix.temp_file "routes" ".db" in
   let writer = Db.open_ path in
   Db.exec_script writer (In_channel.read_all "../schema.sql");
@@ -34,6 +47,7 @@ let with_corpus ?(heartbeat = `Fresh) ?(records = true) ~f () =
           Or_error.ok_exn
             (Reader.parse_line
                (line ~seed ~level ~version:(Seed_corpus.Query.Version.to_string version)))))
+      @ List.map extra ~f:(fun line -> Or_error.ok_exn (Reader.parse_line line))
     in
     ignore (Db.write_batch writer records : Db.Counts.t));
   (* /health reads back a generator heartbeat and answers 503 without one, so a
@@ -52,8 +66,12 @@ let with_corpus ?(heartbeat = `Fresh) ?(records = true) ~f () =
   let reader = Db.open_ path in
   let pool = Pool.create path ~size:2 in
   let lock_path = Seed_corpus.Deepen.fill_lock_path ~db_path:path in
+  let feedback =
+    Option.map feedback_path ~f:(Seed_corpus.Feedback.open_ ~key:"test-key")
+  in
   Fun.protect
     ~finally:(fun () ->
+      Option.iter feedback ~f:Seed_corpus.Feedback.close;
       Db.close reader;
       Db.close writer;
       Pool.close pool;
@@ -64,7 +82,13 @@ let with_corpus ?(heartbeat = `Fresh) ?(records = true) ~f () =
            (Dream.test
               (Seed_web.head_as_get
                  (Seed_web.security_headers
-                    (Seed_web.router ~reader ~writer ~pool ~lock_path))))
+                    (Seed_web.router
+                       ?flag_limit
+                       ~feedback
+                       ~reader
+                       ~writer
+                       ~pool
+                       ~lock_path))))
          ~writer
          ~lock_path)
 ;;
@@ -152,9 +176,9 @@ let%expect_test "HEAD sends no body but reports the length GET would" =
     /health              GET body 7  HEAD body 0  HEAD content-length 7
     /robots.txt          GET body 129  HEAD body 0  HEAD content-length 129
     /sitemap.xml         GET body 482  HEAD body 0  HEAD content-length 482
-    /0.34.1/             GET body 5604  HEAD body 0  HEAD content-length 5604
-    /0.34.1/about        GET body 4233  HEAD body 0  HEAD content-length 4233
-    /0.34.1/search/help  GET body 11082  HEAD body 0  HEAD content-length 11082
+    /0.34.1/             GET body 5361  HEAD body 0  HEAD content-length 5361
+    /0.34.1/about        GET body 4329  HEAD body 0  HEAD content-length 4329
+    /0.34.1/search/help  GET body 7624  HEAD body 0  HEAD content-length 7624
     |}]
 ;;
 
@@ -321,8 +345,8 @@ let value_after s ~key ~until =
   String.drop_prefix s (i + String.length key) |> String.take_while ~f:(Fn.non until)
 ;;
 
-let seed_page_token handle =
-  let target = sprintf "/%s/seed/100" (Served.to_string Served.current) in
+let seed_page_token ?(seed = "100") handle =
+  let target = sprintf "/%s/seed/%s" (Served.to_string Served.current) seed in
   let response = handle (Dream.request ~method_:`GET ~target "") in
   let body = Lwt_main.run (Dream.body response) in
   let input =
@@ -550,6 +574,44 @@ let with_indexed_router ~f =
     ()
 ;;
 
+let brand_line ~seed ~level ~version =
+  sprintf
+    {|#SEED#((format 4)(version "%s")(seed "%s")(level "%s")(cats (items (((base_type "weapon")(branded t)(ego "distort")(kind "item")(name "quick blade of distortion")(plus 0)(quantity 1)(sub_type "quick blade")(text "quick blade of distortion")(x 3)(y 4))))))|}
+    version
+    seed
+    level
+;;
+
+(* End to end: the parse, the store, and the rendered hit line, which names the
+   item the way the game does rather than echoing the term. *)
+let%expect_test "a brand search runs and names the item" =
+  let version = Served.to_version Served.current in
+  with_corpus
+    ~extra:
+      [ brand_line
+          ~seed:"300"
+          ~level:"D:1"
+          ~version:(Seed_corpus.Query.Version.to_string version)
+      ]
+    ~f:(fun ~handle ~writer ~lock_path:_ ->
+      Or_error.ok_exn (Db.build_search_index writer ~version);
+      let status, body =
+        get handle (search_target [ "weapon:quick blade ego:distortion" ])
+      in
+      printf "status %d\n" status;
+      printf "hit          %b\n" (has body {|href="/0.34.1/seed/300?from=|});
+      printf "named        %b\n" (has body "quick blade of distortion");
+      printf "term echoed  %b\n" (has body {|value="weapon:quick blade ego:distortion"|}))
+    ();
+  [%expect
+    {|
+    status 200
+    hit          true
+    named        true
+    term echoed  true
+    |}]
+;;
+
 (* The fixture holds one item type, potion:haste. *)
 let%expect_test "a bare word naming one item runs, and says what ran" =
   with_indexed_router ~f:(fun handle ->
@@ -557,7 +619,7 @@ let%expect_test "a bare word naming one item runs, and says what ran" =
     printf "status %d\n" status;
     printf "box teaches the term %b\n" (has body {|value="potion:haste"|});
     printf "echoed               %b\n" (has body "was read as");
-    printf "matched              %b\n" (has body {|href="/0.34.1/seed/100"|}));
+    printf "matched              %b\n" (has body {|href="/0.34.1/seed/100?from=|}));
   [%expect
     {|
     status 200
@@ -576,5 +638,675 @@ let%expect_test "an unknown bare word offers name~ as a link, keeping the other 
     {|
     status 400
     offer link true
+    |}]
+;;
+
+(* {1 The count ceiling}
+
+   Seeds 100 and 200 each hold one potion of haste on D:1 and one on D:2, so
+   the most any seed holds is 2. *)
+
+let after s ~marker =
+  Option.map (String.substr_index s ~pattern:marker) ~f:(fun i ->
+    String.drop_prefix s (i + String.length marker))
+;;
+
+(* The [has=] value of the first link after the ceiling sentence, decoded. *)
+let ceiling_link_term body =
+  let open Option.Let_syntax in
+  let%bind rest = after body ~marker:"the most any seed" in
+  let%bind rest = after rest ~marker:{|href="|} in
+  let href = String.take_while rest ~f:(fun c -> not (Char.equal c '"')) in
+  let%bind query = after href ~marker:"?" in
+  let%bind has =
+    String.split query ~on:'&'
+    |> List.find_map ~f:(fun kv -> String.chop_prefix kv ~prefix:"has=")
+  in
+  Some (Dream.from_percent_encoded has)
+;;
+
+let%expect_test "an impossible count names the build's ceiling, and links to it" =
+  with_router ~f:(fun handle ->
+    let status, body = get handle (search_target [ "3x potion:haste" ]) in
+    [%expect.output] |> (ignore : string -> unit);
+    printf "status %d\n" status;
+    printf "no matches %b\n" (has body "No matching seeds.");
+    printf "ceiling    %b\n" (has body "the most any seed");
+    Option.iter (after body ~marker:{|<p class="ceiling">|}) ~f:(fun rest ->
+      print_endline (String.prefix rest (String.substr_index_exn rest ~pattern:"</p>")));
+    match ceiling_link_term body with
+    | None -> print_endline "no link"
+    | Some term ->
+      printf "link term  %s\n" term;
+      printf
+        "parses to  %s\n"
+        (match Seed_web.Params.term_of_string term with
+         | Ok term -> Seed_corpus.Search.Term.to_query_string term
+         | Error err -> Error.to_string_hum err));
+  [%expect
+    {|
+    status 200
+    no matches true
+    ceiling    true
+    <strong>The count is out of reach on its own.</strong> For potion of haste, the most any seed in this build holds is <strong><span class="num">2</span></strong>, short of the <span class="num">3</span> asked for. <a href="/0.34.1/search?has=2x%20potion%3Ahaste">Search for <code>2x potion:haste</code> →</a>
+    link term  2x potion:haste
+    parses to  2x potion:haste
+    |}]
+;;
+
+(* A swap replaces the results div, so the fragment has to carry it too. *)
+let%expect_test "the htmx fragment carries the ceiling" =
+  with_router ~f:(fun handle ->
+    let status, body =
+      get ~headers:[ "HX-Request", "true" ] handle (search_target [ "3x potion:haste" ])
+    in
+    [%expect.output] |> (ignore : string -> unit);
+    printf "status %d\n" status;
+    printf "ceiling %b\n" (has body "the most any seed"));
+  [%expect
+    {|
+    status 200
+    ceiling true
+    |}]
+;;
+
+(* [2x] is reachable on its own, so the emptiness is the conjunction's and the
+   ceiling would explain nothing. *)
+let%expect_test "a satisfiable count beside an unmet term says nothing more" =
+  with_router ~f:(fun handle ->
+    let status, body =
+      get handle (search_target [ "2x potion:haste"; "shop potion:haste" ])
+    in
+    [%expect.output] |> (ignore : string -> unit);
+    printf "status %d\n" status;
+    printf "no matches %b\n" (has body "No matching seeds.");
+    printf "ceiling    %b\n" (has body "the most any seed"));
+  [%expect
+    {|
+    status 200
+    no matches true
+    ceiling    false
+    |}]
+;;
+
+let%expect_test "the store answers the ceiling too" =
+  with_indexed_router ~f:(fun handle ->
+    let status, body = get handle (search_target [ "3x potion:haste" ]) in
+    [%expect.output] |> (ignore : string -> unit);
+    printf "status %d\n" status;
+    printf "link term %s\n" (Option.value (ceiling_link_term body) ~default:"none"));
+  [%expect
+    {|
+    status 200
+    link term 2x potion:haste
+    |}]
+;;
+
+(* The budget is its own ref so this path is reachable: sharing
+   [search_timeout] would time the search out first. *)
+let%expect_test "a ceiling over its budget degrades to the plain message" =
+  with_router ~f:(fun handle ->
+    let budget = !Seed_web.Params.ceiling_timeout in
+    Fun.protect
+      ~finally:(fun () -> Seed_web.Params.ceiling_timeout := budget)
+      (fun () ->
+         Seed_web.Params.ceiling_timeout := 0.;
+         let status, body = get handle (search_target [ "3x potion:haste" ]) in
+         [%expect.output] |> (ignore : string -> unit);
+         printf "status %d\n" status;
+         printf "no matches %b\n" (has body "No matching seeds.");
+         printf "ceiling    %b\n" (has body "the most any seed")));
+  [%expect
+    {|
+    status 200
+    no matches true
+    ceiling    false
+    |}]
+;;
+
+let deep_seed_line =
+  line
+    ~seed:"300"
+    ~level:Seed_corpus.Fill_depth.deep_cap
+    ~version:(Seed_corpus.Query.Version.to_string (Served.to_version Served.current))
+;;
+
+let with_feedback ?flag_limit ~f () =
+  let path = Filename_unix.temp_file "flags" ".db" in
+  Fun.protect
+    ~finally:(fun () -> Sys_unix.remove path)
+    (fun () ->
+       with_corpus
+         ?flag_limit
+         ~feedback_path:path
+         ~extra:[ deep_seed_line ]
+         ~f:(fun ~handle ~writer:_ ~lock_path:_ -> f handle path)
+         ())
+;;
+
+let flags_in path =
+  let fb = Seed_corpus.Feedback.open_ ~key:"test-key" path in
+  Fun.protect
+    ~finally:(fun () -> Seed_corpus.Feedback.close fb)
+    (fun () -> Or_error.ok_exn (Seed_corpus.Feedback.rows fb))
+;;
+
+let post_flag
+      ?(version = Served.to_string Served.current)
+      ?(seed = "100")
+      handle
+      ~cookie
+      body
+  =
+  handle
+    (Dream.request
+       ~method_:`POST
+       ~target:(sprintf "/%s/seed/%s/flag" version seed)
+       ~headers:[ "Cookie", cookie; "Content-Type", "application/x-www-form-urlencoded" ]
+       body)
+;;
+
+let%expect_test "a flag records the build name, seed, hashed session and query" =
+  with_feedback () ~f:(fun handle path ->
+    let token, cookie = seed_page_token handle in
+    let response =
+      post_flag
+        handle
+        ~cookie
+        (sprintf "dream.csrf=%s&from=has%%3Dpotion%%253Ahaste" token)
+    in
+    printf "%d\n" (status_of response);
+    List.iter (flags_in path) ~f:(fun row ->
+      printf
+        "%s %s session=%d chars query=%s depth=%s\n"
+        row.version
+        row.seed
+        (String.length row.session)
+        (Option.value row.query ~default:"-")
+        row.depth));
+  [%expect
+    {|
+    200
+    0.34.1 100 session=64 chars query=has=potion%3Ahaste depth=D:2
+    |}]
+;;
+
+let%expect_test "a second flag in the same session adds no row and still succeeds" =
+  with_feedback () ~f:(fun handle path ->
+    let token, cookie = seed_page_token handle in
+    let body = sprintf "dream.csrf=%s" token in
+    printf "%d\n" (status_of (post_flag handle ~cookie body));
+    printf "%d\n" (status_of (post_flag handle ~cookie body));
+    printf "rows %d\n" (List.length (flags_in path)));
+  [%expect
+    {|
+    200
+    200
+    rows 1
+    |}]
+;;
+
+let%expect_test "a flag without a valid token is refused and writes nothing" =
+  let quiet sources level = List.iter sources ~f:(fun s -> Dream.set_log_level s level) in
+  let sources = [ "dream.form"; "dream.csrf" ] in
+  Fun.protect ~finally:(fun () -> quiet sources `Warning)
+  @@ fun () ->
+  quiet sources `Error;
+  with_feedback () ~f:(fun handle path ->
+    let _, cookie = seed_page_token handle in
+    printf "no token  %d\n" (status_of (post_flag handle ~cookie "from=x"));
+    printf "bad token %d\n" (status_of (post_flag handle ~cookie "dream.csrf=nope"));
+    printf "rows %d\n" (List.length (flags_in path)));
+  [%expect
+    {|
+    no token  400
+    bad token 400
+    rows 0
+    |}]
+;;
+
+let%expect_test "an unserved build and an absent seed are 404 and write nothing" =
+  with_feedback () ~f:(fun handle path ->
+    let token, cookie = seed_page_token handle in
+    let body = sprintf "dream.csrf=%s" token in
+    printf "unserved %d\n" (status_of (post_flag handle ~cookie ~version:"9.99" body));
+    printf "absent   %d\n" (status_of (post_flag handle ~cookie ~seed:"999" body));
+    printf "rows %d\n" (List.length (flags_in path)));
+  [%expect
+    {|
+    unserved 404
+    absent   404
+    rows 0
+    |}]
+;;
+
+let%expect_test "with no feedback file the page has no button and the POST is a 404" =
+  with_router ~f:(fun handle ->
+    let token, cookie = seed_page_token handle in
+    let target = sprintf "/%s/seed/100" (Served.to_string Served.current) in
+    let body =
+      Lwt_main.run (Dream.body (handle (Dream.request ~method_:`GET ~target "")))
+    in
+    printf "button %b\n" (String.is_substring body ~substring:"/flag");
+    printf
+      "post   %d\n"
+      (status_of (post_flag handle ~cookie (sprintf "dream.csrf=%s" token))));
+  [%expect
+    {|
+    button false
+    post   404
+    |}]
+;;
+
+(* A deep seed has no deepen offer and so no token of its own; the flag button
+   needs one in exactly that case. *)
+let%expect_test "a deep seed still renders the flag button, and its token works" =
+  with_feedback () ~f:(fun handle path ->
+    let target = sprintf "/%s/seed/300" (Served.to_string Served.current) in
+    let body =
+      Lwt_main.run (Dream.body (handle (Dream.request ~method_:`GET ~target "")))
+    in
+    printf "button %b\n" (String.is_substring body ~substring:"/seed/300/flag");
+    printf "deepen %b\n" (String.is_substring body ~substring:"/deepen");
+    let token, cookie = seed_page_token ~seed:"300" handle in
+    printf
+      "post   %d\n"
+      (status_of (post_flag handle ~cookie ~seed:"300" (sprintf "dream.csrf=%s" token)));
+    printf "rows   %d\n" (List.length (flags_in path)));
+  [%expect
+    {|
+    button true
+    deepen false
+    post   200
+    rows   1
+    |}]
+;;
+
+let%expect_test "an overlong from is truncated, not rejected" =
+  with_feedback () ~f:(fun handle path ->
+    let token, cookie = seed_page_token handle in
+    let response =
+      post_flag
+        handle
+        ~cookie
+        (sprintf "dream.csrf=%s&from=%s" token (String.make 600 'a'))
+    in
+    printf "%d\n" (status_of response);
+    List.iter (flags_in path) ~f:(fun row ->
+      printf "%d\n" (String.length (Option.value_exn row.query))));
+  [%expect
+    {|
+    200
+    500
+    |}]
+;;
+
+let%expect_test "the seed page is canonical without its from parameter" =
+  with_feedback () ~f:(fun handle _ ->
+    let target =
+      sprintf "/%s/seed/100?from=has%%3Dpotion" (Served.to_string Served.current)
+    in
+    let body =
+      Lwt_main.run (Dream.body (handle (Dream.request ~method_:`GET ~target "")))
+    in
+    let link =
+      String.split body ~on:'<'
+      |> List.find_exn ~f:(String.is_substring ~substring:"canonical")
+    in
+    print_endline (String.strip link);
+    printf "hidden from carried %b\n" (String.is_substring body ~substring:"has=potion"));
+  [%expect
+    {|
+    link rel="canonical" href="https://dcss.garden/0.34.1/seed/100"/>
+    hidden from carried true
+    |}]
+;;
+
+let%expect_test "search results link to the seed carrying the query" =
+  with_feedback () ~f:(fun handle _ ->
+    let body =
+      Lwt_main.run
+        (Dream.body
+           (handle
+              (Dream.request ~method_:`GET ~target:(search_target [ "potion:haste" ]) "")))
+    in
+    String.split body ~on:'"'
+    |> List.filter ~f:(String.is_substring ~substring:"/seed/100?from=")
+    |> List.dedup_and_sort ~compare:String.compare
+    |> List.iter ~f:print_endline);
+  [%expect {| /0.34.1/seed/100?from=has%3Dpotion%253Ahaste |}]
+;;
+
+let%expect_test "a flagged seed shows the confirmation on reload, to that session only" =
+  with_feedback () ~f:(fun handle _ ->
+    let token, cookie = seed_page_token handle in
+    ignore (post_flag handle ~cookie (sprintf "dream.csrf=%s" token) : Dream.response);
+    let target = sprintf "/%s/seed/100" (Served.to_string Served.current) in
+    let page headers =
+      Lwt_main.run (Dream.body (handle (Dream.request ~method_:`GET ~target ~headers "")))
+    in
+    let describe label body =
+      printf
+        "%-7s noted %b  form %b\n"
+        label
+        (String.is_substring body ~substring:"Noted")
+        (String.is_substring body ~substring:"/seed/100/flag")
+    in
+    describe "same" (page [ "Cookie", cookie ]);
+    describe "other" (page []));
+  [%expect
+    {|
+    same    noted true  form false
+    other   noted false  form true
+    |}]
+;;
+
+(* The community garden. Flags are written straight to the file rather than
+   through the POST, so a test can create the duplicate-across-sessions case
+   without minting two cookie jars. *)
+let community_target = sprintf "/%s/community" (Served.to_string Served.current)
+
+let flag_direct path ~seed ~session =
+  let feedback = Seed_corpus.Feedback.open_ ~key:"test-key" path in
+  Fun.protect
+    ~finally:(fun () -> Seed_corpus.Feedback.close feedback)
+    (fun () ->
+       Or_error.ok_exn
+         (Seed_corpus.Feedback.flag
+            feedback
+            ~version:(Served.to_version Served.current)
+            ~seed
+            ~session_id:session
+            ~query:None
+            ~depth:"D:2"))
+;;
+
+(* No feedback store means no garden to point at, so no link either. *)
+let%expect_test "with no feedback file the garden 404s and the nav offers no link" =
+  with_router ~f:(fun handle ->
+    let status, _ = get handle community_target in
+    let _, index = get handle (sprintf "/%s/" (Served.to_string Served.current)) in
+    printf "garden %d\n" status;
+    printf "link   %b\n" (has index "community garden"));
+  [%expect
+    {|
+    garden 404
+    link   false
+    |}]
+;;
+
+(* One seed flagged by two sessions is one row, not two: the garden is a set of
+   seeds, and [sample_seeds] has to collapse the per-session flags. *)
+let%expect_test "the garden lists each flagged seed once, and links to itself" =
+  with_feedback () ~f:(fun handle path ->
+    flag_direct path ~seed:"100" ~session:"s1";
+    flag_direct path ~seed:"100" ~session:"s2";
+    flag_direct path ~seed:"200" ~session:"s3";
+    let status, body = get handle community_target in
+    let rows seed =
+      String.substr_index_all
+        body
+        ~may_overlap:false
+        ~pattern:(sprintf "class=\"seed\">%s<" seed)
+      |> List.length
+    in
+    printf "status %d\n" status;
+    printf "seed 100 rows %d\n" (rows "100");
+    printf "seed 200 rows %d\n" (rows "200");
+    printf "nav link %b\n" (has body "/community"));
+  [%expect
+    {|
+    status 200
+    seed 100 rows 1
+    seed 200 rows 1
+    nav link true
+    |}]
+;;
+
+(* The feedback file outlives the corpus it was written against, so a flag can
+   name a seed the served build does not hold. It is dropped, not rendered as
+   an empty row pointing at a 404. *)
+let%expect_test "a flag for a seed the corpus does not hold is not listed" =
+  with_feedback () ~f:(fun handle path ->
+    flag_direct path ~seed:"100" ~session:"s1";
+    flag_direct path ~seed:"999" ~session:"s2";
+    let _, body = get handle community_target in
+    printf "held    %b\n" (has body "class=\"seed\">100<");
+    printf "unheld  %b\n" (has body "class=\"seed\">999<"));
+  [%expect
+    {|
+    held    true
+    unheld  false
+    |}]
+;;
+
+(* "No seeds for this build yet" would be false -- the build has seeds, none
+   flagged -- so the empty garden says what it actually knows. *)
+let%expect_test "an empty garden says so rather than claiming the build is empty" =
+  with_feedback () ~f:(fun handle _ ->
+    let status, body = get handle community_target in
+    printf "status %d\n" status;
+    printf "empty  %b\n" (has body "marked good on this build yet"));
+  [%expect
+    {|
+    status 200
+    empty  true
+    |}]
+;;
+
+(* The garden reuses the front page's shape, so "community" has to be two
+   questions kept apart: whether the nav link exists (the store is configured)
+   and whether this wall *is* the garden. Conflated, the front page titled
+   itself "community garden" and claimed its seeds were reader-picked. *)
+let%expect_test "the front page keeps its own title and caption with the store on" =
+  with_feedback () ~f:(fun handle _ ->
+    let _, body = get handle (sprintf "/%s/" (Served.to_string Served.current)) in
+    printf "title    %b\n" (has body "<title>dcss garden</title>");
+    printf "caption  %b\n" (has body "A random sample of seeds from this build.");
+    printf "nav link %b\n" (has body "/community"));
+  [%expect
+    {|
+    title    true
+    caption  true
+    nav link true
+    |}]
+;;
+
+(* The href of the anchor whose text is [More →]. *)
+let more_href body =
+  let text = String.substr_index_exn body ~pattern:"More →" in
+  let close = String.rindex_from_exn body text '"' in
+  let open_ = String.rindex_from_exn body (close - 1) '"' in
+  String.sub body ~pos:(open_ + 1) ~len:(close - open_ - 1)
+;;
+
+(* The garden's "more" link is an address a reader can follow, and it 404'd
+   twice over: the href carried a trailing slash the route does not have, and it
+   was offered on a build holding fewer flags than a page -- where the pool is
+   one page and there is nothing behind it. *)
+let%expect_test "the garden offers more only when there is more, and it resolves" =
+  with_feedback () ~f:(fun handle path ->
+    flag_direct path ~seed:"100" ~session:"s1";
+    flag_direct path ~seed:"200" ~session:"s2";
+    let _, whole = get handle community_target in
+    printf "one page: more %b\n" (has whole "More →");
+    let _, paged = get handle (community_target ^ "?limit=1") in
+    printf "paged:    more %b\n" (has paged "More →");
+    let href = more_href paged in
+    printf "href:     %s\n" href;
+    let status, _ = get handle href in
+    printf "follow:   %d\n" status);
+  [%expect
+    {|
+    one page: more false
+    paged:    more true
+    href:     /0.34.1/community?limit=1
+    follow:   200
+    |}]
+;;
+
+(* {1 Submissions} *)
+
+let submit handle ~token ~cookie seed =
+  let target = sprintf "/%s/seed/%s/submit" (Served.to_string Served.current) seed in
+  handle
+    (Dream.request
+       ~method_:`POST
+       ~target
+       ~headers:
+         [ "Cookie", cookie
+         ; "Content-Type", "application/x-www-form-urlencoded"
+         ; "HX-Request", "true"
+         ]
+       ("dream.csrf=" ^ token))
+;;
+
+let body_of response = Lwt_main.run (Dream.body response)
+
+let summarise response =
+  let body = body_of response in
+  printf
+    "%d form=%b queued=%b to=%s paused=%b\n"
+    (status_of response)
+    (String.is_substring body ~substring:"/submit\"")
+    (String.is_substring body ~substring:"Queued to generate")
+    (Option.value
+       ~default:"-"
+       (Option.first_some
+          (Dream.header response "HX-Redirect")
+          (Dream.header response "Location")))
+    (String.is_substring body ~substring:"is paused")
+;;
+
+let%expect_test "a missing seed offers to generate it; a malformed one does not" =
+  with_router ~f:(fun handle ->
+    List.iter [ "12345"; "007"; "0"; "18446744073709551616"; "abc" ] ~f:(fun seed ->
+      let target = sprintf "/%s/seed/%s" (Served.to_string Served.current) seed in
+      printf "%-22s " seed;
+      summarise (handle (Dream.request ~method_:`GET ~target ""))));
+  [%expect
+    {|
+    12345                  404 form=true queued=false to=- paused=false
+    007                    404 form=false queued=false to=- paused=false
+    0                      404 form=false queued=false to=- paused=false
+    18446744073709551616   404 form=false queued=false to=- paused=false
+    abc                    404 form=false queued=false to=- paused=false
+    |}]
+;;
+
+let%expect_test "a submission queues a job, and polling follows it to the seed" =
+  with_corpus
+    ~f:(fun ~handle ~writer ~lock_path:_ ->
+      let token, cookie = seed_page_token ~seed:"12345" handle in
+      summarise (submit handle ~token ~cookie "12345");
+      (match
+         Or_error.ok_exn
+           (Db.job_for_seed
+              writer
+              ~version:(Served.to_version Served.current)
+              ~seed:"12345")
+       with
+       | None -> print_endline "no job"
+       | Some job -> print_endline (Seed_corpus.Job.Origin.to_string job.origin));
+      (* A second press is the same job, not a second one. *)
+      summarise (submit handle ~token ~cookie "12345");
+      let poll () =
+        let target =
+          sprintf "/%s/seed/12345/submission" (Served.to_string Served.current)
+        in
+        summarise
+          (handle (Dream.request ~method_:`GET ~target ~headers:[ "Cookie", cookie ] ""))
+      in
+      poll ();
+      ignore
+        (Db.write_batch
+           ~requested:true
+           writer
+           [ Or_error.ok_exn
+               (Reader.parse_line
+                  (line
+                     ~seed:"12345"
+                     ~level:"D:1"
+                     ~version:
+                       (Seed_corpus.Query.Version.to_string
+                          (Served.to_version Served.current))))
+           ]
+         : Db.Counts.t);
+      poll ();
+      (* A held seed is the deepen path's: the page is the seed's own. *)
+      summarise (submit handle ~token ~cookie "100"))
+    ();
+  [%expect
+    {|
+    200 form=false queued=true to=- paused=false
+    submit
+    200 form=false queued=true to=- paused=false
+    200 form=false queued=true to=- paused=false
+    303 form=false queued=false to=/0.34.1/seed/12345 paused=false
+    200 form=false queued=false to=/0.34.1/seed/100 paused=false
+    |}]
+;;
+
+let%expect_test "a session is capped per day, and the cap is said in words" =
+  with_router ~f:(fun handle ->
+    let token, cookie = seed_page_token ~seed:"12345" handle in
+    (* In order: [List.init] makes no promise about evaluation order. *)
+    let outcomes =
+      List.fold (List.range 0 11) ~init:[] ~f:(fun acc i ->
+        let response = submit handle ~token ~cookie (Int.to_string (5000 + i)) in
+        (status_of response, body_of response) :: acc)
+      |> List.rev
+    in
+    List.iter (List.drop outcomes 9) ~f:(fun (status, body) ->
+      printf "%d limit=%b\n" status (String.is_substring body ~substring:"limit"));
+    [%expect
+      {|
+      200 limit=false
+      429 limit=true
+      |}])
+;;
+
+let%expect_test "SEED_DISABLE_SUBMIT withdraws the button and refuses the write" =
+  with_router ~f:(fun handle ->
+    let token, cookie = seed_page_token ~seed:"12345" handle in
+    let disabled = !Seed_web.Params.submit_disabled in
+    Exn.protect
+      ~finally:(fun () -> Seed_web.Params.submit_disabled := disabled)
+      ~f:(fun () ->
+        Seed_web.Params.submit_disabled := true;
+        let target = sprintf "/%s/seed/12345" (Served.to_string Served.current) in
+        summarise (handle (Dream.request ~method_:`GET ~target ""));
+        summarise (submit handle ~token ~cookie "12345")));
+  [%expect
+    {|
+    404 form=false queued=false to=- paused=true
+    503 form=false queued=false to=- paused=true
+    |}]
+;;
+
+(* Fossil ticket 92. Caps of two here; the real ones are in [Seed_web]. A
+   repeat press is free, as it is for a submission: it adds no row. *)
+let%expect_test "flags are capped per reader per day, and a repeat is free" =
+  with_feedback
+    ~flag_limit:(Seed_web.Reader_limit.create ~per_ip:5 ~per_session:2)
+    ()
+    ~f:(fun handle path ->
+      let token, cookie = seed_page_token handle in
+      let body = sprintf "dream.csrf=%s" token in
+      List.iter [ "100"; "100"; "200"; "300" ] ~f:(fun seed ->
+        let response = post_flag ~seed handle ~cookie body in
+        printf
+          "%s %d limit=%b\n"
+          seed
+          (status_of response)
+          (String.is_substring (Lwt_main.run (Dream.body response)) ~substring:"limit"));
+      printf "rows %d\n" (List.length (flags_in path)));
+  [%expect
+    {|
+    100 200 limit=false
+    100 200 limit=false
+    200 200 limit=false
+    300 429 limit=true
+    rows 2
     |}]
 ;;

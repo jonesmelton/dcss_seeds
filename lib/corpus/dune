@@ -1,7 +1,7 @@
 (library
  (name seed_corpus)
  (public_name seed_corpus)
- (libraries core core_unix parsexp sexplib sqlite3 sqlite3_utils)
+ (libraries core core_unix digestif.c parsexp sexplib sqlite3 sqlite3_utils)
  (preprocess
   (pps ppx_jane)))
 

@@ -64,9 +64,15 @@ val build : Sqlite3.db -> version:Query.Version.t -> unit Or_error.t
     removal still reports current and the rebuild is a hygiene step rather than
     a correctness one: the store looks criteria up by [(kind, a, b)]
     ([search_criteria_key]), so a leftover row for a removed criterion is never
-    read, and the only visible cost is a stale catalog count and datalist. The
-    same blind spot would be a correctness bug for a change that *renames* a
-    criterion rather than removing one. *)
+    read, and the only visible cost is a stale catalog count and datalist.
+
+    An *added* kind, or a renamed spelling, is not invisible in the same way
+    and is not left to this mark: such a search finds no catalog row, and
+    {!page} declines on a missing row rather than reading absence as "the build
+    holds none". A store built before brand lists existed therefore takes the
+    SQL path for a brand search instead of answering it from silence -- the
+    rebuild is then a speed-up, not the thing standing between the reader and a
+    true answer. *)
 val is_current : Sqlite3.db -> version:Query.Version.t -> bool
 
 (** The largest deep cohort {!page} will re-derive rather than decline over. *)
@@ -91,12 +97,40 @@ val catalog_item_pairs
   -> version:Query.Version.t
   -> string list option Or_error.t
 
+(** Every (base type, ego code) the catalog's brand rows hold, floor and shop,
+    for the datalist. Like {!catalog_item_pairs}, a brand found only below D:8
+    on a deepened seed is missing. [None] when the store is stale. *)
+val catalog_brands
+  :  Sqlite3.db
+  -> version:Query.Version.t
+  -> (string * string) list option Or_error.t
+
 (** The most seeds a [name~] fragment may resolve to before {!page} declines.
     97.5% of fragment occurrences in human searches resolve to at most this
     many (315 distinct fragments, access log 2026-09-09 to 2026-09-26, resolved
     against 1.3M, 0.34.1, D:8, prod, 2026-09-26); resolution near it costs
     ~0.5s. *)
 val max_name_seeds : int
+
+(** The most of [criterion] any one seed holds, from posting counts, or [None]
+    when the store declines; the inner [None] is a criterion no seed holds.
+
+    Declines unless the criterion is [Exact] over one key: a [Narrowing] count
+    is a superset's, and would overstate. Also declines when stale or past
+    {!max_overlay_cohort}, as {!page} does.
+
+    The deep cohort is not optional. A deepened seed's posting carries a count
+    that is too low, so postings alone {i understate} -- the direction that
+    tells a reader to stop looking for something that exists. [cohort_ceiling]
+    answers the same question from SQL for those seeds, and the larger wins:
+    deepening only adds levels, so a re-derived count is never below the
+    posting's. *)
+val ceiling
+  :  Sqlite3.db
+  -> version:Query.Version.t
+  -> Search.Criterion.t
+  -> cohort_ceiling:(seeds:string list -> int option Or_error.t)
+  -> int option option Or_error.t
 
 (** One page of matching seeds, or [None] when the store declines the search.
 
@@ -105,9 +139,17 @@ val max_name_seeds : int
 
     - {!is_current} is [false]. Tested after the catalog-row rule below, which
       costs nothing, and before [name~] resolution, which costs the most.
-    - a term other than [name~] has no catalog row. Driving on the store and
-      re-checking such a term per candidate batch inverts the selectivity: the
-      re-check runs once per batch of the driver's whole list.
+    - a term other than [name~] has no catalog row. This is a *decline*, not an
+      empty answer, and the distinction is the point: a missing row is
+      ambiguous between "the build holds none" and "the store predates the
+      criterion's kind or its spelling", and the store cannot tell them apart.
+      Reading it as absence would answer a page of nothing -- or worse, a page
+      of only the deep cohort -- over a corpus that holds the thing, which is
+      exactly what a store built before brand lists existed would do for a
+      brand search. The SQL path is the ground truth and decides. (Driving on
+      the store and re-checking such a term per candidate batch would also
+      invert the selectivity: the re-check runs once per batch of the driver's
+      whole list.)
     - a [name~] fragment resolves to more than [name_cap] seeds (default
       {!max_name_seeds}). Under the cap the fragment is resolved first -- the
       same two-stage [strings_fts]-then-[like] lookup [criterion_where] builds,

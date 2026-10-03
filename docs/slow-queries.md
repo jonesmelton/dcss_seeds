@@ -60,6 +60,10 @@ rows. That is a person doing binary search by hand because the tool will not
 tell them where the ceiling is. Both of these want the same thing — *how high
 can this number go and still match* — and neither can ask it.
 
+Answered 2026-10: an empty search whose one counted term is out of reach now
+says the most any seed in the build holds, and links to that count
+(`Db.count_ceiling`, fossil ticket bcc9e65f53).
+
 ### Name search on unrands
 
 `name~Elemental Staff` 184ms and 270ms, `name~pair of quick blades "Gyre" and
@@ -136,6 +140,8 @@ result page offers as copyable, someone took it for a query.
    question.
 2. **A count with no matches should fail fast, not time out.** `9x artefact`
    spending 30s to return a 503 is the worst version of no.
+   The timeout half was fixed 2026-09-05 (`Db.driver_select`); the empty
+   answer now names the ceiling (bcc9e65f53).
 3. **`floor` + `name~` is a composition gap**, cheap to judge and asked three
    times.
 4. **A term that parses but matches nothing should say so differently than one

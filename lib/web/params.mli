@@ -29,6 +29,12 @@ val search_disabled : bool ref
     happily. Fossil ticket 0c6422bfc2. *)
 val deepen_disabled : bool ref
 
+(** Set from SEED_DISABLE_SUBMIT in {!Main}. Withdraws the offer to generate a
+    seed the corpus does not hold and refuses the POST, leaving deepen alone.
+    {!deepen_disabled} withdraws submissions too: a frozen copy can take
+    neither. *)
+val submit_disabled : bool ref
+
 (** Seconds a search may take before the handler abandons the wait and answers
     503. Set from SEED_SEARCH_TIMEOUT in {!Main}; a test may set it directly.
 
@@ -42,6 +48,16 @@ val search_timeout : float ref
     query has not started and there is nothing to wait out. Kept well under
     {!search_timeout}. Set from SEED_POOL_TIMEOUT in {!Main}. *)
 val pool_timeout : float ref
+
+(** Seconds the count ceiling ({!Seed_corpus.Db.count_ceiling}) may take
+    before an empty search renders without it. Shorter than {!search_timeout}
+    because the answer is already known and this only explains it: giving up
+    costs a sentence. Its own ref so a test can expire it without expiring the
+    search first. Deliberately not an operator knob, so no env var.
+
+    Bounds the reader's wait, not the connection, for the reason
+    {!search_timeout} gives. *)
+val ceiling_timeout : float ref
 
 (** {1 Search}
 

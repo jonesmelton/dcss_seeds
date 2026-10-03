@@ -18,7 +18,15 @@ let command =
          "-batch-size"
          (optional_with_default default_batch_size int)
          ~doc:(sprintf "N records per transaction (default: %d)" default_batch_size)
-     and quiet = flag "-quiet" no_arg ~doc:" do not report rejected lines individually" in
+     and quiet = flag "-quiet" no_arg ~doc:" do not report rejected lines individually"
+     and requested =
+       flag
+         "-requested"
+         no_arg
+         ~doc:
+           " a reader asked for these seeds: a seed not already held is kept out of the \
+            random sample"
+     in
      fun () ->
        if batch_size < 1 then failwith "-batch-size must be at least 1";
        let on_reject line_number error =
@@ -27,7 +35,7 @@ let command =
        in
        let counts =
          Db.with_db db_path ~f:(fun db ->
-           Db.ingest_channel db In_channel.stdin ~batch_size ~on_reject)
+           Db.ingest_channel ~requested db In_channel.stdin ~batch_size ~on_reject)
        in
        print_endline (Db.Counts.to_string counts))
 ;;

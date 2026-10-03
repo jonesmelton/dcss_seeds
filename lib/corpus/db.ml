@@ -70,15 +70,18 @@ let query (t : t) sql =
   List.rev !rows
 ;;
 
-(* Seeds only; summary columns are separate lookups. *)
+(* Seeds only; summary columns are separate lookups. Correlated rather than
+   [not in], because the submitted set grows without bound and a sampler issues
+   this once per draw. *)
 let list_seeds_sql =
   sprintf
     {|
-  select distinct seed
-    from seed_levels
-   where version_id = %s
-     and seed > ?
-order by seed
+  select distinct sl.seed
+    from seed_levels sl
+   where sl.version_id = %s
+     and sl.seed > ?
+     and not exists (select 1 from seed_fills f where f.seed = sl.seed and f.version_id = sl.version_id and f.origin = 'submit')
+order by sl.seed
    limit ?
 |}
     version_id_sql
@@ -593,6 +596,48 @@ let sample_seeds t ~version ~limit =
   with_txn t ~f:(fun t -> sample_seeds_unlocked t ~version ~limit)
 ;;
 
+(* Membership in the cohort, not in [entries]: a seed whose levels were filled
+   has a [seed_fills] row whether or not any entry survived pruning. *)
+let present_seeds_sql seeds =
+  sprintf
+    {|
+select seed
+  from seed_fills
+ where version_id = %s
+   and seed in (%s)
+|}
+    version_id_sql
+    seeds
+;;
+
+let present_seeds t ~version ~seeds =
+  match seeds with
+  | [] -> Ok String.Set.empty
+  | _ ->
+    let placeholders = List.map seeds ~f:(fun _ -> "?") |> String.concat ~sep:", " in
+    with_stmt
+      t
+      (present_seeds_sql placeholders)
+      ~bind:(version_bind version :: List.map seeds ~f:(fun s -> Sqlite3.Data.TEXT s))
+      ~f:(fun stmt ->
+        fold_rows stmt ~init:String.Set.empty ~f:(fun acc row ->
+          let%map.Or_error seed = required row 0 ~field:"seed" in
+          Set.add acc seed))
+;;
+
+let summarize_seeds t ~version ~seeds =
+  with_txn t ~f:(fun t ->
+    let open Or_error.Let_syntax in
+    let%bind present = present_seeds t ~version ~seeds in
+    let%map summaries =
+      summarize
+        t
+        ~version
+        ~seeds:(List.filter seeds ~f:(fun seed -> Set.mem present seed))
+    in
+    summaries)
+;;
+
 module Seed_levels_col = struct
   let at = Columns.at seed_levels_columns
   let level = at "level"
@@ -935,15 +980,19 @@ select s_level.val
 |}
 ;;
 
+(* A fill reaching a submitted seed takes it into the sample; a request never
+   takes a seed out of it. *)
 let upsert_seed_fill_sql =
   {|
 insert into seed_fills
           ( seed
           , version_id
           , depth
+          , origin
           )
      values
           ( ?
+          , ?
           , ?
           , ?
           )
@@ -956,6 +1005,8 @@ on conflict
             = excluded.depth
           , filled_at
             = unixepoch()
+          , origin
+            = case when excluded.origin = 'fill' then 'fill' else origin end
 |}
 ;;
 
@@ -1154,7 +1205,7 @@ let sync_book_spells t ~insert_stmt ~intern ~version ~version_id ~sub_type ~spel
              ~recorded:(stored : string list)])
 ;;
 
-let refresh_seed_fill t ~seed ~version_id =
+let refresh_seed_fill t ~seed ~version_id ~requested =
   let levels =
     with_stmt
       t
@@ -1174,6 +1225,7 @@ let refresh_seed_fill t ~seed ~version_id =
       [ Sqlite3.Data.TEXT seed
       ; Sqlite3.Data.INT (Int64.of_int version_id)
       ; Sqlite3.Data.INT (Int64.of_int depth)
+      ; Sqlite3.Data.TEXT (if requested then "submit" else "fill")
       ]
     ~f:(fun stmt ->
       check_rc "step" (Sqlite3.step stmt);
@@ -1181,7 +1233,7 @@ let refresh_seed_fill t ~seed ~version_id =
   |> Or_error.ok_exn
 ;;
 
-let write_batch (t : t) (records : Record.t list) : Counts.t =
+let write_batch ?(requested = false) (t : t) (records : Record.t list) : Counts.t =
   if List.is_empty records
   then Counts.zero
   else
@@ -1314,18 +1366,22 @@ let write_batch (t : t) (records : Record.t list) : Counts.t =
         List.map records ~f:(fun (r : Record.t) -> r.seed, r.version)
         |> List.dedup_and_sort ~compare:[%compare: string * string]
         |> List.iter ~f:(fun (seed, version) ->
-          refresh_seed_fill t ~seed ~version_id:(Map.find_exn version_ids version));
+          refresh_seed_fill
+            t
+            ~seed
+            ~version_id:(Map.find_exn version_ids version)
+            ~requested);
         { Counts.levels = List.length records; entries; rejected = 0 }))
 ;;
 
-let ingest_channel t input ~batch_size ~on_reject =
+let ingest_channel ?requested t input ~batch_size ~on_reject =
   let totals = ref Counts.zero in
   let batch = ref [] in
   let pending = ref 0 in
   let flush () =
     if !pending > 0
     then (
-      let counts = write_batch t (List.rev !batch) in
+      let counts = write_batch ?requested t (List.rev !batch) in
       totals := Counts.add !totals counts;
       batch := [];
       pending := 0)
@@ -1398,8 +1454,12 @@ let props_exist ~alias props =
 ;;
 
 (* One criterion becomes one predicate over an aliased [entries] row. The alias
-   lets the same fragment serve as driver [where] or correlated [exists]. *)
-let criterion_where (criterion : Search.Criterion.t) ~alias =
+   lets the same fragment serve as driver [where] or correlated [exists].
+
+   [~version] is the search's own build: the one criterion that needs it is
+   [Brand], whose word resolves to the code spelling that build stores. Every
+   caller has the version already -- a search is never version-less. *)
+let criterion_where ~version (criterion : Search.Criterion.t) ~alias =
   let col name = sprintf "%s.%s" alias name in
   match criterion with
   | Search.Criterion.Item ({ base_type; sub_type }, position) ->
@@ -1466,6 +1526,31 @@ let criterion_where (criterion : Search.Criterion.t) ~alias =
         , Sqlite3.Data.TEXT base_type :: prop_bind )
     in
     String.concat (where @ [ position_where ~alias position ]) ~sep:" and ", bind
+  (* The word resolves to the build's own code spelling; an unknown word has
+     no code, and "matches nothing" is the honest reading of a criterion the
+     parse boundary would have refused. Binding the word itself would instead
+     hit any code that happens to equal it -- half the vocabulary does
+     ([chaos], [speed], [venom]). *)
+  | Search.Criterion.Brand { base_type; sub_type; word; position } ->
+    (match Search.Brand.code ~base_type ~version word with
+     | None -> "1 = 0", []
+     | Some code ->
+       let sub_where, sub_bind =
+         match sub_type with
+         | None -> "", []
+         | Some sub_type ->
+           ( sprintf "%s = %s and " (col "sub_type_id") string_id_sql
+           , [ Sqlite3.Data.TEXT sub_type ] )
+       in
+       ( sprintf
+           "%s = %s and %s%s = %s and %s"
+           (col "base_type_id")
+           string_id_sql
+           sub_where
+           (col "ego_id")
+           string_id_sql
+           (position_where ~alias position)
+       , (Sqlite3.Data.TEXT base_type :: sub_bind) @ [ Sqlite3.Data.TEXT code ] ))
 ;;
 
 (* [driver_select] and [correlated_select] scan the whole build for any bare
@@ -1532,7 +1617,10 @@ let props_seek ~base_type ~props ~position ~entries_alias ~props_alias =
    keep caller's order. *)
 let criterion_driver_rank (criterion : Search.Criterion.t) =
   match criterion with
-  | Search.Criterion.Unique _ | Search.Criterion.Item (_, Search.Criterion.Shop) -> 0
+  (* A brand term narrows at least as hard as a unique: it is an item term plus
+     an ego test, so it belongs in the rarest class. *)
+  | Search.Criterion.Unique _ | Search.Criterion.Brand _
+  | Search.Criterion.Item (_, Search.Criterion.Shop) -> 0
   | Search.Criterion.Item (_, Search.Criterion.Floor)
   | Search.Criterion.Feature _ | Search.Criterion.Name_like _ -> 1
   (* Last. The property [exists]es are filters on a driving row rather than a
@@ -1564,10 +1652,10 @@ let driver_rank (term : Search.Term.t) =
    reshapes the *whole* query into a [group by ... having] over the bare
    [entries] table, returned as [`Group_by]. The flat group-by streams off the
    index order; a subquery form made SQLite walk all of [entries]. *)
-let driver_select (term : Search.Term.t) =
+let driver_select ~version (term : Search.Term.t) =
   if term.min_count > 1
   then (
-    let where, bind = criterion_where term.criterion ~alias:"e" in
+    let where, bind = criterion_where ~version term.criterion ~alias:"e" in
     `Group_by (where, bind, Sqlite3.Data.INT (Int64.of_int term.min_count)))
   else (
     match term.criterion with
@@ -1577,10 +1665,10 @@ let driver_select (term : Search.Term.t) =
        with
        | Some (from_, where, bind) -> `Props_seek (from_, "p0", where, bind)
        | None ->
-         let where, bind = criterion_where term.criterion ~alias:"e" in
+         let where, bind = criterion_where ~version term.criterion ~alias:"e" in
          `Where (where, bind))
     | criterion ->
-      let where, bind = criterion_where criterion ~alias:"e" in
+      let where, bind = criterion_where ~version criterion ~alias:"e" in
       `Where (where, bind))
 ;;
 
@@ -1612,10 +1700,10 @@ let correlated_select (term : Search.Term.t) ~alias ~version ~after =
          with
          | Some (from_, where, bind) -> from_, props_alias, where, bind
          | None ->
-           let where, bind = criterion_where term.criterion ~alias in
+           let where, bind = criterion_where ~version term.criterion ~alias in
            sprintf "entries %s" alias, alias, where, bind)
       | criterion ->
-        let where, bind = criterion_where criterion ~alias in
+        let where, bind = criterion_where ~version criterion ~alias in
         sprintf "entries %s" alias, alias, where, bind
     in
     ( sprintf
@@ -1629,7 +1717,7 @@ let correlated_select (term : Search.Term.t) ~alias ~version ~after =
         alias
     , (version_bind version :: bind) @ [ Sqlite3.Data.TEXT after ] ))
   else (
-    let where, bind = criterion_where term.criterion ~alias in
+    let where, bind = criterion_where ~version term.criterion ~alias in
     ( sprintf
         "(select sum(coalesce(%s.quantity, 1)) from entries %s where %s.version_id = \
          e.version_id and %s and %s.seed = e.seed) >= ?"
@@ -1639,6 +1727,40 @@ let correlated_select (term : Search.Term.t) ~alias ~version ~after =
         where
         alias
     , bind @ [ Sqlite3.Data.INT (Int64.of_int term.min_count) ] ))
+;;
+
+(* A submitted seed the search store has not taken in yet. Both search paths
+   hide these -- the store by their absence, SQL by this filter -- so they agree
+   until a rebuild absorbs them. The filter is added only when the set is
+   non-empty, so with nothing pending the SQL is exactly what it was. *)
+let pending_exists_sql =
+  sprintf
+    {|
+select exists (select 1 from seed_fills where version_id = %s and origin = 'submit' and indexed_at is null)
+|}
+    version_id_sql
+;;
+
+let has_pending t ~version =
+  with_stmt
+    t
+    pending_exists_sql
+    ~bind:[ version_bind version ]
+    ~f:(fun stmt ->
+      fold_rows stmt ~init:false ~f:(fun _ row ->
+        Ok (Option.value_map (column_int row 0) ~default:false ~f:(fun n -> n <> 0))))
+;;
+
+let pending_filter ~hide ~version ~alias =
+  if hide
+  then
+    ( sprintf
+        " and %s not in (select seed from seed_fills where version_id = %s and origin = \
+         'submit' and indexed_at is null)"
+        alias
+        version_id_sql
+    , [ version_bind version ] )
+  else "", []
 ;;
 
 (* The matched seeds, before evidence. Terms are flattened into one query: one
@@ -1659,19 +1781,24 @@ let correlated_select (term : Search.Term.t) ~alias ~version ~after =
    test/test_search.ml.
 
    An empty search degenerates to the flattened seed-listing keyset. *)
-let search_seeds_sql (search : Search.t) =
+let search_seeds_sql (search : Search.t) ~hide =
   let indexed, unindexed = Search.partition_terms search in
   let terms = indexed @ unindexed in
   match terms with
   | [] ->
+    let hidden, hidden_bind =
+      pending_filter ~hide ~version:search.version ~alias:"seed"
+    in
     ( sprintf
-        "select distinct seed from seed_levels where version_id = %s and seed > ? order \
-         by seed limit ?"
+        "select distinct seed from seed_levels where version_id = %s and seed > ?%s \
+         order by seed limit ?"
         version_id_sql
+        hidden
     , [ version_bind search.version
       ; Sqlite3.Data.TEXT (Option.value search.page.after ~default:"")
-      ; Sqlite3.Data.INT (Int64.of_int (search.page.limit + 1))
-      ] )
+      ]
+      @ hidden_bind
+      @ [ Sqlite3.Data.INT (Int64.of_int (search.page.limit + 1)) ] )
   | terms ->
     (* Stable sort: within a driver_rank class, caller's order survives. *)
     let driver, rest =
@@ -1700,19 +1827,24 @@ let search_seeds_sql (search : Search.t) =
     let version_bind = version_bind search.version in
     let after_bind = Sqlite3.Data.TEXT after in
     let limit_bind = Sqlite3.Data.INT (Int64.of_int (search.page.limit + 1)) in
-    (match driver_select driver with
+    let hidden, hidden_bind =
+      pending_filter ~hide ~version:search.version ~alias:"e.seed"
+    in
+    (match driver_select ~version:search.version driver with
      | `Where (driver_where, driver_bind) ->
        let where_clauses = driver_where :: rest_wheres in
        let sql =
          sprintf
            "select distinct e.seed from entries e where e.version_id = %s and e.seed > ? \
-            and %s order by e.seed limit ?"
+            and %s%s order by e.seed limit ?"
            version_id_sql
            (String.concat where_clauses ~sep:" and ")
+           hidden
        in
        ( sql
        , (version_bind :: after_bind :: driver_bind)
          @ List.concat rest_binds
+         @ hidden_bind
          @ [ limit_bind ] )
      | `Group_by (driver_where, driver_bind, min_count_bind) ->
        (* [group by seed] yields one row per seed; no outer [distinct] needed.
@@ -1721,30 +1853,34 @@ let search_seeds_sql (search : Search.t) =
        let where_clauses = driver_where :: rest_wheres in
        let sql =
          sprintf
-           "select seed from entries e where e.version_id = %s and e.seed > ? and %s \
+           "select seed from entries e where e.version_id = %s and e.seed > ? and %s%s \
             group by e.seed having sum(coalesce(e.quantity, 1)) >= ? order by e.seed \
             limit ?"
            version_id_sql
            (String.concat where_clauses ~sep:" and ")
+           hidden
        in
        ( sql
        , (version_bind :: after_bind :: driver_bind)
          @ List.concat rest_binds
+         @ hidden_bind
          @ [ min_count_bind; limit_bind ] )
      | `Props_seek (from_, props_alias, driver_where, driver_bind) ->
        let where_clauses = driver_where :: rest_wheres in
        let sql =
          sprintf
            "select distinct e.seed from %s where %s.version_id = %s and e.seed > ? and \
-            %s order by e.seed limit ?"
+            %s%s order by e.seed limit ?"
            from_
            props_alias
            version_id_sql
            (String.concat where_clauses ~sep:" and ")
+           hidden
        in
        ( sql
        , (version_bind :: after_bind :: driver_bind)
          @ List.concat rest_binds
+         @ hidden_bind
          @ [ limit_bind ] ))
 ;;
 
@@ -1784,8 +1920,8 @@ module Term_hit_col = struct
   let shop_type = at "shop_type"
 end
 
-let term_hits_sql (term : Search.Term.t) ~seed_count =
-  let where, bind = criterion_where term.criterion ~alias:"e" in
+let term_hits_sql (term : Search.Term.t) ~version ~seed_count =
+  let where, bind = criterion_where ~version term.criterion ~alias:"e" in
   let placeholders = List.init seed_count ~f:(fun _ -> "?") |> String.concat ~sep:", " in
   ( sprintf
       {|
@@ -1907,7 +2043,7 @@ let term_hits t ~version ~(term : Search.Term.t) ~seeds =
   if List.is_empty seeds
   then Ok []
   else (
-    let sql, bind = term_hits_sql term ~seed_count:(List.length seeds) in
+    let sql, bind = term_hits_sql term ~version ~seed_count:(List.length seeds) in
     with_stmt
       t
       sql
@@ -1940,7 +2076,7 @@ let verify_terms t ~version ~seeds ~terms =
       terms
       ~init:(String.Set.of_list seeds)
       ~f:(fun acc (term : Search.Term.t) ->
-        let where, bind = criterion_where term.criterion ~alias:"e" in
+        let where, bind = criterion_where ~version term.criterion ~alias:"e" in
         let select, group, count_bind =
           if term.min_count <= 1
           then "select distinct e.seed", "", []
@@ -1992,8 +2128,8 @@ let verify_terms t ~version ~seeds ~terms =
    that. *)
 let overlay_batch = 500
 
-let cohort_depths_sql term ~seed_count =
-  let where, bind = criterion_where term.Search.Term.criterion ~alias:"e" in
+let cohort_depths_sql term ~version ~seed_count =
+  let where, bind = criterion_where ~version term.Search.Term.criterion ~alias:"e" in
   let placeholders = List.init seed_count ~f:(fun _ -> "?") |> String.concat ~sep:", " in
   ( sprintf
       {|
@@ -2023,7 +2159,9 @@ let verify_terms_with_depth t ~version ~seeds ~terms =
       let seed_bind = List.map seeds ~f:(fun seed -> Sqlite3.Data.TEXT seed) in
       let%map depths =
         List.fold_result terms ~init:String.Map.empty ~f:(fun acc term ->
-          let sql, bind = cohort_depths_sql term ~seed_count:(List.length seeds) in
+          let sql, bind =
+            cohort_depths_sql term ~version ~seed_count:(List.length seeds)
+          in
           with_stmt
             t
             sql
@@ -2046,6 +2184,58 @@ let verify_terms_with_depth t ~version ~seeds ~terms =
 
 let cohort_matches t ~version ~seeds ~terms =
   verify_terms_with_depth t ~version ~seeds ~terms
+;;
+
+(* The search's [group by e.seed] over the same predicate, without the
+   [having]. A bare [Props] seeks through [props_seek] for the reason
+   [driver_select] does; a seed list seeks [entries_seed] instead, as
+   [verify_terms] does. *)
+let count_ceiling_sql criterion ~version ~seeds ~hide =
+  let from_, version_alias, where, bind =
+    match (criterion : Search.Criterion.t), seeds with
+    | Search.Criterion.Props { base_type; props; position }, None ->
+      (match
+         props_seek ~base_type ~props ~position ~entries_alias:"e" ~props_alias:"p0"
+       with
+       | Some (from_, where, bind) -> from_, "p0", where, bind
+       | None ->
+         let where, bind = criterion_where ~version criterion ~alias:"e" in
+         "entries e", "e", where, bind)
+    | criterion, _ ->
+      let where, bind = criterion_where ~version criterion ~alias:"e" in
+      "entries e", "e", where, bind
+  in
+  let seed_where, seed_bind =
+    match seeds with
+    | None -> pending_filter ~hide ~version ~alias:"e.seed"
+    | Some seeds ->
+      ( sprintf
+          " and e.seed in (%s)"
+          (List.map seeds ~f:(fun _ -> "?") |> String.concat ~sep:", ")
+      , List.map seeds ~f:(fun seed -> Sqlite3.Data.TEXT seed) )
+  in
+  ( sprintf
+      "select max(n) from (select sum(coalesce(e.quantity, 1)) as n from %s where \
+       %s.version_id = %s and %s%s group by e.seed)"
+      from_
+      version_alias
+      version_id_sql
+      where
+      seed_where
+  , (version_bind version :: bind) @ seed_bind )
+;;
+
+let count_ceiling_of ?(hide = false) t criterion ~version ~seeds =
+  let sql, bind = count_ceiling_sql criterion ~version ~seeds ~hide in
+  with_stmt t sql ~bind ~f:(fun stmt ->
+    fold_rows stmt ~init:None ~f:(fun _ row -> Ok (column_int row 0)))
+;;
+
+let cohort_ceiling t criterion ~version ~seeds =
+  List.chunks_of seeds ~length:overlay_batch
+  |> List.fold_result ~init:None ~f:(fun acc seeds ->
+    let%map.Or_error n = count_ceiling_of t criterion ~version ~seeds:(Some seeds) in
+    Option.merge acc n ~f:Int.max)
 ;;
 
 (* A term's evidence may sit on several levels; the shallowest is the one worth
@@ -2125,18 +2315,59 @@ order by 1
     Search.Prop.min_value
 ;;
 
+(* Codes alone, not (base type, code): jewellery shares rF+, Reflect and others
+   with armour, but the per-base form leaves the covering index and was 4m13s
+   against 2.5s for this (1.3M, 0.34.1, prod, 2026-10-02). Only a stale store
+   reaches it, and armour holds every code jewellery shares. *)
+let ego_codes_sql =
+  sprintf
+    {|
+  select distinct g.val
+    from entries e
+    join strings g
+      on g.id = e.ego_id
+   where e.version_id = %s
+     and e.ego_id is not null
+|}
+    version_id_sql
+;;
+
+let brand_options ~version ~held =
+  List.concat_map Search.Brand.base_types ~f:(fun base_type ->
+    Search.Brand.words ~base_type
+    |> List.filter ~f:(fun word ->
+      Option.is_none (Search.Brand.why_excluded ~base_type word)
+      && Option.exists (Search.Brand.code ~base_type ~version word) ~f:(fun code ->
+        held ~base_type code))
+    |> List.map ~f:(sprintf "%s ego:%s" base_type))
+;;
+
 let distinct_criteria t ~version =
   let%bind.Or_error pairs =
     match%bind.Or_error Search_index.item_pairs t ~version with
     | Some pairs -> Ok pairs
     | None -> with_stmt t item_pairs_sql ~bind:[ version_bind version ] ~f:seeds_of_stmt
   in
-  let%map.Or_error props =
+  let%bind.Or_error props =
     with_stmt t prop_names_sql ~bind:[ version_bind version ] ~f:seeds_of_stmt
+  in
+  let%map.Or_error held =
+    match%bind.Or_error Search_index.catalog_brands t ~version with
+    | Some brands ->
+      Ok
+        (fun ~base_type code ->
+          List.mem brands (base_type, code) ~equal:[%equal: string * string])
+    | None ->
+      let%map.Or_error codes =
+        with_stmt t ego_codes_sql ~bind:[ version_bind version ] ~f:seeds_of_stmt
+      in
+      fun ~base_type:_ code -> List.mem codes code ~equal:String.equal
   in
   (* Filtered here rather than in SQL: the exclusion is a judgement about the
      game, and [Search.Prop] is where that judgement lives. *)
-  pairs @ (List.filter props ~f:Search.Prop.searchable |> List.map ~f:(sprintf "props:%s"))
+  pairs
+  @ (List.filter props ~f:Search.Prop.searchable |> List.map ~f:(sprintf "props:%s"))
+  @ brand_options ~version ~held
 ;;
 
 (* The distinct (portal, parent) pairs a version holds, which is what a depth
@@ -2280,6 +2511,7 @@ let refuse_stale_trigram t (search : Search.t) =
       (* [Props] resolves property names through [strings] by primary key, not
          through the trigram index, so a rebuild cannot stale it. *)
       | Search.Criterion.Props _
+      | Search.Criterion.Brand _
       | Search.Criterion.Item _
       | Search.Criterion.Feature _
       | Search.Criterion.Unique _ -> false)
@@ -2314,9 +2546,9 @@ let matches_of_seeds t (search : Search.t) seeds =
     })
 ;;
 
-let search_seeds_unranked t (search : Search.t) =
+let search_seeds_unranked t (search : Search.t) ~hide =
   let open Or_error.Let_syntax in
-  let sql, bind = search_seeds_sql search in
+  let sql, bind = search_seeds_sql search ~hide in
   let%bind seeds = with_stmt t sql ~bind ~f:seeds_of_stmt in
   let seeds, more =
     match List.split_n seeds search.page.limit with
@@ -2333,12 +2565,12 @@ let search_seeds_unranked t (search : Search.t) =
    refused rather than answered with a page-local order.
 
    The cursor is an offset into the ranked order, not a seed. *)
-let search_seeds_ranked t (search : Search.t) ~rank =
+let search_seeds_ranked t (search : Search.t) ~rank ~hide =
   let open Or_error.Let_syntax in
   let whole =
     { search with page = { Query.Page.after = None; limit = Search.Rank.sort_limit + 1 } }
   in
-  let%bind matches, _ = search_seeds_unranked t whole in
+  let%bind matches, _ = search_seeds_unranked t whole ~hide in
   if List.length matches > Search.Rank.sort_limit
   then
     Or_error.errorf
@@ -2409,9 +2641,10 @@ let search_index_stats t ~version =
 ;;
 
 let sql_path t (search : Search.t) ~rank =
+  let%bind.Or_error hide = has_pending t ~version:search.version in
   if Search.Rank.equal rank Search.Rank.Seed
-  then search_seeds_unranked t search
-  else search_seeds_ranked t search ~rank
+  then search_seeds_unranked t search ~hide
+  else search_seeds_ranked t search ~rank ~hide
 ;;
 
 let search_seeds_sql t (search : Search.t) ~rank =
@@ -2421,8 +2654,19 @@ let search_seeds_sql t (search : Search.t) ~rank =
     sql_path t search ~rank)
 ;;
 
+(* The store resolves [name~] through SQL, and a pending seed has no ordinal to
+   resolve to, so it is filtered there rather than read as a reason to
+   decline. *)
 let store_path ?name_cap t (search : Search.t) ~rank =
   let open Or_error.Let_syntax in
+  let%bind hide = has_pending t ~version:search.version in
+  let criterion_where criterion ~alias =
+    let where, bind = criterion_where ~version:search.version criterion ~alias in
+    let hidden, hidden_bind =
+      pending_filter ~hide ~version:search.version ~alias:(alias ^ ".seed")
+    in
+    where ^ hidden, bind @ hidden_bind
+  in
   (* A current store that errors is a fault, so that propagates; a decline is
      [None]. *)
   match%bind
@@ -2464,12 +2708,43 @@ let search_seeds t (search : Search.t) ~rank =
     | None -> sql_path t search ~rank)
 ;;
 
+let ceiling_store_path t ~version criterion =
+  Search_index.ceiling
+    t
+    ~version
+    criterion
+    ~cohort_ceiling:(cohort_ceiling t criterion ~version)
+;;
+
+let count_ceiling_store t ~version criterion =
+  with_txn t ~f:(fun t -> ceiling_store_path t ~version criterion)
+;;
+
+let count_ceiling_sql t ~version criterion =
+  with_txn t ~f:(fun t ->
+    let%bind.Or_error hide = has_pending t ~version in
+    count_ceiling_of ~hide t criterion ~version ~seeds:None)
+;;
+
+let count_ceiling t ~version criterion =
+  if not (Search.Criterion.has_count_ceiling criterion)
+  then Ok None
+  else
+    with_txn t ~f:(fun t ->
+      match%bind.Or_error ceiling_store_path t ~version criterion with
+      | Some ceiling -> Ok ceiling
+      | None ->
+        let%bind.Or_error hide = has_pending t ~version in
+        count_ceiling_of ~hide t criterion ~version ~seeds:None)
+;;
+
 (* Deepen queue: web process enqueues, generator claims and runs crawl. *)
 
 let job_of_row row ~version =
   let open Or_error.Let_syntax in
   let%bind seed = required row 0 ~field:"seed" in
-  let%map depth = required row 2 ~field:"depth" in
+  let%bind depth = required row 2 ~field:"depth" in
+  let%map origin = required row 8 ~field:"origin" >>= Job.Origin.of_string in
   { Job.seed
   ; version
   ; depth
@@ -2478,6 +2753,7 @@ let job_of_row row ~version =
   ; finished_at = column_int row 5
   ; attempts = Option.value (column_int row 6) ~default:0
   ; error = column_text row 7
+  ; origin
   }
 ;;
 
@@ -2491,6 +2767,7 @@ let job_columns =
        , finished_at
        , attempts
        , error
+       , origin
     from ingest_jobs
 |}
 ;;
@@ -2518,7 +2795,7 @@ let job_for_seed t ~version ~seed =
 ;;
 
 (* Jobs ahead of this one in the queue, same version only. Counted by
-   (queued_at, seed) to break ties. Index-driven over ingest_jobs_pending;
+   (origin, queued_at, seed): deepens first, then age, then seed to break ties. Index-driven over ingest_jobs_pending;
    residual filters on started_at/error are bounded by the outstanding-jobs
    cap. *)
 let queue_position_sql =
@@ -2530,13 +2807,13 @@ let queue_position_sql =
      and ahead.started_at is null
      and ahead.finished_at is null
      and ahead.error is null
-     and (ahead.queued_at, ahead.seed) < (select mine.queued_at, mine.seed
-                                            from ingest_jobs mine
-                                           where mine.seed = ?
-                                             and mine.version_id = %s
-                                             and mine.started_at is null
-                                             and mine.finished_at is null
-                                             and mine.error is null)
+     and (ahead.origin = 'submit', ahead.queued_at, ahead.seed) < (select mine.origin = 'submit', mine.queued_at, mine.seed
+                                                                    from ingest_jobs mine
+                                                                   where mine.seed = ?
+                                                                     and mine.version_id = %s
+                                                                     and mine.started_at is null
+                                                                     and mine.finished_at is null
+                                                                     and mine.error is null)
 |}
     version_id_sql
     version_id_sql
@@ -2571,13 +2848,40 @@ let outstanding_jobs_sql =
     from ingest_jobs
    where finished_at is null
      and error is null
+     and origin = coalesce(?, origin)
 |}
 ;;
 
-let outstanding_jobs t =
-  with_stmt t outstanding_jobs_sql ~bind:[] ~f:(fun stmt ->
-    fold_rows stmt ~init:0 ~f:(fun _ row ->
-      Ok (Option.value (column_int row 0) ~default:0)))
+let outstanding_jobs ?origin t =
+  with_stmt
+    t
+    outstanding_jobs_sql
+    ~bind:
+      [ Option.value_map origin ~default:Sqlite3.Data.NULL ~f:(fun origin ->
+          Sqlite3.Data.TEXT (Job.Origin.to_string origin))
+      ]
+    ~f:(fun stmt ->
+      fold_rows stmt ~init:0 ~f:(fun _ row ->
+        Ok (Option.value (column_int row 0) ~default:0)))
+;;
+
+let submitted_since_sql =
+  {|
+  select count(*)
+    from ingest_jobs
+   where origin = 'submit'
+     and queued_at >= ?
+|}
+;;
+
+let submitted_since t ~since =
+  with_stmt
+    t
+    submitted_since_sql
+    ~bind:[ Sqlite3.Data.INT (Int64.of_int since) ]
+    ~f:(fun stmt ->
+      fold_rows stmt ~init:0 ~f:(fun _ row ->
+        Ok (Option.value (column_int row 0) ~default:0)))
 ;;
 
 let servable_versions_sql =
@@ -2621,7 +2925,7 @@ let populated_versions t =
 let enqueue_sql =
   sprintf
     {|
-insert into ingest_jobs (seed, version_id) values (?, %s) on conflict do nothing
+insert into ingest_jobs (seed, version_id, origin) values (?, %s, ?) on conflict do nothing
 |}
     version_id_sql
 ;;
@@ -2663,7 +2967,7 @@ let heartbeat t ~generator_id ~versions ~now =
 ;;
 
 (* Cap and generator checks inside the write transaction to avoid TOCTOU races. *)
-let enqueue t ~version ~seed ~cap ~servable_since =
+let enqueue ?daily t ~version ~seed ~origin ~cap ~servable_since =
   with_immediate_txn t ~f:(fun t ->
     let open Or_error.Let_syntax in
     let%bind servable = servable_versions t ~since:servable_since in
@@ -2674,8 +2978,17 @@ let enqueue t ~version ~seed ~cap ~servable_since =
       match existing with
       | Some job -> Ok (`Already_queued job)
       | None ->
-        let%bind outstanding = outstanding_jobs t in
-        if outstanding >= cap
+        let%bind outstanding = outstanding_jobs ~origin t in
+        let%bind over_daily =
+          match daily with
+          | None -> Ok false
+          | Some (daily_cap, since) ->
+            let%map today = submitted_since t ~since in
+            today >= daily_cap
+        in
+        if over_daily
+        then Ok `Daily_cap
+        else if outstanding >= cap
         then Ok `Queue_full
         else (
           let%bind () = register_version t version in
@@ -2683,7 +2996,11 @@ let enqueue t ~version ~seed ~cap ~servable_since =
             with_stmt
               t
               enqueue_sql
-              ~bind:[ Sqlite3.Data.TEXT seed; version_bind version ]
+              ~bind:
+                [ Sqlite3.Data.TEXT seed
+                ; version_bind version
+                ; Sqlite3.Data.TEXT (Job.Origin.to_string origin)
+                ]
               ~f:(fun stmt -> fold_rows stmt ~init:() ~f:(fun () _ -> Ok ()))
           in
           `Queued)))
@@ -2731,7 +3048,8 @@ update ingest_jobs
                                  and started_at is null
                                  and finished_at is null
                                  and error is null
-                               order by queued_at
+                               order by origin = 'submit'
+                                      , queued_at
                                limit 1)
 |}
     version_id_sql
@@ -2893,6 +3211,8 @@ let finish_job t ~version ~seed ~started_at ~now ~error =
    Population statistics per (version, cap), recomputed by bin/rescore.ml after
    a fill. *)
 
+(* The population is the random sample. A submitted seed is scored against it
+   but never counted in it. *)
 let eligible_seeds_sql =
   sprintf
     {|
@@ -2900,6 +3220,7 @@ select seed
   from seed_fills
  where version_id = %s
    and depth >= ?
+   and origin = 'fill'
 |}
     version_id_sql
 ;;
@@ -2908,6 +3229,27 @@ let eligible_seeds t ~version ~cap =
   with_stmt
     t
     eligible_seeds_sql
+    ~bind:[ version_bind version; Sqlite3.Data.INT (Int64.of_int cap) ]
+    ~f:seeds_of_stmt
+  |> Or_error.ok_exn
+;;
+
+let submitted_seeds_sql =
+  sprintf
+    {|
+select seed
+  from seed_fills
+ where version_id = %s
+   and depth >= ?
+   and origin = 'submit'
+|}
+    version_id_sql
+;;
+
+let submitted_seeds t ~version ~cap =
+  with_stmt
+    t
+    submitted_seeds_sql
     ~bind:[ version_bind version; Sqlite3.Data.INT (Int64.of_int cap) ]
     ~f:seeds_of_stmt
   |> Or_error.ok_exn
@@ -2972,7 +3314,8 @@ let surprise_counts_sql ~levels_filter ~portal_filter =
      and e.seed in (select seed
                       from seed_fills
                      where version_id = %s
-                       and depth >= ?)
+                       and depth >= ?
+                       and origin = 'fill')
      %s
      %s
 group by e.seed
@@ -3064,36 +3407,94 @@ select es.entry_id
     string_id_sql
 ;;
 
+let seed_book_rows_sql =
+  sprintf
+    {|
+   select e.id
+        , e.seed
+        , s_sub_type.val
+        , e.artefact
+        , s_level.val
+        , s_parent.val
+     from entries e
+     join seed_levels sl
+       on sl.seed = e.seed
+      and sl.version_id = e.version_id
+      and sl.level_id = e.level_id
+     join strings s_level
+       on s_level.id = e.level_id
+left join strings s_parent
+       on s_parent.id = sl.parent_level_id
+left join strings s_sub_type
+       on s_sub_type.id = e.sub_type_id
+    where e.seed = ?
+      and e.version_id = %s
+      and e.cost is null
+      and e.base_type_id = %s
+|}
+    version_id_sql
+    string_id_sql
+;;
+
+let seed_randart_book_spells_sql = randart_book_spells_sql ^ "   and e.seed = ?\n"
+
+let early_spells_of_rows ~book_spells ~randart_spells rows =
+  let by_seed = String.Table.create () in
+  List.iter rows ~f:(fun (entry_id, seed, sub_type, artefact) ->
+    let spells =
+      if Book.spells_are_fixed ~sub_type ~artefact
+      then Option.bind sub_type ~f:(fun sub_type -> Map.find book_spells sub_type)
+      else (
+        match sub_type with
+        | Some sub_type when Book.spells_are_derivable ~sub_type:(Some sub_type) ->
+          Book.spells_of_sub_type sub_type
+        | _ -> Hashtbl.find randart_spells entry_id)
+    in
+    match spells with
+    | None -> ()
+    | Some spells ->
+      List.iter spells ~f:(fun spell ->
+        match Spell.level spell with
+        | Some level when level <= 4 -> Hashtbl.add_multi by_seed ~key:seed ~data:spell
+        | _ -> ()));
+  Hashtbl.map by_seed ~f:(fun spells ->
+    List.dedup_and_sort spells ~compare:String.compare |> List.length)
+;;
+
+let version_book_spells t ~version =
+  with_stmt
+    t
+    version_book_spells_sql
+    ~bind:[ version_bind version ]
+    ~f:(fun stmt ->
+      fold_rows stmt ~init:[] ~f:(fun acc row ->
+        let%bind.Or_error sub_type = required row 0 ~field:"sub_type" in
+        let%map.Or_error spell = required row 1 ~field:"spell" in
+        (sub_type, spell) :: acc)
+      |> Or_error.map ~f:(fun rows -> List.rev rows |> Map.of_alist_multi (module String)))
+;;
+
+let randart_spells_of t sql ~bind =
+  with_stmt t sql ~bind ~f:(fun stmt ->
+    fold_rows stmt ~init:[] ~f:(fun acc row ->
+      let%bind.Or_error entry_id =
+        match column_int row 0 with
+        | Some id -> Ok id
+        | None -> Or_error.error_string "entry_id is null"
+      in
+      let%map.Or_error spell = required row 1 ~field:"spell" in
+      (entry_id, spell) :: acc)
+    |> Or_error.map ~f:(fun rows -> Int.Table.of_alist_multi (List.rev rows)))
+;;
+
 let early_spell_counts t ~version ~cap ~levels ~parents =
   let open Or_error.Let_syntax in
-  let%bind book_spells =
-    with_stmt
-      t
-      version_book_spells_sql
-      ~bind:[ version_bind version ]
-      ~f:(fun stmt ->
-        fold_rows stmt ~init:[] ~f:(fun acc row ->
-          let%bind sub_type = required row 0 ~field:"sub_type" in
-          let%map spell = required row 1 ~field:"spell" in
-          (sub_type, spell) :: acc)
-        |> Or_error.map ~f:(fun rows ->
-          List.rev rows |> Map.of_alist_multi (module String)))
-  in
+  let%bind book_spells = version_book_spells t ~version in
   let%bind randart_spells =
-    with_stmt
+    randart_spells_of
       t
       randart_book_spells_sql
       ~bind:[ version_bind version; Sqlite3.Data.TEXT "book" ]
-      ~f:(fun stmt ->
-        fold_rows stmt ~init:[] ~f:(fun acc row ->
-          let%bind entry_id =
-            match column_int row 0 with
-            | Some id -> Ok id
-            | None -> Or_error.error_string "entry_id is null"
-          in
-          let%map spell = required row 1 ~field:"spell" in
-          (entry_id, spell) :: acc)
-        |> Or_error.map ~f:(fun rows -> Int.Table.of_alist_multi (List.rev rows)))
   in
   let (levels_filter, portal_filter), extra_bind = cap_filter ~levels ~parents ~cap in
   let%map rows =
@@ -3120,26 +3521,7 @@ let early_spell_counts t ~version ~cap ~levels ~parents =
           (entry_id, seed, sub_type, artefact) :: acc)
         |> Or_error.map ~f:List.rev)
   in
-  let by_seed = String.Table.create () in
-  List.iter rows ~f:(fun (entry_id, seed, sub_type, artefact) ->
-    let spells =
-      if Book.spells_are_fixed ~sub_type ~artefact
-      then Option.bind sub_type ~f:(fun sub_type -> Map.find book_spells sub_type)
-      else (
-        match sub_type with
-        | Some sub_type when Book.spells_are_derivable ~sub_type:(Some sub_type) ->
-          Book.spells_of_sub_type sub_type
-        | _ -> Hashtbl.find randart_spells entry_id)
-    in
-    match spells with
-    | None -> ()
-    | Some spells ->
-      List.iter spells ~f:(fun spell ->
-        match Spell.level spell with
-        | Some level when level <= 4 -> Hashtbl.add_multi by_seed ~key:seed ~data:spell
-        | _ -> ()));
-  Hashtbl.map by_seed ~f:(fun spells ->
-    List.dedup_and_sort spells ~compare:String.compare |> List.length)
+  early_spells_of_rows ~book_spells ~randart_spells rows
 ;;
 
 let delete_surprise_sql =
@@ -3445,6 +3827,24 @@ insert into heat_bands (version_id, cap, band, min_score)
     version_id_sql
 ;;
 
+let delete_heat_cohort_sql =
+  sprintf "delete from heat_cohorts where version_id = %s and cap = ?" version_id_sql
+;;
+
+let insert_heat_cohort_sql =
+  sprintf
+    "insert into heat_cohorts (version_id, cap, seeds) values (%s, ?, ?)"
+    version_id_sql
+;;
+
+(* A tie lands in the lowest band that reaches it, which [max_elt] gives only
+   over [cuts] in ascending band order. *)
+let band_of_score cuts score =
+  List.filter cuts ~f:(fun (_, min_score) -> Float.( >= ) score min_score)
+  |> List.max_elt ~compare:(fun (_, a) (_, b) -> Float.compare a b)
+  |> Option.value_map ~default:Heat.Band.Cold ~f:fst
+;;
+
 (* Percentile cut points for [Heat.Band.t]: band 0 (Cold) starts at the
    population minimum, each higher band at score [pct] up the sorted list. No
    interpolation; a stored min_score is a threshold test at read time. *)
@@ -3534,9 +3934,16 @@ let rescore ?(shards = 1) t ~version ~(cap : Depth.t) =
         ~bind:[ version_bind version; Sqlite3.Data.INT cap_int ]
         ~f:(fun stmt -> fold_rows stmt ~init:() ~f:(fun () _ -> Ok ()))
       |> Or_error.ok_exn;
+      with_stmt
+        t
+        delete_heat_cohort_sql
+        ~bind:[ version_bind version; Sqlite3.Data.INT cap_int ]
+        ~f:(fun stmt -> fold_rows stmt ~init:() ~f:(fun () _ -> Ok ()))
+      |> Or_error.ok_exn;
       f t)
   in
   let eligible = eligible_seeds t ~version ~cap in
+  let submitted = submitted_seeds t ~version ~cap in
   let n = List.length eligible in
   if n > 0
   then (
@@ -3591,18 +3998,22 @@ let rescore ?(shards = 1) t ~version ~(cap : Depth.t) =
           let early_spells = Hashtbl.find early_spells seed |> Option.value ~default:0 in
           (seed, Heat.score ~surprise ~n ~cap ~early_spells observations) :: acc))
     in
-    (* Eligible seeds with no scoring rows score 0; fill the gap explicitly. *)
+    (* Seeds with no scoring rows score 0; fill the gap explicitly. *)
     let scored = Hash_set.of_list (module String) (List.map scores ~f:fst) in
     let scores =
-      List.fold eligible ~init:scores ~f:(fun acc seed ->
+      List.fold (eligible @ submitted) ~init:scores ~f:(fun acc seed ->
         if Hash_set.mem scored seed
         then acc
         else (
           let early_spells = Hashtbl.find early_spells seed |> Option.value ~default:0 in
           (seed, Heat.score ~surprise ~n ~cap ~early_spells []) :: acc))
     in
+    let sample = Hash_set.of_list (module String) eligible in
     let sorted_scores =
-      List.map scores ~f:snd |> List.sort ~compare:Float.compare |> Array.of_list
+      List.filter_map scores ~f:(fun (seed, score) ->
+        Option.some_if (Hash_set.mem sample seed) score)
+      |> List.sort ~compare:Float.compare
+      |> Array.of_list
     in
     let cut ~pct = percentile sorted_scores ~pct in
     let min_score_of : Heat.Band.t -> float = function
@@ -3613,11 +4024,6 @@ let rescore ?(shards = 1) t ~version ~(cap : Depth.t) =
     in
     let bands = [ Heat.Band.Cold; Warm; Hot; Blazing ] in
     let cuts = List.map bands ~f:(fun band -> band, min_score_of band) in
-    let band_of_score score =
-      List.filter cuts ~f:(fun (_, min_score) -> Float.( >= ) score min_score)
-      |> List.max_elt ~compare:(fun (_, a) (_, b) -> Float.compare a b)
-      |> Option.value_map ~default:Heat.Band.Cold ~f:fst
-    in
     write_scores ~f:(fun t ->
       let insert_score_stmt = Sqlite3.prepare t insert_seed_score_sql in
       let insert_band_stmt = Sqlite3.prepare t insert_heat_band_sql in
@@ -3626,8 +4032,18 @@ let rescore ?(shards = 1) t ~version ~(cap : Depth.t) =
           ignore (Sqlite3.finalize insert_score_stmt : Sqlite3.Rc.t);
           ignore (Sqlite3.finalize insert_band_stmt : Sqlite3.Rc.t))
         ~f:(fun () ->
+          with_stmt
+            t
+            insert_heat_cohort_sql
+            ~bind:
+              [ version_bind version
+              ; Sqlite3.Data.INT cap_int
+              ; Sqlite3.Data.INT (Int64.of_int n)
+              ]
+            ~f:(fun stmt -> fold_rows stmt ~init:() ~f:(fun () _ -> Ok ()))
+          |> Or_error.ok_exn;
           List.iter scores ~f:(fun (seed, score) ->
-            let band = band_of_score score in
+            let band = band_of_score cuts score in
             let bind i data = check_rc "bind" (Sqlite3.bind insert_score_stmt i data) in
             bind 1 (Sqlite3.Data.TEXT seed);
             bind 2 (Sqlite3.Data.TEXT (Query.Version.to_string version));
@@ -3687,7 +4103,7 @@ delete from %s
 
 let drop_stale_caps t ~version =
   with_immediate_txn t ~f:(fun t ->
-    [ "seed_scores"; "heat_bands"; "surprise" ]
+    [ "seed_scores"; "heat_bands"; "heat_cohorts"; "surprise" ]
     |> List.map ~f:(fun table ->
       with_stmt
         t
@@ -3708,4 +4124,191 @@ let fill_caps t ~version =
         | Some depth -> Ok (depth :: acc)
         | None -> Or_error.error_string "depth is null")
       |> Or_error.map ~f:List.rev)
+;;
+
+let heat_cohort_sql =
+  sprintf
+    "select seeds from heat_cohorts where version_id = %s and cap = ?"
+    version_id_sql
+;;
+
+let heat_cuts_sql =
+  sprintf
+    "select band, min_score from heat_bands where version_id = %s and cap = ?"
+    version_id_sql
+;;
+
+let seed_depth_sql =
+  sprintf "select depth from seed_fills where seed = ? and version_id = %s" version_id_sql
+;;
+
+let upsert_seed_score_sql =
+  sprintf
+    {|
+insert or replace
+  into seed_scores
+     ( seed
+     , version_id
+     , cap
+     , score
+     , band
+     )
+values
+     ( ?
+     , %s
+     , ?
+     , ?
+     , ?
+     )
+|}
+    version_id_sql
+;;
+
+(* The depth cap applied to rows already narrowed to one seed, in the terms
+   [cap_filter] states it in SQL for a whole version: the level must be within
+   the cap, and so must a portal's (level, parent) pair. Reading the version's
+   level and parent lists to build that SQL is a scan of the build. *)
+let row_within_cap ~level ~parent ~cap =
+  level_within_cap ~level ~parent:None ~cap
+  &&
+  match parent with
+  | None -> true
+  | Some parent -> level_within_cap ~level ~parent:(Some parent) ~cap
+;;
+
+let score_seed t ~version ~seed =
+  with_immediate_txn t ~f:(fun t ->
+    let open Or_error.Let_syntax in
+    let cap_bind cap = Sqlite3.Data.INT (Int64.of_int cap) in
+    let%bind depth =
+      with_stmt
+        t
+        seed_depth_sql
+        ~bind:[ Sqlite3.Data.TEXT seed; version_bind version ]
+        ~f:(fun stmt -> fold_rows stmt ~init:None ~f:(fun _ row -> Ok (column_int row 0)))
+    in
+    match depth with
+    | None -> Ok []
+    | Some depth ->
+      let%bind caps = fill_caps t ~version in
+      let%bind book_spells = version_book_spells t ~version in
+      let%bind randart_spells =
+        randart_spells_of
+          t
+          seed_randart_book_spells_sql
+          ~bind:[ version_bind version; Sqlite3.Data.TEXT "book"; Sqlite3.Data.TEXT seed ]
+      in
+      let%bind book_rows =
+        with_stmt
+          t
+          seed_book_rows_sql
+          ~bind:[ Sqlite3.Data.TEXT seed; version_bind version; Sqlite3.Data.TEXT "book" ]
+          ~f:(fun stmt ->
+            fold_rows stmt ~init:[] ~f:(fun acc row ->
+              let%bind entry_id =
+                match column_int row 0 with
+                | Some id -> Ok id
+                | None -> Or_error.error_string "entry_id is null"
+              in
+              let%bind seed = required row 1 ~field:"seed" in
+              let%map level = required row 4 ~field:"level" in
+              ( (entry_id, seed, column_text row 2, column_bool row 3)
+              , level
+              , column_text row 5 )
+              :: acc))
+      in
+      let%map scored =
+        List.filter caps ~f:(fun cap -> cap <= depth)
+        |> List.fold_result ~init:[] ~f:(fun scored cap ->
+          let%bind n =
+            with_stmt
+              t
+              heat_cohort_sql
+              ~bind:[ version_bind version; cap_bind cap ]
+              ~f:(fun stmt ->
+                fold_rows stmt ~init:None ~f:(fun _ row -> Ok (column_int row 0)))
+          in
+          let%bind cuts =
+            with_stmt
+              t
+              heat_cuts_sql
+              ~bind:[ version_bind version; cap_bind cap ]
+              ~f:(fun stmt ->
+                fold_rows stmt ~init:[] ~f:(fun acc row ->
+                  let%bind band =
+                    match Option.bind (column_int row 0) ~f:Heat.Band.of_int with
+                    | Some band -> Ok band
+                    | None -> Or_error.error_string "corrupt band"
+                  in
+                  let%map min_score =
+                    match Sqlite3.Data.to_float row.(1) with
+                    | Some f -> Ok f
+                    | None -> Or_error.error_string "min_score is null"
+                  in
+                  (band, min_score) :: acc))
+          in
+          match n, cuts with
+          | None, _ | _, [] -> Ok scored
+          | Some n, cuts ->
+            let cuts =
+              List.sort cuts ~compare:(fun (a, _) (b, _) ->
+                Int.compare (Heat.Band.to_int a) (Heat.Band.to_int b))
+            in
+            let early_spells =
+              List.filter_map book_rows ~f:(fun (row, level, parent) ->
+                Option.some_if (row_within_cap ~level ~parent ~cap) row)
+              |> early_spells_of_rows ~book_spells ~randart_spells
+              |> Fn.flip Hashtbl.find seed
+              |> Option.value ~default:0
+            in
+            let%bind rows =
+              with_stmt
+                t
+                (score_rows_sql
+                   ~levels_filter:""
+                   ~portal_filter:""
+                   ~shard_filter:"and e.seed >= ? and e.seed <= ?")
+                ~bind:
+                  [ version_bind version
+                  ; version_bind version
+                  ; cap_bind cap
+                  ; Sqlite3.Data.TEXT seed
+                  ; Sqlite3.Data.TEXT seed
+                  ]
+                ~f:(fun stmt ->
+                  fold_rows stmt ~init:[] ~f:(fun acc row ->
+                    let%bind seed = required row 0 ~field:"seed" in
+                    let%bind base_type = required row 1 ~field:"base_type" in
+                    let%bind sub_type = required row 2 ~field:"sub_type" in
+                    let%map level = required row 3 ~field:"level" in
+                    let count = Option.value (column_int row 4) ~default:1 in
+                    let parent = column_text row 5 in
+                    if row_within_cap ~level ~parent ~cap
+                    then (seed, base_type, sub_type, level, count, parent) :: acc
+                    else acc))
+            in
+            let observations =
+              Map.find (group_observations rows) seed |> Option.value ~default:[]
+            in
+            let%bind surprise =
+              Or_error.try_with (fun () -> surprise_lookup t ~version ~cap ~n)
+            in
+            let score = Heat.score ~surprise ~n ~cap ~early_spells observations in
+            let%map () =
+              with_stmt
+                t
+                upsert_seed_score_sql
+                ~bind:
+                  [ Sqlite3.Data.TEXT seed
+                  ; version_bind version
+                  ; cap_bind cap
+                  ; Sqlite3.Data.FLOAT score
+                  ; Sqlite3.Data.INT
+                      (Int64.of_int (Heat.Band.to_int (band_of_score cuts score)))
+                  ]
+                ~f:(fun stmt -> fold_rows stmt ~init:() ~f:(fun () _ -> Ok ()))
+            in
+            cap :: scored)
+      in
+      List.rev scored)
 ;;

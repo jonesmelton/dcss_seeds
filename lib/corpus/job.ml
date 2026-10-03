@@ -16,6 +16,24 @@ module State = struct
   ;;
 end
 
+module Origin = struct
+  type t =
+    | Deepen
+    | Submit
+  [@@deriving compare, equal, sexp_of]
+
+  let to_string = function
+    | Deepen -> "deepen"
+    | Submit -> "submit"
+  ;;
+
+  let of_string = function
+    | "deepen" -> Ok Deepen
+    | "submit" -> Ok Submit
+    | other -> Or_error.errorf "unknown job origin: %s" other
+  ;;
+end
+
 type t =
   { seed : string
   ; version : Query.Version.t
@@ -25,6 +43,7 @@ type t =
   ; finished_at : int option
   ; attempts : int
   ; error : string option
+  ; origin : Origin.t
   }
 [@@deriving sexp_of]
 
