@@ -1,11 +1,13 @@
 open! Core
 module Search = Seed_corpus.Search
 
+let version = Or_error.ok_exn (Seed_corpus.Query.Version.of_string "0.34.1")
+
 (* Exercised through the same entry point the handler uses, but the affix
    peeling is where the ambiguity lives: "3x" is a count, an "x" inside a name
    is not. *)
 let show s =
-  match Seed_web.Params.term_of_string s with
+  match Seed_web.Params.term_of_string ~version s with
   | Error err -> printf "%-28s -> error: %s\n" s (Error.to_string_hum err)
   | Ok term -> printf "%-28s -> %s\n" s (Search.Term.to_string term)
 ;;
@@ -46,7 +48,7 @@ let%expect_test "term syntax" =
    a floor term from a term that named no position, which is exactly the
    distinction every row here turns on. *)
 let show_parse s =
-  match Seed_web.Params.term_of_string s with
+  match Seed_web.Params.term_of_string ~version s with
   | Error err -> printf "%-26s -> error: %s\n" s (Error.to_string_hum err)
   | Ok term -> printf "%-26s -> %s\n" s (Sexp.to_string [%sexp (term : Search.Term.t)])
 ;;
@@ -59,6 +61,7 @@ let%expect_test "a position prefix is peeled off and the rest parses as it would
     ; "floor potion:haste"
     ; "name~Wyrmbane"
     ; "floor name~Wyrmbane"
+    ; "shop name~Wyrmbane"
     ; "props:Conj"
     ; "shop props:Conj"
     ; "staff props:Conj"
@@ -72,6 +75,7 @@ let%expect_test "a position prefix is peeled off and the rest parses as it would
     floor potion:haste         -> ((criterion(Item((base_type potion)(sub_type haste))Floor))(min_count 1))
     name~Wyrmbane              -> ((criterion(Name_like Wyrmbane Floor))(min_count 1))
     floor name~Wyrmbane        -> ((criterion(Name_like Wyrmbane Floor))(min_count 1))
+    shop name~Wyrmbane         -> ((criterion(Name_like Wyrmbane Shop))(min_count 1))
     props:Conj                 -> ((criterion(Props(base_type())(props(Conj))(position Floor)))(min_count 1))
     shop props:Conj            -> ((criterion(Props(base_type())(props(Conj))(position Shop)))(min_count 1))
     staff props:Conj           -> ((criterion(Props(base_type(staff))(props(Conj))(position Floor)))(min_count 1))
@@ -91,9 +95,6 @@ let%expect_test "position guards" =
       "shop floor potion:haste"
     ; "floor shop potion:haste"
     ; "shop shop potion:haste"
-      (* No shop form of name~, and its own message -- never a fallthrough to
-         the not-a-feature branch. *)
-    ; "shop name~Wyrmbane"
       (* A position must not rescue a term search dropped on other grounds. *)
     ; "shop unique:Sigmund"
     ; "floor unique:Sigmund"
@@ -103,7 +104,6 @@ let%expect_test "position guards" =
     shop floor potion:haste    -> error: use "shop " or "floor ", not both: "shop floor potion:haste"
     floor shop potion:haste    -> error: use "shop " or "floor ", not both: "floor shop potion:haste"
     shop shop potion:haste     -> error: use "shop " or "floor ", not both: "shop shop potion:haste"
-    shop name~Wyrmbane         -> error: name~ only searches the floor. Remove the "shop ".
     shop unique:Sigmund        -> error: only items are searchable, not monsters. Each seed page lists its uniques.
     floor unique:Sigmund       -> error: only items are searchable, not monsters. Each seed page lists its uniques.
     |}]
@@ -155,7 +155,7 @@ let%expect_test "shop props: is a property search, not a base type named props" 
 (* "floor " is accepted and redundant, on the same rule that accepts "floor
    potion:haste". It must reach the identical criterion, not a near-miss. *)
 let%expect_test "floor name~ is accepted and is the same search as bare name~" =
-  let parse s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
+  let parse s = Or_error.ok_exn (Seed_web.Params.term_of_string ~version s) in
   let same a b = Search.Term.compare (parse a) (parse b) = 0 in
   printf "floor name~ = bare name~: %b\n" (same "floor name~Wyrmbane" "name~Wyrmbane");
   printf
@@ -188,11 +188,11 @@ let%expect_test "floor name~ is accepted and is the same search as bare name~" =
 let%expect_test "every term the parser builds round-trips through to_query_string" =
   List.iter
     ~f:(fun s ->
-      match Seed_web.Params.term_of_string s with
+      match Seed_web.Params.term_of_string ~version s with
       | Error err -> printf "%-26s -> unparseable: %s\n" s (Error.to_string_hum err)
       | Ok term ->
         let emitted = Search.Term.to_query_string term in
-        (match Seed_web.Params.term_of_string emitted with
+        (match Seed_web.Params.term_of_string ~version emitted with
          | Error err ->
            printf "%-26s -> %-26s REJECTED: %s\n" s emitted (Error.to_string_hum err)
          | Ok reparsed ->
@@ -215,6 +215,7 @@ let%expect_test "every term the parser builds round-trips through to_query_strin
     ; "shop weapon:executioner's axe"
     ; "name~Wyrmbane"
     ; "floor name~Wyrmbane"
+    ; "shop name~Wyrmbane"
     ; "props:Conj"
     ; "props:Conj,Alch"
     ; "props:+Blink"
@@ -236,6 +237,7 @@ let%expect_test "every term the parser builds round-trips through to_query_strin
     shop weapon:executioner's axe -> shop weapon:executioner's axe same
     name~Wyrmbane              -> name~Wyrmbane              same
     floor name~Wyrmbane        -> name~Wyrmbane              same
+    shop name~Wyrmbane         -> shop name~Wyrmbane         same
     props:Conj                 -> props:Conj                 same
     props:Conj,Alch            -> props:Conj,Alch            same
     props:+Blink               -> props:+Blink               same
@@ -293,7 +295,7 @@ let%expect_test "a term count above the cap is an error" =
   let many =
     List.init (Seed_web.Params.max_terms + 1) ~f:(fun i -> sprintf "potion:haste%d" i)
   in
-  (match Seed_web.Params.terms_of_strings many with
+  (match Seed_web.Params.terms_of_strings ~version many with
    | Error err -> printf "%s\n" (Error.to_string_hum err)
    | Ok _ -> printf "unexpectedly accepted");
   [%expect {| too many search terms (max 10) |}]
@@ -431,7 +433,7 @@ let%expect_test "properties take no count" =
 let%expect_test "property terms round-trip through the query string" =
   List.iter
     ~f:(fun s ->
-      match Seed_web.Params.term_of_string s with
+      match Seed_web.Params.term_of_string ~version s with
       | Error err -> printf "%-28s -> error: %s\n" s (Error.to_string_hum err)
       | Ok term -> printf "%-28s -> %s\n" s (Search.Term.to_query_string term))
     [ "props:Conj"; "props:Conj,Alch"; "staff props:Conj,Alch"; "props: Conj , Alch " ];
@@ -589,7 +591,7 @@ let%expect_test "a brand typed as a property is told where it goes" =
 let%expect_test "brand terms round-trip through the query string" =
   List.iter
     ~f:(fun s ->
-      match Seed_web.Params.term_of_string s with
+      match Seed_web.Params.term_of_string ~version s with
       | Error err -> printf "%-32s -> error: %s\n" s (Error.to_string_hum err)
       | Ok term -> printf "%-32s -> %s\n" s (Search.Term.to_query_string term))
     [ "weapon:quick blade ego:distortion"
@@ -613,7 +615,7 @@ let%expect_test "brand terms round-trip through the query string" =
 let%expect_test "help page examples parse" =
   List.iter
     ~f:(fun s ->
-      match Seed_web.Params.term_of_string s with
+      match Seed_web.Params.term_of_string ~version s with
       | Error err -> printf "FAILS: %-28s %s\n" s (Error.to_string_hum err)
       | Ok _ -> ())
     [ "potion:haste"
@@ -664,7 +666,7 @@ let%expect_test "unknown properties are rejected, not searched" =
 let%expect_test "property names are case-insensitive and canonicalised" =
   List.iter
     ~f:(fun s ->
-      match Seed_web.Params.term_of_string s with
+      match Seed_web.Params.term_of_string ~version s with
       | Error err -> printf "%-28s -> error: %s\n" s (Error.to_string_hum err)
       | Ok term -> printf "%-28s -> %s\n" s (Search.Term.to_query_string term))
     [ "props:conj"; "props:rf"; "props:sinv"; "props:CONJ,alch"; "props:*rage" ];
@@ -678,11 +680,33 @@ let%expect_test "property names are case-insensitive and canonicalised" =
     |}]
 ;;
 
+(* Crawl renamed Alchemy to Alch in 0.33.1. Each build accepts its own spelling
+   and only that, and a reader who typed the other is told which one it is. *)
+let%expect_test "a renamed property is spelled as its own build spells it" =
+  List.iter [ "0.32.1"; "0.33.1"; "0.34.1" ] ~f:(fun v ->
+    let version = Or_error.ok_exn (Seed_corpus.Query.Version.of_string v) in
+    List.iter [ "props:Alchemy"; "props:alch"; "staff props:Conj,Alch" ] ~f:(fun s ->
+      match Seed_web.Params.term_of_string ~version s with
+      | Error err -> printf "%s %-22s -> error: %s\n" v s (Error.to_string_hum err)
+      | Ok term -> printf "%s %-22s -> %s\n" v s (Search.Term.to_query_string term)));
+  [%expect
+    {|
+    0.32.1 props:Alchemy          -> props:Alchemy
+    0.32.1 props:alch             -> error: 0.32.1 spells "alch" as "Alchemy".
+    0.32.1 staff props:Conj,Alch  -> error: 0.32.1 spells "Alch" as "Alchemy".
+    0.33.1 props:Alchemy          -> error: 0.33.1 spells "Alchemy" as "Alch".
+    0.33.1 props:alch             -> props:Alch
+    0.33.1 staff props:Conj,Alch  -> staff props:Conj,Alch
+    0.34.1 props:Alchemy          -> error: 0.34.1 spells "Alchemy" as "Alch".
+    0.34.1 props:alch             -> props:Alch
+    0.34.1 staff props:Conj,Alch  -> staff props:Conj,Alch
+    |}]
+;;
+
 let%expect_test "an empty first page logs the version and the terms by kind" =
-  let version = Seed_corpus.Query.Version.of_string "0.34.1" |> Or_error.ok_exn in
   List.iter
     ~f:(fun has ->
-      let terms = Seed_web.Params.terms_of_strings has |> Or_error.ok_exn in
+      let terms = Seed_web.Params.terms_of_strings ~version has |> Or_error.ok_exn in
       print_endline (Seed_web.Params.empty_search_line (Search.create ~version ~terms ())))
     [ [ "potion:haste"; "staff props:Conj,Alch" ]
     ; [ "3x shop potion:haste"; "shop props:rF"; "shop scroll:acquirement" ]
@@ -718,7 +742,7 @@ let vocabulary =
 ;;
 
 let show_box ?(vocabulary = vocabulary) s =
-  let box = Seed_web.Params.box ~vocabulary s in
+  let box = Seed_web.Params.box ~version ~vocabulary s in
   match box.outcome with
   | Parsed term -> printf "%-18s -> parsed %s\n" s (Search.Term.to_query_string term)
   | Resolved term -> printf "%-18s -> resolved %s\n" s (Search.Term.to_query_string term)
@@ -801,7 +825,7 @@ let%expect_test "a bare brand word is told where it goes" =
   let vocabulary = lazy (Some [ "weapon:quick blade"; "potion:haste" ]) in
   List.iter
     ~f:(fun word ->
-      match Seed_web.Params.box ~vocabulary word with
+      match Seed_web.Params.box ~version ~vocabulary word with
       | { Seed_web.Params.Box.outcome = Rejected { message; _ }; _ } ->
         printf "%-14s -> %s\n" word message
       | { outcome = Parsed _ | Resolved _; _ } -> printf "%-14s -> ran\n" word)

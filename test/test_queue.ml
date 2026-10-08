@@ -417,6 +417,27 @@ let%expect_test "a pass that raises does not end the generator" =
     |}]
 ;;
 
+(* The store rebuild holds the write lock for ~15 minutes, far past
+   busy_timeout, and the generator heartbeats through it. A raise there was the
+   crash loop of 2026-10-04: 26 restarts in one rebuild. *)
+let%expect_test "a heartbeat that cannot take the write lock is an error, not a raise" =
+  let path, holder = corpus () in
+  let contender = Db.open_ path in
+  Db.exec_script contender "pragma busy_timeout = 0";
+  Db.exec_script holder "begin immediate";
+  (match Db.heartbeat contender ~generator_id:"g1" ~versions:[ v ] ~now:1000 with
+   | Ok () -> print_endline "ok"
+   | Error err -> printf "error: %s\n" (Error.to_string_hum err)
+   | exception exn -> printf "raised: %s\n" (Exn.to_string exn));
+  Db.exec_script holder "rollback";
+  cleanup path [ contender; holder ];
+  [%expect
+    {|
+    error: (Failure
+     "exec_script failed: BUSY (5): database is locked; statement: begin immediate")
+    |}]
+;;
+
 (* The loop's sleep is a fixed poll interval, so wall-clock between failures
    says little: the count is what separates the first BUSY of an incident from
    one that has survived several passes and is not clearing on its own. A pass

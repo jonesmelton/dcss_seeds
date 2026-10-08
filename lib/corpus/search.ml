@@ -83,7 +83,7 @@ module Prop = struct
      A crawl release adding a property would be silent in the same direction --
      present in the corpus, on real artefacts, unsearchable with no error --
      so [tools/corpus-check] diffs this list against the corpus and warns. *)
-  let known =
+  let newest =
     [ "*Corrode"
     ; "*Noise"
     ; "*Rage"
@@ -142,13 +142,40 @@ module Prop = struct
     ]
   ;;
 
-  let is_known prop = List.mem known prop ~equal:String.equal
+  (* (newest spelling, first build to use it, spelling before that). Not
+     aliased: a reader on a build types that build's spelling, as the datalist
+     offers it. One spelling per build is what keeps a term from having to
+     expand into a disjunction over two interned strings. *)
+  let renamed = [ "Alch", "0.33.1", "Alchemy" ]
+
+  let spelled_on ~version prop =
+    match List.find renamed ~f:(fun (now, _, _) -> String.equal now prop) with
+    | Some (_, since, before)
+      when Query.Version.release_compare
+             version
+             (Or_error.ok_exn (Query.Version.of_string since))
+           < 0 -> before
+    | _ -> prop
+  ;;
+
+  let known ~version = List.map newest ~f:(spelled_on ~version)
 
   (* Case-insensitive, so "conj" and "rf" resolve. Crawl's spellings mix case
      within a name ([rF], [SInv], [BAcc]) and no reader should have to reproduce
      that from memory. Returns the canonical spelling, which is what gets stored
      and echoed back. *)
-  let canonical prop = List.find known ~f:(fun known -> String.Caseless.equal known prop)
+  let canonical ~version prop =
+    List.find (known ~version) ~f:(fun known -> String.Caseless.equal known prop)
+  ;;
+
+  let spelling ~version prop =
+    List.find_map renamed ~f:(fun (now, _, before) ->
+      if String.Caseless.equal now prop || String.Caseless.equal before prop
+      then (
+        let here = spelled_on ~version now in
+        Option.some_if (not (String.Caseless.equal here prop)) here)
+      else None)
+  ;;
 
   (* Grants ('+Blink', '+Inv') keep their sigil and stay: a granted capability
      is a reason to pick a seed. *)
@@ -525,10 +552,8 @@ module Term = struct
       match criterion with
       | Criterion.Item ({ base_type; sub_type }, position) ->
         sprintf "%s%s:%s" (Criterion.position_to_query_string position) base_type sub_type
-      (* There is no [shop name~] spelling for [Params] to parse back, so a
-         [Shop] position here has nowhere to go: the position is dropped rather
-         than emitted unparseable. *)
-      | Criterion.Name_like (fragment, _) -> sprintf "name~%s" fragment
+      | Criterion.Name_like (fragment, position) ->
+        sprintf "%sname~%s" (Criterion.position_to_query_string position) fragment
       | Criterion.Feature feat -> feat
       | Criterion.Unique name -> sprintf "unique:%s" name
       (* Comma, not '+': '+Blink' and '+Inv' are property names, so a '+'

@@ -141,7 +141,7 @@ let current_version_redirect request =
 let served_builds db =
   List.filter_map Served.all ~f:(fun served ->
     let version = Served.to_version served in
-    match Seed_corpus.Db.seed_count db ~version with
+    match Seed_corpus.Db.searchable_seed_count db ~version with
     | Ok count -> Some (served, count)
     | Error err ->
       Dream.error (fun log -> log "%s" (Error.to_string_hum err));
@@ -1357,7 +1357,10 @@ let search_page ~community db ~pool ~gate version request =
       |> Params.without_dropped ~drop:(Dream.query request "drop")
     in
     let boxes =
-      Params.boxes ~vocabulary:(lazy (search_vocabulary db pool gate version)) typed
+      Params.boxes
+        ~version
+        ~vocabulary:(lazy (search_vocabulary db pool gate version))
+        typed
     in
     let page = Params.page request in
     let rank = Params.rank request in

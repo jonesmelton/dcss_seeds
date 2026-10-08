@@ -1274,9 +1274,11 @@ h1 .copy-seed {
 
 /* Same reason as the term boxes: this line spells out the syntax, `name~...`
    included, and the serif face ligates `~` with the letter after it. The
-   problem notes and the resolution echo quote terms back the same way. */
+   problem notes, the resolution echo and the example offers quote terms back
+   the same way. */
 .term-problem,
 .search-problems,
+.offers,
 .resolved,
 .term-example,
 #search-help {

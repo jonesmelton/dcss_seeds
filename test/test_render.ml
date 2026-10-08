@@ -499,7 +499,7 @@ let%expect_test "the htmx response carries a form with a box for the next term" 
    gets none -- there is nothing to remove -- and no placeholder either: a
    term-shaped placeholder in the box below a term reads as a duplicate of it. *)
 let%expect_test "each term box carries a remove button, the blank box does not" =
-  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
+  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string ~version:v s) in
   let search =
     Search.create ~version:v ~terms:[ term "name~bear"; term "potion:experience" ] ()
   in
@@ -572,7 +572,7 @@ let%expect_test "each term box carries a remove button, the blank box does not" 
    pressing Enter in a term box submits "drop=0:<first term>" -- the reader
    silently loses an unrelated term instead of searching. *)
 let%expect_test "the first submit button in the form is a search, not a removal" =
-  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
+  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string ~version:v s) in
   let search =
     Search.create ~version:v ~terms:[ term "potion:haste"; term "wand:digging" ] ()
   in
@@ -611,7 +611,7 @@ let%expect_test "the first submit button in the form is a search, not a removal"
    box below it. Ids are positional, so box n only ever matches box n and the
    new blank comes back empty. *)
 let%expect_test "term boxes carry positional ids, blank box included" =
-  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
+  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string ~version:v s) in
   let search =
     Search.create ~version:v ~terms:[ term "name~lance"; term "wand:digging" ] ()
   in
@@ -795,7 +795,7 @@ let%expect_test "the empty form is placeheld; a form with terms is not" =
     "empty form placeheld:  %b\n"
     (String.is_substring empty ~substring:"placeholder");
   printf "names a prop form:     %b\n" (String.is_substring empty ~substring:"props:Conj");
-  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string s) in
+  let term s = Or_error.ok_exn (Seed_web.Params.term_of_string ~version:v s) in
   let filled = render (Search.create ~version:v ~terms:[ term "potion:haste" ] ()) in
   printf
     "blank under a term:    %b\n"

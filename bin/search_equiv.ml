@@ -107,7 +107,7 @@ let check db ~version ~limit ~ranked_pages ~rank query =
   let terms =
     String.split query ~on:';'
     |> List.map ~f:String.strip
-    |> Seed_web.Params.terms_of_strings
+    |> Seed_web.Params.terms_of_strings ~version
     |> Or_error.ok_exn
   in
   let max_pages =

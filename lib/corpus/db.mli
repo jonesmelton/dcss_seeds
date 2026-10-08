@@ -421,15 +421,15 @@ val heartbeat
 
     See [docs/heat.md] and [docs/corpus-scaling.md], "Rescore". *)
 
-(** How many seeds the corpus holds for [version], at any fill depth.
-
-    A covering seek on [seed_fills_cohort], which holds one row per seed --
-    counting [seed_levels] or [entries] answers the same question with a scan.
-
-    But a covering seek that {e counts} is linear in what it counts: 43ms at
-    1.3M (0.34.1, D:8, 2026-09-05, server), inline and undetached. Hence
-    [Seed_web.served_builds] caching it for the life of the process. *)
+(** The size of [version]'s random sample, at any fill depth: the
+    trigger-kept [seed_fill_counts] row, so a primary-key read. Submitted
+    seeds are not in it. *)
 val seed_count : t -> version:Query.Version.t -> int Or_error.t
+
+(** [seed_count] plus the submitted seeds a store rebuild has indexed: every
+    seed a search can return. This is the masthead's figure, and it is not a
+    sample size, so nothing statistical may read it. *)
+val searchable_seed_count : t -> version:Query.Version.t -> int Or_error.t
 
 (** Every distinct [seed_fills.depth] a version holds, ascending: the caps
     [bin/rescore.ml] scores that version at. Index-backed. *)

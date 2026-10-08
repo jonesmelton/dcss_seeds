@@ -13,10 +13,7 @@ whatever it costs.
 
 All observations 0.34.1, 1.3M corpus, prod, 2026-09-10 UTC, taken from the Caddy
 access log over a 12-hour window. Durations are end to end over HTTP, so they
-include queueing. That window overlapped ~6.5 hours of a co-tenant process
-holding 4 of 8 cores, which inflates the multi-second timings by an unknown
-factor — the ordering is trustworthy, the absolute numbers are an upper bound
-until re-measured on a quiet box.
+include queueing.
 
 ## The slow ones
 

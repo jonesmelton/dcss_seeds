@@ -2950,20 +2950,23 @@ let register_version t version =
     ~f:(fun stmt -> fold_rows stmt ~init:() ~f:(fun () _ -> Ok ()))
 ;;
 
+(* [with_immediate_txn] raises on BUSY, and the generator heartbeats through a
+   store rebuild that holds the write lock far past busy_timeout. *)
 let heartbeat t ~generator_id ~versions ~now =
-  with_immediate_txn t ~f:(fun t ->
-    List.map versions ~f:(fun version ->
-      let%bind.Or_error () = register_version t version in
-      with_stmt
-        t
-        heartbeat_sql
-        ~bind:
-          [ Sqlite3.Data.TEXT generator_id
-          ; version_bind version
-          ; Sqlite3.Data.INT (Int64.of_int now)
-          ]
-        ~f:(fun stmt -> fold_rows stmt ~init:() ~f:(fun () _ -> Ok ())))
-    |> Or_error.all_unit)
+  Or_error.try_with_join (fun () ->
+    with_immediate_txn t ~f:(fun t ->
+      List.map versions ~f:(fun version ->
+        let%bind.Or_error () = register_version t version in
+        with_stmt
+          t
+          heartbeat_sql
+          ~bind:
+            [ Sqlite3.Data.TEXT generator_id
+            ; version_bind version
+            ; Sqlite3.Data.INT (Int64.of_int now)
+            ]
+          ~f:(fun stmt -> fold_rows stmt ~init:() ~f:(fun () _ -> Ok ())))
+      |> Or_error.all_unit))
 ;;
 
 (* Cap and generator checks inside the write transaction to avoid TOCTOU races. *)
@@ -4074,6 +4077,30 @@ let seed_count t ~version =
     t
     seed_count_sql
     ~bind:[ version_bind version ]
+    ~f:(fun stmt ->
+      fold_rows stmt ~init:0 ~f:(fun _ row ->
+        Ok (Option.value (column_int row 0) ~default:0)))
+;;
+
+let searchable_seed_count_sql =
+  sprintf
+    {|
+select coalesce((select seeds from seed_fill_counts where version_id = %s), 0)
+     + (select count(*)
+          from seed_fills
+         where version_id = %s
+           and origin = 'submit'
+           and indexed_at is not null)
+|}
+    version_id_sql
+    version_id_sql
+;;
+
+let searchable_seed_count t ~version =
+  with_stmt
+    t
+    searchable_seed_count_sql
+    ~bind:[ version_bind version; version_bind version ]
     ~f:(fun stmt ->
       fold_rows stmt ~init:0 ~f:(fun _ row ->
         Ok (Option.value (column_int row 0) ~default:0)))

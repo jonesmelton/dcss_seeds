@@ -1558,11 +1558,13 @@ let search_help ~version =
   ; p
       [ txt "Floor by default. "
       ; code [ txt "shop " ]
-      ; txt " prefix for shop stock. A term is one or the other; "
-      ; code [ txt "name~" ]
-      ; txt " is floor only."
+      ; txt " prefix for shop stock. A term is one or the other."
       ]
-  ; examples [ [ "potion:might" ], "floor"; [ "shop potion:might" ], "shop" ]
+  ; examples
+      [ [ "potion:might" ], "floor"
+      ; [ "shop potion:might" ], "shop"
+      ; [ "shop name~Wyrmbane" ], "shop"
+      ]
   ; h2 [ txt "Count" ]
   ; p
       [ code [ txt "Nx " ]

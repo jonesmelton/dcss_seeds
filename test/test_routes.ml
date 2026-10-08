@@ -178,7 +178,7 @@ let%expect_test "HEAD sends no body but reports the length GET would" =
     /sitemap.xml         GET body 482  HEAD body 0  HEAD content-length 482
     /0.34.1/             GET body 5361  HEAD body 0  HEAD content-length 5361
     /0.34.1/about        GET body 4329  HEAD body 0  HEAD content-length 4329
-    /0.34.1/search/help  GET body 7624  HEAD body 0  HEAD content-length 7624
+    /0.34.1/search/help  GET body 7714  HEAD body 0  HEAD content-length 7714
     |}]
 ;;
 
@@ -680,7 +680,11 @@ let%expect_test "an impossible count names the build's ceiling, and links to it"
       printf "link term  %s\n" term;
       printf
         "parses to  %s\n"
-        (match Seed_web.Params.term_of_string term with
+        (match
+           Seed_web.Params.term_of_string
+             ~version:(Or_error.ok_exn (Seed_corpus.Query.Version.of_string "0.34.1"))
+             term
+         with
          | Ok term -> Seed_corpus.Search.Term.to_query_string term
          | Error err -> Error.to_string_hum err));
   [%expect
@@ -1264,6 +1268,61 @@ let%expect_test "a session is capped per day, and the cap is said in words" =
       200 limit=false
       429 limit=true
       |}])
+;;
+
+(* The shape a browser took on dcss.garden 2026-10-04: each submission from a
+   freshly loaded 404 page with its own token, then the poll, carrying whatever
+   cookie the last response set. Thirteen were queued and none refused. *)
+let%expect_test "the session cap holds across page loads, as a browser submits" =
+  with_router ~f:(fun handle ->
+    let jar = ref None in
+    let cookies = ref [] in
+    let send ~method_ ~target body =
+      let headers =
+        Option.value_map !jar ~default:[] ~f:(fun c -> [ "Cookie", c ])
+        @ [ "Content-Type", "application/x-www-form-urlencoded" ]
+      in
+      let response = handle (Dream.request ~method_ ~target ~headers body) in
+      Option.iter (Dream.header response "Set-Cookie") ~f:(fun set ->
+        let c = fst (String.lsplit2_exn set ~on:';') in
+        jar := Some c;
+        cookies := c :: !cookies);
+      response
+    in
+    let version = Served.to_string Served.current in
+    let outcomes =
+      List.fold (List.range 0 11) ~init:[] ~f:(fun acc i ->
+        let seed = Int.to_string (6000 + i) in
+        let page = send ~method_:`GET ~target:(sprintf "/%s/seed/%s" version seed) "" in
+        let input =
+          String.split (body_of page) ~on:'<'
+          |> List.find_exn ~f:(String.is_substring ~substring:"dream.csrf")
+        in
+        let token = value_after input ~key:"value=\"" ~until:(Char.equal '"') in
+        let response =
+          send
+            ~method_:`POST
+            ~target:(sprintf "/%s/seed/%s/submit" version seed)
+            ("dream.csrf=" ^ token)
+        in
+        let outcome = status_of response, body_of response in
+        ignore
+          (send ~method_:`GET ~target:(sprintf "/%s/seed/%s/submission" version seed) ""
+           : Dream.response);
+        outcome :: acc)
+      |> List.rev
+    in
+    List.iter (List.drop outcomes 9) ~f:(fun (status, body) ->
+      printf "%d limit=%b\n" status (String.is_substring body ~substring:"limit"));
+    printf
+      "distinct session cookies: %d\n"
+      (List.length (List.dedup_and_sort !cookies ~compare:String.compare)));
+  [%expect
+    {|
+    200 limit=false
+    429 limit=true
+    distinct session cookies: 1
+    |}]
 ;;
 
 let%expect_test "SEED_DISABLE_SUBMIT withdraws the button and refuses the write" =

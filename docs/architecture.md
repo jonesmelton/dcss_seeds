@@ -286,8 +286,7 @@ term becomes the driver, and the flat group-by above is what makes a
 `min_count > 1` driver cheap. A **second** counted term has no driver slot left
 and falls back to the correlated scalar-sum, which the 2026-09-09 decorrelation
 did not touch — that rewrite covers the `min_count <= 1` branch only. Measured
-on prod (1.3M, 0.34.1, 2026-09-10, box contended by a neighbor process, so
-these are pessimistic): `9x artefact` alone **0.20s**, `9x floor potion:haste`
+on prod (1.3M, 0.34.1, 2026-09-10): `9x artefact` alone **0.20s**, `9x floor potion:haste`
 alone **0.24s**, the two together **23.2s**. A counted term beside a plain one
 stays cheap (0.21s), since the counted one takes the driver slot.
 
@@ -831,9 +830,11 @@ was an error, not a narrowing) because a generic artefact search is a weak
 question — 8,665 of 10,000 seeds hold one (0.34.1, D:8, local) — and
 qualifying it would have needed parse syntax it did not have. It is refused
 with a message naming the type pair or `props:` term that asks the real
-question. `name~` breaks the symmetry the other way and has no shop form: gold
+question. ~~`name~` breaks the symmetry the other way and has no shop form: gold
 binds the early game, so an unrand you can afford in a shop is one you could
-have afforded off the floor.
+have afforded off the floor.~~ `shop name~` was restored 2026-10 at a reader's
+request: the affordability argument applied equally to `shop props:`, which was
+never refused, and shops persist for a player who comes back with gold.
 
 `cost is null` used to fall outside the covering index, so the floor arm read
 the index for the seek and the table for the test — a shape that read as cheap
@@ -1092,7 +1093,7 @@ because a deepened seed's posting count understates; the SQL fallback costs
 about what the empty search did. See `db.mli` and `search_index.mli`.
 
 Measured with `corpus-search-bench -ceiling` (1.3M, 0.34.1, D:8, prod, store
-current, neighbor idle, median of 3, 2026-10-01). Store branch against the empty
+current, median of 3, 2026-10-01). Store branch against the empty
 search it follows: `potion:curing` 0.198s after a 0.264s search, `potion:haste`
 0.148s / 0.205s, `scroll:teleportation` 0.203s / 0.266s, `scroll:acquirement`
 0.064s / 0.087s. The SQL branch is 0.54s for the two broadest. A multi-property
@@ -1376,7 +1377,7 @@ fragment pays the partial resolution first, on top of the SQL path: 0.50s
 (`hat`) to 1.01s (`the`) to reach the cap.
 
 What it bought, first page warm, store against the SQL path (1.3M, 0.34.1, D:8,
-prod clone, cores 1-3,5-7, neighbor idle, ARC cap 10 GB, 2026-09-29): the shape
+prod clone, cores 1-3,5-7, ARC cap 10 GB, 2026-09-29): the shape
 still slow in production, `name~` beside a bare `props:`, went from 1.5-8.2s to
 0.11-0.42s (`name~heavy crossbow "Sniper"; props:Dex` 8.22s → 0.11s). What it
 cost: a selective fragment beside a selective term, and a lone fragment, are

@@ -46,9 +46,8 @@ let corpus =
        must keep -- one property, two strengths, no grouping mechanism. *)
   ; {|#SEED#((format 4)(version "0.34.1")(seed "33")(level "D:2")(cats (items (((artefact t)(artprops ((rF -2)(Str 3)))(base_type "armour")(kind "item")(name "+0 cloak of Miasma {rF- Str+3}")(quantity 1)(sub_type "cloak")(text "+0 cloak of Miasma"))))))|}
   ; {|#SEED#((format 4)(version "0.34.1")(seed "34")(level "D:6")(cats (items (((artefact t)(artprops ((rF 2)))(base_type "armour")(kind "item")(name "+2 scale mail of Ember {rF++}")(plus 2)(quantity 1)(sub_type "scale mail")(text "+2 scale mail of Ember"))))))|}
-    (* An unrand behind a counter, and the only Wyrmbane in the fixture. It is
-       what makes [name~]'s missing shop form observable rather than asserted:
-       a bare [name~] reads the floor and cannot reach it. *)
+    (* An unrand behind a counter, and the only Wyrmbane in the fixture: a bare
+       [name~] reads the floor and cannot reach it, [shop name~] can. *)
   ; {|#SEED#((format 4)(version "0.34.1")(seed "21")(level "D:4")(cats (items (((artefact t)(base_type "weapon")(cost 4000)(kind "item")(name "+8 Wyrmbane {holy, slay+4}")(plus 8)(quantity 1)(sub_type "demon blade")(text "+8 Wyrmbane"))))))|}
     (* The brand fixtures. Seed 46 is the leak [Criterion.Brand] exists to
        prevent: a plain quick blade on D:6 and a distortion dagger on D:2, so
@@ -310,11 +309,11 @@ let%expect_test "name_like finds an unrand through its enchantment prefix" =
   Db.close db
 ;;
 
-(* [name~] has no shop form, so it cannot reach seed 21's Wyrmbane -- the only
-   one in the fixture. An empty result would otherwise be indistinguishable from
-   a corpus that holds no such name, so the shop-qualified criterion is run
-   straight after to show the row is there. *)
-let%expect_test "name_like does not reach shop stock, and has no form that would" =
+(* Bare [name~] cannot reach seed 21's Wyrmbane -- the only one in the
+   fixture. An empty result would otherwise be indistinguishable from a corpus
+   that holds no such name, so the shop form is run straight after to show the
+   row is there. *)
+let%expect_test "name_like is partitioned by position like every other criterion" =
   let db = fresh_db () in
   run db [ Search.Term.create (named "Wyrmbane") ];
   [%expect
@@ -322,9 +321,6 @@ let%expect_test "name_like does not reach shop stock, and has no form that would
     seeds on 0.34.1 with named like "Wyrmbane"
       [end]
     |}];
-  (* Constructed directly, since [Params] refuses to build it. Storage would
-     serve a shop name search; the decision not to offer one is at the parse
-     boundary, and this is what says so. *)
   run
     db
     [ Search.Term.create (Search.Criterion.Name_like ("Wyrmbane", Search.Criterion.Shop))

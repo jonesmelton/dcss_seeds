@@ -241,6 +241,39 @@ let%expect_test "armour egos spell out, and orbs and scarves take no enchantment
     |}]
 ;;
 
+(* The live case was /0.33.1/seed/1005, a scarf of harm rendered as "scarf". *)
+let%expect_test "an ego crawl capitalised in 0.34.1 renders from its older spelling" =
+  show
+    (List.map
+       [ "harm"
+       ; "guile"
+       ; "mayhem"
+       ; "infuse"
+       ; "light"
+       ; "hurl"
+       ; "repulsion"
+       ; "reflect"
+       ; "ponderous"
+       ; "rampage"
+       ; "shadows"
+       ]
+       ~f:(fun ego -> item "armour" "scarf" ~plus:0 ~ego));
+  [%expect
+    {|
+    scarf of harm
+    scarf of guile
+    scarf of mayhem
+    scarf of infusion
+    scarf of light
+    scarf of hurling
+    scarf of repulsion
+    scarf of reflection
+    scarf of ponderousness
+    scarf of rampaging
+    scarf of shadows
+    |}]
+;;
+
 let%expect_test "jewellery already spells itself; only a nonzero plus is added" =
   show
     [ item "jewellery" "ring of protection from fire" ~plus:0 ~ego:"rF+"

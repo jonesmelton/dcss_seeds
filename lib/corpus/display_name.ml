@@ -114,7 +114,7 @@ module Ego = struct
     | _ -> None
   ;;
 
-  let armour = function
+  let rec armour = function
     | "+Inv" -> Some "invisibility"
     | "AC+3" -> Some "protection"
     | "Air" -> Some "air"
@@ -157,6 +157,19 @@ module Ego = struct
     | "rF+" -> Some "fire resistance"
     | "rN+" -> Some "positive energy"
     | "rPois" -> Some "poison resistance"
+    (* Crawl capitalised these in 0.34.1; earlier builds store the lowercase
+       code, and no build stores both. *)
+    | ( "harm"
+      | "guile"
+      | "mayhem"
+      | "infuse"
+      | "light"
+      | "hurl"
+      | "repulsion"
+      | "reflect"
+      | "ponderous"
+      | "rampage"
+      | "shadows" ) as code -> armour (String.capitalize code)
     | _ -> None
   ;;
 end

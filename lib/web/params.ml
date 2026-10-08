@@ -80,7 +80,7 @@ let not_an_item_monster =
    Comma separates. A '+' cannot: '+Blink' and '+Inv' are property names, so a
    set holding one would spell "Conj++Blink". It also avoids an encoding trap --
    [Dream.queries] decodes a raw '+' to a space, and only "%2B" survives it. *)
-let props_of_string ?base_type ~position rest =
+let props_of_string ?base_type ~version ~position rest =
   let props =
     String.split rest ~on:','
     |> List.map ~f:String.strip
@@ -92,7 +92,7 @@ let props_of_string ?base_type ~position rest =
     let open Or_error.Let_syntax in
     let%bind props =
       List.map props ~f:(fun prop ->
-        match Search.Prop.canonical prop with
+        match Search.Prop.canonical ~version prop with
         (* An unknown property is rejected, never searched. Running it would
            match nothing and report that the build holds no such artefact --
            false, and indistinguishable from true. The case this catches in
@@ -111,14 +111,20 @@ let props_of_string ?base_type ~position rest =
                property ("props:speed" and kin, 32 requests over 15 spellings,
                access log 2026-09-12..10-01). Name the spelling rather than
                only refusing. *)
-            match Search.Brand.canonical_any prop with
-            | Some word ->
+            match Search.Brand.canonical_any prop, Search.Prop.spelling ~version prop with
+            | Some word, _ ->
               Or_error.errorf
                 "%S is a brand, not a property. A brand goes after the item with ego:, \
                  as in \"weapon:quick blade ego:%s\"."
                 prop
                 word
-            | None -> Or_error.errorf "no property named %S" prop)
+            | None, Some spelled ->
+              Or_error.errorf
+                "%s spells %S as %S."
+                (Query.Version.to_string version)
+                prop
+                spelled
+            | None, None -> Or_error.errorf "no property named %S" prop)
         | Some canonical ->
           (* Named rather than counted: a reader who typed a drawback wants to
              know which one we will not search for, not that "one term was
@@ -202,10 +208,6 @@ let bare_prefix s =
     else None)
 ;;
 
-(* The one criterion with no shop form. Gold is the binding constraint in the
-   early game, so an unrand you can afford in a shop is one you could have
-   afforded off the floor -- "is it for sale" is not the question being asked.
-   Bare "name~" and "floor name~" are therefore the same search. *)
 let name_like ~position rest =
   if String.is_empty rest
   then Or_error.errorf "name~ needs something to match"
@@ -215,12 +217,7 @@ let name_like ~position rest =
       "name~ needs at least %d characters (got %d)"
       Search.Criterion.min_name_like_length
       (String.length rest)
-  else (
-    match position with
-    | Some Search.Criterion.Shop ->
-      Or_error.errorf "name~ only searches the floor. Remove the \"shop \"."
-    | Some Search.Criterion.Floor | None ->
-      Ok (Search.Criterion.Name_like (rest, Search.Criterion.Floor)))
+  else Ok (Search.Criterion.Name_like (rest, position))
 ;;
 
 (* "quick blade of distortion" -> ("quick blade", "distortion"): the first
@@ -238,7 +235,7 @@ let brand_suffix sub_type =
 
 (* The body every term reaches once its position is peeled off. [position] is
    [None] for a term that named none; everywhere else it settles to [Floor]. *)
-let criterion_at ~position s =
+let criterion_at ~version ~position s =
   let at = Option.value position ~default:Search.Criterion.Floor in
   (* Players use brand and ego interchangeably. *)
   let s =
@@ -256,9 +253,10 @@ let criterion_at ~position s =
   else if String.is_prefix s ~prefix:"unique:"
   then Or_error.errorf "%s" not_an_item_monster
   else if String.is_prefix s ~prefix:"name~"
-  then name_like ~position (String.drop_prefix s (String.length "name~"))
+  then name_like ~position:at (String.drop_prefix s (String.length "name~"))
   else if String.is_prefix s ~prefix:"props:"
-  then props_of_string ~position:at (String.drop_prefix s (String.length "props:"))
+  then
+    props_of_string ~version ~position:at (String.drop_prefix s (String.length "props:"))
   else if String.is_prefix s ~prefix:"ego:"
   then
     Or_error.errorf
@@ -291,8 +289,8 @@ let criterion_at ~position s =
       let base_type = String.strip (String.prefix s i) in
       let rest = String.drop_prefix s (i + String.length " props:") in
       if String.is_empty base_type
-      then props_of_string ~position:at rest
-      else props_of_string ~base_type ~position:at rest)
+      then props_of_string ~version ~position:at rest
+      else props_of_string ~base_type ~version ~position:at rest)
   else if String.mem s ':'
   then (
     match item_type s with
@@ -347,12 +345,12 @@ let criterion_at ~position s =
   else Or_error.errorf "search covers items, not features: %S" s
 ;;
 
-let criterion s =
+let criterion ~version s =
   match bare_prefix s with
   | Some err -> err
   | None ->
     (match position_prefix s with
-     | None -> criterion_at ~position:None s
+     | None -> criterion_at ~version ~position:None s
      (* Checked here rather than inside [criterion_at] so the message can quote
         the term as typed. The peeled remainder is not something the reader
         wrote, and naming it back at them is an answer to a question they cannot
@@ -360,7 +358,7 @@ let criterion s =
      | Some (position, rest) ->
        (match position_prefix rest with
         | Some _ -> Or_error.errorf "use \"shop \" or \"floor \", not both: %S" s
-        | None -> criterion_at ~position:(Some position) rest))
+        | None -> criterion_at ~version ~position:(Some position) rest))
 ;;
 
 (* "<term> by D:n" used to cap how deep a match could sit. Rejected rather than
@@ -390,12 +388,12 @@ let rejects_prop_count criterion ~min_count =
   | _ -> Ok criterion
 ;;
 
-let term_of_string s =
+let term_of_string ~version s =
   let s = String.strip s in
   let open Or_error.Let_syntax in
   let%bind () = rejects_depth_cap s in
   let min_count, s = peel_min_count s in
-  let%bind criterion = criterion s in
+  let%bind criterion = criterion ~version s in
   let%map criterion = rejects_prop_count criterion ~min_count in
   Search.Term.create ~min_count criterion
 ;;
@@ -406,12 +404,12 @@ let term_of_string s =
 let max_terms = 10
 let is_blank s = String.is_empty (String.strip s)
 
-let terms_of_strings strings =
+let terms_of_strings ~version strings =
   let terms = List.filter ~f:(fun s -> not (is_blank s)) strings in
   if List.length terms > max_terms
   then Or_error.errorf "too many search terms (max %d)" max_terms
   else (
-    match List.map ~f:term_of_string terms |> Or_error.all with
+    match List.map ~f:(term_of_string ~version) terms |> Or_error.all with
     | Ok terms -> Ok terms
     | Error err -> Error err)
 ;;
@@ -551,10 +549,10 @@ let dedup tokens =
    near miss is offered even when it is the only one, since running a guess is
    the silent wrong answer this replaces. [name~] is offered and never run: its
    cost is the one the vocabulary does not bound. *)
-let box ~vocabulary typed =
+let box ~version ~vocabulary typed =
   let rejected ?offer message = { Box.typed; outcome = Rejected { message; offer } } in
   let offering prompt terms = { Box.prompt; terms } in
-  match term_of_string typed with
+  match term_of_string ~version typed with
   | Ok term -> { Box.typed; outcome = Parsed term }
   | Error err ->
     (match bare_word typed with
@@ -566,7 +564,7 @@ let box ~vocabulary typed =
        let readings tokens =
          List.map (dedup tokens) ~f:(fun token ->
            let spelled = affix ^ token in
-           spelled, term_of_string spelled)
+           spelled, term_of_string ~version spelled)
        in
        let valid readings =
          List.filter_map readings ~f:(fun (spelled, result) ->
@@ -574,7 +572,7 @@ let box ~vocabulary typed =
        in
        let name_offer =
          let spelled = count_affix min_count ^ "name~" ^ word in
-         Result.ok (term_of_string spelled)
+         Result.ok (term_of_string ~version spelled)
          |> Option.map ~f:(fun _ -> offering "Search artefact names instead:" [ spelled ])
        in
        (match Option.map (force vocabulary) ~f:item_pairs with
@@ -588,8 +586,10 @@ let box ~vocabulary typed =
           let exact =
             List.filter_map items ~f:(fun (token, item) ->
               Option.some_if (names_exactly word item) token)
-            @ Option.value_map (Search.Prop.canonical word) ~default:[] ~f:(fun prop ->
-              [ "props:" ^ prop ])
+            @ Option.value_map
+                (Search.Prop.canonical ~version word)
+                ~default:[]
+                ~f:(fun prop -> [ "props:" ^ prop ])
             |> readings
           in
           (match valid exact, exact with
@@ -628,11 +628,11 @@ let box ~vocabulary typed =
                   (sprintf "Nothing matches %S." word)))))
 ;;
 
-let boxes ~vocabulary strings =
+let boxes ~version ~vocabulary strings =
   let strings = List.filter strings ~f:(Fn.non is_blank) in
   if List.length strings > max_terms
   then Or_error.errorf "too many search terms (max %d)" max_terms
-  else Ok (List.map strings ~f:(box ~vocabulary))
+  else Ok (List.map strings ~f:(box ~version ~vocabulary))
 ;;
 
 let terms_of_boxes boxes =

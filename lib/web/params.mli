@@ -81,12 +81,13 @@ val ceiling_timeout : float ref
     potion:haste] wants three on the floor and is not satisfied by two plus one
     behind a counter.
 
-    Three things are deliberately not expressible. The union itself has no
+    Two things are deliberately not expressible. The union itself has no
     prefix, so the pre-2026-09-15 reading of a bare term cannot be spelled at
-    all. [shop name~] is refused: gold binds the early game, so an unrand you
-    can afford in a shop is one you could have afforded off the floor. And a
-    term takes one position, so [shop floor potion:haste] is an error rather
-    than a last-one-wins. [artefact] was a fourth until 2026-10: it was the one
+    all. And a term takes one position, so [shop floor potion:haste] is an
+    error rather than a last-one-wins. [shop name~] was refused until 2026-10,
+    on the grounds that a shop unrand is unaffordable early; [shop props:] never
+    was, on the same grounds, and shops persist for a reader who comes back with
+    gold. [artefact] was a third until 2026-10: it was the one
     term spanning both positions, and it is now refused with a message naming
     the type pair or [props:] term that asks the real question.
 
@@ -105,13 +106,19 @@ val ceiling_timeout : float ref
     else by one string. Unparseable terms are a bad request rather than a
     dropped filter: silently ignoring a term would show a result set that does
     not answer the question asked. *)
-val term_of_string : string -> Seed_corpus.Search.Term.t Or_error.t
+val term_of_string
+  :  version:Seed_corpus.Query.Version.t
+  -> string
+  -> Seed_corpus.Search.Term.t Or_error.t
 
 (** Empty strings dropped, count capped at [max_terms]: a search with more terms
     than that is a paste, not a query. *)
 val max_terms : int
 
-val terms_of_strings : string list -> Seed_corpus.Search.Term.t list Or_error.t
+val terms_of_strings
+  :  version:Seed_corpus.Query.Version.t
+  -> string list
+  -> Seed_corpus.Search.Term.t list Or_error.t
 
 (** What became of one search box, for the handler to either run or hand back
     with the reader's text intact. *)
@@ -152,10 +159,18 @@ end
     is none to consult; it is forced only for a bare word. With [None] nothing
     resolves, properties included: [fire] is [staff:fire] as well as
     [props:Fire], and a property matched alone could hide the collision. *)
-val box : vocabulary:string list option Lazy.t -> string -> Box.t
+val box
+  :  version:Seed_corpus.Query.Version.t
+  -> vocabulary:string list option Lazy.t
+  -> string
+  -> Box.t
 
 (** Blank boxes dropped; an error only past {!max_terms}. *)
-val boxes : vocabulary:string list option Lazy.t -> string list -> Box.t list Or_error.t
+val boxes
+  :  version:Seed_corpus.Query.Version.t
+  -> vocabulary:string list option Lazy.t
+  -> string list
+  -> Box.t list Or_error.t
 
 (** [None] if any box was rejected. *)
 val terms_of_boxes : Box.t list -> Seed_corpus.Search.Term.t list option

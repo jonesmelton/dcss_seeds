@@ -260,6 +260,8 @@ create index seed_fills_cohort on seed_fills (version_id, depth, seed);
 
 create index seed_fills_pending on seed_fills (version_id, seed) where origin = 'submit' and indexed_at is null;
 
+create index seed_fills_indexed on seed_fills (version_id) where origin = 'submit' and indexed_at is not null;
+
 -- The sample's size per version -- seed_fills rows with origin 'fill' -- kept
 -- by trigger so the search store's currency check is a primary-key read rather
 -- than a covering-index scan (88ms at 1,299,999 seeds, prod, 2026-09-16, on

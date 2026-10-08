@@ -51,15 +51,22 @@ module Prop : sig
       is synchronous, and an unknown property must be rejected there. A property
       search that runs and matches nothing would report that the build holds no
       such artefact -- a false statement about the corpus, indistinguishable
-      from a true one. *)
-  val known : string list
+      from a true one.
 
-  val is_known : string -> bool
+      Per build, because crawl renames properties between releases and a
+      build's vocabulary holds only its own spelling. *)
+  val known : version:Query.Version.t -> string list
 
   (** The canonical spelling of a property named case-insensitively, or [None]
-      if no such property exists. Crawl mixes case within a name ([rF], [SInv]),
-      which no reader should have to reproduce from memory. *)
-  val canonical : string -> string option
+      if [version] has no such property. Crawl mixes case within a name ([rF],
+      [SInv]), which no reader should have to reproduce from memory. *)
+  val canonical : version:Query.Version.t -> string -> string option
+
+  (** For a property [version] does not know but another build does under a
+      rename, the spelling [version] uses -- [Some "Alchemy"] for [Alch] on
+      0.32.1. [None] otherwise. For telling a reader, never for resolving: a
+      term is searched as typed or refused. *)
+  val spelling : version:Query.Version.t -> string -> string option
 
   (** The floor a bare property must meet.
 
@@ -155,8 +162,7 @@ module Criterion : sig
       search is not a union search with the shop hits struck off -- it can match
       strictly fewer seeds. The partition is total: every criterion names a
       position, so the union is not expressible at all and there is no term to
-      qualify. [Name_like] is the only criterion that ignores its position, and
-      [Params] builds only [Floor].
+      qualify.
 
       [Name_like] is the escape hatch for what the type vocabulary cannot name:
       an unrand is identified by a substring of its display name, its
@@ -164,9 +170,7 @@ module Criterion : sig
       irreducible tail -- artefacts, unrands, monsters -- and no longer reaches
       a name the columns imply. [Name_like "potion of haste"] finds nothing;
       [Item ({base_type = "potion"; sub_type = "haste"}, Floor)] is that
-      question. It carries a [position] for uniformity but [Params] builds only
-      [Floor]: gold binds the early game, so an unrand you could buy is one you
-      could have afforded off the floor, and the shop form answers nothing.
+      question.
 
       [Props] asks for properties carried by *one* item, which is what makes it
       a criterion of its own rather than a conjunction of simpler ones. "A staff

@@ -28,7 +28,11 @@ let%expect_test "a suggested unrand parses back to the criterion that finds it" 
   in
   print_endline suggestion;
   [%expect {| name~Black Knight's barding |}];
-  (match Seed_web.Params.term_of_string suggestion with
+  (match
+     Seed_web.Params.term_of_string
+       ~version:(Or_error.ok_exn (Seed_corpus.Query.Version.of_string "0.34.1"))
+       suggestion
+   with
    | Ok term -> print_endline (Seed_corpus.Search.Term.to_query_string term)
    | Error err -> print_endline (Error.to_string_hum err));
   [%expect {| name~Black Knight's barding |}]

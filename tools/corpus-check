@@ -29,7 +29,7 @@ q() { sqlite3 -init /dev/null -noheader "$db" "$1"; }
 seeds=$(q "select count(distinct sl.seed) from seed_levels sl join versions v on v.id = sl.version_id where v.version = '$version';")
 if [ "$seeds" -eq 0 ]; then
     echo "FAIL: no seeds ingested for '$version'"
-    echo "      versions present: $(q 'select group_concat(version, ", ") from versions;')"
+    echo "      versions present: $(q "select group_concat(version, ', ') from versions;")"
     exit 1
 fi
 
@@ -207,12 +207,20 @@ fi
 # unknown property has to be rejected there. A crawl release adding one is
 # therefore silent in the worst direction: the property is in the corpus, on
 # real artefacts, and unsearchable with no error anywhere. Compare the two.
-code_props="$(sed -n '/^  let known =/,/^  ;;/p' "$root/lib/corpus/search.ml" \
+# The list is spelled as the newest build spells it; Prop.renamed holds
+# (newest, since, before) triples for the builds that spelled one otherwise.
+code_props="$(sed -n '/^  let newest =/,/^  ;;/p' "$root/lib/corpus/search.ml" \
     | grep -oE '"[^"]+"' | tr -d '"' | sort -u)"
+while read -r now since before; do
+    if [ "$(printf '%s\n%s\n' "$version" "$since" | sort -V | head -1)" != "$since" ]; then
+        code_props="$(echo "$code_props" | sed "s/^$now\$/$before/" | sort -u)"
+    fi
+done < <(awk '/^  let renamed =/ { f = 1 } f { print } f && /]/ { exit }' "$root/lib/corpus/search.ml" \
+    | grep -oE '"[^"]+"' | tr -d '"' | paste - - -)
 db_props="$(q "select distinct s.val from entry_props p join strings s on s.id = p.prop_id join versions v on v.id = p.version_id where v.version = '$version';" | sort -u)"
 unknown="$(comm -13 <(echo "$code_props") <(echo "$db_props"))"
 if [ -n "$unknown" ]; then
-    echo "WARN: $(echo "$unknown" | wc -l | tr -d ' ') artefact propert(y|ies) in the corpus are not in Search.Prop.known:"
+    echo "WARN: $(echo "$unknown" | wc -l | tr -d ' ') artefact propert(y|ies) in the corpus are not in Search.Prop.known for $version:"
     echo "$unknown" | sed 's/^/        /'
     echo "      they cannot be searched for. Add them to lib/corpus/search.ml,"
     echo "      and to Prop.excluded if they are drawbacks."

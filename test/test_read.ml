@@ -355,6 +355,28 @@ let%expect_test "a submitted seed is not listed, sampled or counted" =
   Db.close db
 ;;
 
+let%expect_test "the searchable count takes a submitted seed once a rebuild indexes it" =
+  let db = corpus () in
+  ignore
+    (Db.write_batch
+       ~requested:true
+       db
+       [ Or_error.ok_exn (Reader.parse_line (line ~seed:"150" ~level:"D:1")) ]
+     : Db.Counts.t);
+  let show () =
+    printf
+      "sample %d, searchable %d\n"
+      (Or_error.ok_exn (Db.seed_count db ~version:v))
+      (Or_error.ok_exn (Db.searchable_seed_count db ~version:v))
+  in
+  show ();
+  [%expect {| sample 3, searchable 3 |}];
+  Or_error.ok_exn (Db.build_search_index db ~version:v);
+  show ();
+  [%expect {| sample 3, searchable 4 |}];
+  Db.close db
+;;
+
 (* Without sqlite_stat1 the planner sizes every index from built-in defaults
    and underestimates the partial ones badly: on the 10k corpus it chose
    entries_seed over entries_search_artefact, walking every entry of all 200

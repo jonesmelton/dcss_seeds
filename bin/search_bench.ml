@@ -86,7 +86,7 @@ let bench db ~version ~limit ~depth ~runs query =
   let terms =
     String.split query ~on:';'
     |> List.map ~f:String.strip
-    |> Seed_web.Params.terms_of_strings
+    |> Seed_web.Params.terms_of_strings ~version
     |> Or_error.ok_exn
   in
   List.iter [ Search.Rank.Seed; Search.Rank.Shallowest ] ~f:(fun rank ->
@@ -118,7 +118,7 @@ let bench db ~version ~limit ~depth ~runs query =
 
 let ceiling db ~version ~runs query =
   List.iter
-    (Or_error.ok_exn (Seed_web.Params.terms_of_strings [ query ]))
+    (Or_error.ok_exn (Seed_web.Params.terms_of_strings ~version [ query ]))
     ~f:(fun (term : Search.Term.t) ->
       let time f =
         let results = List.init runs ~f:(fun _ -> timed f) in
